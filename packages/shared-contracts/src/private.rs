@@ -329,11 +329,16 @@ mod tests {
     fn windows_acls_are_private_at_creation() {
         let dir = scratch("acl");
         let me = windows::current_sid().unwrap();
+        // SDDL writes the built-in Administrator (RID 500, the account of the CI runners) as the
+        // alias LA, and any other account as its SID.
+        let names_me = |sddl: &str| {
+            sddl.contains(&format!(";;;{me})")) || (me.ends_with("-500") && sddl.contains(";;;LA)"))
+        };
         let only_us = |sddl: &str| {
             sddl.starts_with("D:P")
                 && sddl.matches('(').count() == 2
                 && sddl.contains(";;;SY)")
-                && sddl.contains(&format!(";;;{me})"))
+                && names_me(sddl)
         };
 
         let file = dir.join("secret.txt");
@@ -362,10 +367,7 @@ mod tests {
         drop(std::fs::File::create_new(&inner).unwrap());
         let text = dacl_text(&inner);
         assert_eq!(text.matches('(').count(), 2, "{text}");
-        assert!(
-            text.contains(";;;SY)") && text.contains(&format!(";;;{me})")),
-            "{text}"
-        );
+        assert!(text.contains(";;;SY)") && names_me(&text), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

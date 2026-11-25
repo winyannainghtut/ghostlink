@@ -278,6 +278,16 @@ mod tests {
         ghostlink_engine::storage::current_sid().unwrap()
     }
 
+    /// How SDDL writes the trustee of `sid`: the built-in Administrator (RID 500, the account of
+    /// the CI runners) is the alias LA, any other account its SID.
+    fn sddl_trustee(sid: &str) -> String {
+        if sid.ends_with("-500") {
+            "LA".to_string()
+        } else {
+            sid.to_string()
+        }
+    }
+
     /// Reads one request from `stream` and answers it.
     async fn serve(stream: Stream, answer: &str) {
         let mut reader = BufReader::new(stream);
@@ -421,9 +431,10 @@ mod tests {
             assert!(sddl.starts_with("D:P"), "protected: {sddl}");
             assert_eq!(sddl.matches('(').count(), 2, "nobody else: {sddl}");
             assert_eq!(mask(&sddl, "SY"), 0x1f01ff, "SYSTEM is the service: {sddl}");
-            assert_eq!(mask(&sddl, &me), expected, "{rights:?}: {sddl}");
+            let owner = sddl_trustee(&me);
+            assert_eq!(mask(&sddl, &owner), expected, "{rights:?}: {sddl}");
             assert_eq!(
-                mask(&sddl, &me) & 0x4 != 0,
+                mask(&sddl, &owner) & 0x4 != 0,
                 rights == Rights::Full,
                 "FILE_CREATE_PIPE_INSTANCE: {sddl}"
             );
