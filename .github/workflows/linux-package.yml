@@ -366,6 +366,11 @@ jobs:
           # The installer is sourced to call its function (it runs its main only when it is executed):
           # --add-swap makes the file only on a server with under 900 MB, which a runner is not.
           set -euo pipefail
+          # GitHub's runner images already have a /swapfile, which the installer rightly refuses to
+          # touch: this runner is thrown away after the job, so take that one away first (and its
+          # fstab line, so that the line checked below is the installer's own).
+          if [ -e /swapfile ]; then sudo swapoff /swapfile || true; sudo rm -f /swapfile; fi
+          sudo sed -i '\#^/swapfile #d' /etc/fstab
           sudo bash -c '. scripts/install-server.sh; add_swap_file'
           swapon --show=NAME | grep -x /swapfile > /dev/null
           test "$(stat -c %a /swapfile)" = 600

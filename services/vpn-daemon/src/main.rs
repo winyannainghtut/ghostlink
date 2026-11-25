@@ -395,24 +395,30 @@ impl Daemon {
         // Connecting to the server that is already running only reports its state. Nothing is
         // checked or fetched again: a dynamic key's host may be unreachable while the tunnel is
         // up, and other requests wait while this one holds the service.
-        if !switching && self.session.as_ref().is_some_and(|s| !s.finished()) {
+        if !switching && self.session.is_some() {
             let status = self.state.read().await.status();
-            if status.profile.as_deref() == Some(&name) {
-                return Ok(Response::ok(status));
+            let active = self
+                .session
+                .as_ref()
+                .is_some_and(|s| session_is_active(s.finished(), &status.status));
+            if active {
+                if status.profile.as_deref() == Some(&name) {
+                    return Ok(Response::ok(status));
+                }
+                // Another server is active, and this is not a switch. That is the answer, given
+                // before anything else is done for this request: reading the saved key and
+                // fetching a dynamic one can take 15 seconds while every other request waits, and
+                // a key that cannot be read or fetched must not turn "busy" into "invalid".
+                let what = if stored.summary.kind == "openvpn" {
+                    "profile"
+                } else {
+                    "server"
+                };
+                return Ok(Response::err(
+                    "busy",
+                    &format!("Another {what} is active; use switch"),
+                ));
             }
-            // Another server is active, and this is not a switch. That is the answer, given
-            // before anything else is done for this request: reading the saved key and fetching
-            // a dynamic one can take 15 seconds while every other request waits, and a key that
-            // cannot be read or fetched must not turn "busy" into "invalid".
-            let what = if stored.summary.kind == "openvpn" {
-                "profile"
-            } else {
-                "server"
-            };
-            return Ok(Response::err(
-                "busy",
-                &format!("Another {what} is active; use switch"),
-            ));
         }
         let clear = storage::unseal(&stored.sealed_content)?;
         let content = String::from_utf8(clear)?;
@@ -1042,6 +1048,19 @@ pub(crate) fn test_daemon(name: &str) -> Daemon {
     }
 }
 
+/// Whether the last session is still running as far as a new connect is concerned. Its task
+/// publishes `Failed` or `Disconnected` a moment before it returns, so `finished` alone is still
+/// false for that moment: a connect that arrived then was answered with the old session's end
+/// (success, status `Failed`) and started nothing, and for another server it said `busy`. A
+/// session that has published its end is over.
+fn session_is_active(finished: bool, state: &ConnectionState) -> bool {
+    !finished
+        && !matches!(
+            state,
+            ConnectionState::Failed | ConnectionState::Disconnected
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,6 +1126,24 @@ mod tests {
         snapshot.status.status = ConnectionState::Failed;
         snapshot.status.last_error = Some(error.into());
         snapshot.footprint = footprint;
+    }
+
+    /// A connect that arrives while the last session's task is still returning, after it published
+    /// its end, starts a new session (it used to be answered with the old session's `Failed`).
+    #[test]
+    fn a_session_that_published_its_end_is_not_active() {
+        use ConnectionState::*;
+        for running in [Connecting, Connected, Reconnecting, Disconnecting] {
+            assert!(session_is_active(false, &running), "{running:?} is active");
+            assert!(!session_is_active(true, &running), "{running:?}, task over");
+        }
+        for ended in [Failed, Disconnected] {
+            assert!(
+                !session_is_active(false, &ended),
+                "{ended:?} was published: the session is over though its task has not returned"
+            );
+            assert!(!session_is_active(true, &ended));
+        }
     }
 
     fn footprint(interface: Option<&str>, address: &str) -> Option<Footprint> {
