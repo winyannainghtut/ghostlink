@@ -268,7 +268,7 @@ test('crash leftovers are removed at startup and do not block state writes', asy
   assert.equal((await cli(['profile', 'list'])).data.profiles[0].name, 'singapore');
 });
 test('version is local, unknown profile exit is predictable, and switch validates target first', async () => {
-  assert.equal((await cli(['version'])).data.version, '0.9.0');
+  assert.equal((await cli(['version'])).data.version, '0.9.1');
   assert.equal((await cli(['connect', '--profile', 'missing'], 2)).error.code, 'not_found');
   assert.equal((await cli(['switch', '--profile', 'missing'], 2)).error.code, 'not_found');
 });
@@ -391,6 +391,44 @@ test('split tunneling policies validate, persist per scope and stay owner-only',
   await cli(['agent', 'revoke', '--name', 'split-agent']);
   await cli(['split', 'clear']); await cli(['profile', 'remove', 'split-home']);
   assert.equal((await cli(['split', 'show'])).data.policy.mode, 'full');
+});
+// The CLI used to stop at 16 KiB, below what the WireGuard and Amnezia parsers (and the desktop
+// app's file picker) take: 64 KiB (code review 2026-11-25, M4).
+test('the CLI reads a key file of up to 64 KiB, and no more', async () => {
+  const conf = `[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.8.1.2/32\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nEndpoint = 203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0\n`;
+  // The same configuration with a comment that makes the file exactly `size` bytes.
+  const sized = size => `${conf}#${'x'.repeat(size - conf.length - 2)}\n`;
+  const write = async (name, size) => { const file = path.join(temp, name); await fs.writeFile(file, sized(size), { mode: 0o600 }); return file; };
+  for (const size of [20 * 1024, 64 * 1024]) {
+    const imported = await cli(['key', 'add', '--name', 'wg-big', '--file', await write(`big-${size}.conf`, size)]);
+    assert.equal(imported.data.kind, 'wireguard', `${size} bytes`);
+    await cli(['profile', 'remove', 'wg-big']);
+  }
+  const refused = await cli(['key', 'add', '--name', 'wg-huge', '--file', await write('huge.conf', 64 * 1024 + 1)], 2);
+  assert.equal(refused.error.code, 'invalid_profile'); assert.match(refused.error.message, /maximum 64 KiB/);
+  assert.equal((await cli(['profile', 'list'])).data.profiles.some(p => p.name.startsWith('wg-')), false);
+});
+// The token file is made before the grant is issued (it used to be made after, so a path that
+// could not be written left a grant behind whose token nobody had).
+test('an agent token file that cannot be created is refused before any grant is issued', async t => {
+  if (!windows && process.getuid?.() === 0) { t.skip('root can write anywhere'); return; }
+  const folder = path.join(temp, 'no-write'); await fs.mkdir(folder);
+  const user = windows ? `${process.env.USERDOMAIN ? process.env.USERDOMAIN + '\\' : ''}${process.env.USERNAME}` : '';
+  if (windows) execFileSync('icacls', [folder, '/deny', `${user}:(WD,AD)`], { windowsHide: true, stdio: 'pipe' }); else await fs.chmod(folder, 0o500);
+  const grants = async () => (await cli(['logs', '--tail', '1000'])).data.entries.filter(e => e.operation === 'agent_grant').length;
+  try {
+    const before = await grants();
+    const refused = await cli(['agent', 'grant', '--name', 'no-write', '--token-file', path.join(folder, 'token')], 3);
+    assert.equal(refused.error.code, 'permission_denied');
+    assert.equal(await grants(), before, 'a grant was issued for a token that could not be saved');
+    await assert.rejects(fs.access(path.join(folder, 'token')));
+  } finally {
+    if (windows) execFileSync('icacls', [folder, '/remove:d', user], { windowsHide: true, stdio: 'pipe' }); else await fs.chmod(folder, 0o700);
+  }
+  // A grant the service refuses (this name is not allowed) leaves no empty token file behind.
+  const refusedFile = path.join(temp, 'refused.token');
+  assert.equal((await cli(['agent', 'grant', '--name', 'not allowed!', '--token-file', refusedFile], 2)).error.code, 'invalid_request');
+  await assert.rejects(fs.access(refusedFile));
 });
 test('dynamic key SSRF, obsolete ciphers and plugins fail without exposing credentials', async () => {
   for (const access_key of ['ssconf://127.0.0.1/private','ssconf://169.254.169.254/latest/meta-data','ss://none:top-secret@example.com:443','ss://aes-256-gcm:top-secret@example.com:443?plugin=evil']) {

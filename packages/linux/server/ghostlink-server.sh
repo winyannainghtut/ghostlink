@@ -101,6 +101,20 @@ need_docker() {
     docker info >/dev/null 2>&1 || die "Docker is not running (try: sudo systemctl enable --now docker)"
 }
 
+# start_docker starts a Docker that is installed but not running (with systemd) and waits for it.
+start_docker() {
+    docker info >/dev/null 2>&1 && return 0
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] || return 1
+    systemctl start --no-block docker.service >/dev/null 2>&1 || return 1
+    tries=0
+    while [ $tries -lt 30 ]; do
+        docker info >/dev/null 2>&1 && return 0
+        tries=$((tries + 1))
+        sleep 1
+    done
+    return 1
+}
+
 # The state belongs to the container account, and the server container can rename and replace
 # anything in it. A compromised server could therefore put a symlink to any host directory where
 # a directory of the state belongs, so root must never follow one there. in_state_dir runs a
@@ -116,6 +130,18 @@ in_state_dir() { # NAME COMMAND...
             "$@"
     )
 }
+
+# The files of the state are the container account's too, so root must not follow a symlink in the
+# place of one either (to /etc/shadow, say), or wait on a pipe there. nofollow_cat copies a file to
+# the standard output; dd opens it with O_NOFOLLOW, which a check before a read could not promise.
+nofollow_cat() { # FILE
+    dd if="$1" iflag=nofollow,nonblock bs=65536 2>/dev/null
+}
+
+# state_cat FILE prints a file of the state itself, ipsec_cat FILE one of its ipsec directory
+# (reached through in_state_dir, because a symlink could stand in for the directory as well).
+state_cat() { nofollow_cat "$STATE/$1"; }
+ipsec_cat() { in_state_dir ipsec nofollow_cat "$1"; }
 
 # The container runs as a dedicated unprivileged host account that owns only the state.
 ensure_account() {
@@ -179,23 +205,24 @@ start_container() {
 }
 
 show_key() {
-    [ -f "$STATE/management-key.json" ] || die "no server yet; run: sudo ghostlink-server setup"
+    key=$(state_cat management-key.json) && [ -n "$key" ] ||
+        die "no server yet (or $STATE/management-key.json is not a plain file); run: sudo ghostlink-server setup"
     cat <<EOF
 
 Ghostlink server is running. Paste this management key into the Ghostlink app
 (Servers I run > Add server), or run: ghostlink server add --name NAME --key-file FILE
 
-$(cat "$STATE/management-key.json")
+$key
 
 Keep it private: it gives full control of this server. Show it again with:
   sudo ghostlink-server show-key
 EOF
 }
 
-# state_summary prints the address in keys and each service's port from the state file, which
-# the server writes with two spaces of indentation per level. Ports inside "users" belong to
-# keys imported from Outline that kept their own.
-state_summary() { # STATE-FILE
+# state_summary prints the address in keys and each service's port from the state file on its
+# standard input, which the server writes with two spaces of indentation per level. Ports inside
+# "users" belong to keys imported from Outline that kept their own.
+state_summary() {
     awk '
         BEGIN {
             title["api"] = "management API: TCP"
@@ -230,7 +257,7 @@ state_summary() { # STATE-FILE
                 print line
             }
         }
-    ' "$1"
+    '
 }
 
 setup() {
@@ -321,11 +348,18 @@ ipsec_dir_refused() {
 
 # ipsec_start (re)creates the component: root in the server account's group (to share only the
 # ipsec directory), no capabilities but the three IPsec needs, read-only, no privilege escalation.
+#
+# Docker mounts the directory by its path, which the server account could swap for a symlink in
+# the moment between the check and the mount, and a shell cannot hand Docker an open directory
+# instead (a restart policy would also look the path up again at each start). So the check comes
+# last, right before docker run, and each look at the component's status below checks the
+# directory again: a swap that stays ends the start and stops the component. What this does not
+# close is a swap that is put back at once; closing it needs the exchange directory outside the
+# server account's reach.
 ipsec_start() {
     ipsec_dir
     docker load --input "$LIB/ipsec-image.tar.gz" >/dev/null || die "could not load the bundled IPsec image"
     ipsec_stop_container
-    # Checked again right before Docker mounts it.
     in_state_dir ipsec rm -f status.json || ipsec_dir_refused
     docker run --detach --name "$IPSEC_CONTAINER" --restart unless-stopped \
         --log-opt max-size=10m --log-opt max-file=3 \
@@ -333,16 +367,46 @@ ipsec_start() {
         --cap-add NET_BIND_SERVICE --security-opt no-new-privileges --read-only --tmpfs /run \
         --volume "$STATE/ipsec:$STATE/ipsec" \
         "$IPSEC_IMAGE" serve --dir "$STATE/ipsec" --iptables "$(ipsec_backend)" >/dev/null
+    ipsec_created=1
     prune_images ghostlink-ipsec "$IPSEC_IMAGE"
     tries=0
     while [ $tries -lt 40 ]; do
-        grep -q '"running": true' "$STATE/ipsec/status.json" 2>/dev/null && return 0
+        if ! in_state_dir ipsec true; then
+            ipsec_stop_container
+            ipsec_dir_refused
+        fi
+        ipsec_cat status.json | grep '"running": true' >/dev/null && return 0
         [ "$(docker inspect --format '{{.State.Running}}' "$IPSEC_CONTAINER" 2>/dev/null || true)" = true ] || break
         tries=$((tries + 1))
         sleep 0.5
     done
     docker logs --tail 20 "$IPSEC_CONTAINER" >&2 || true
     die "the IPsec component did not start; see: sudo ghostlink-server ipsec logs"
+}
+
+# ipsec_forwarding_on turns IPv4 forwarding on, now and after a reboot (a sysctl drop-in), and
+# remembers what was there. Until the component's container exists, any end of "ipsec enable" other
+# than success puts that back (ipsec_forwarding_undo), so that a refused enable changes nothing.
+ipsec_forwarding_on() {
+    forwarding_before=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true)
+    dropin_before=0
+    if [ -e "$SYSCTL_FILE" ] || [ -L "$SYSCTL_FILE" ]; then dropin_before=1; fi
+    ipsec_created=0
+    trap ipsec_forwarding_undo EXIT
+    trap 'exit 130' INT TERM HUP
+    printf '# Written by "ghostlink-server ipsec enable"; removed by "ipsec disable".\nnet.ipv4.ip_forward = 1\n' > "$SYSCTL_FILE"
+    sysctl -q -w net.ipv4.ip_forward=1 || die "could not turn on IPv4 forwarding"
+}
+
+ipsec_forwarding_undo() {
+    trap - EXIT INT TERM HUP
+    # Once the container exists the component may still come up (a slow host), and it needs both.
+    [ "$ipsec_created" = 1 ] && return 0
+    [ "$dropin_before" = 1 ] || rm -f "$SYSCTL_FILE"
+    if [ "$forwarding_before" = 0 ]; then
+        sysctl -q -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 ipsec_command() {
@@ -355,9 +419,9 @@ ipsec_command() {
             ensure_account
             ipsec_check_kernel
             ipsec_dir # a refusal leaves the host as it was
-            printf '# Written by "ghostlink-server ipsec enable"; removed by "ipsec disable".\nnet.ipv4.ip_forward = 1\n' > "$SYSCTL_FILE"
-            sysctl -q -w net.ipv4.ip_forward=1 || die "could not turn on IPv4 forwarding"
+            ipsec_forwarding_on
             ipsec_start
+            trap - EXIT INT TERM HUP # the component runs: what was changed stays
             cat <<'EOF'
 The IPsec component is running. Next:
   1. Open UDP 500 and UDP 4500 in this server's firewall and your cloud security group.
@@ -377,8 +441,9 @@ EOF
         status)
             if docker inspect "$IPSEC_CONTAINER" >/dev/null 2>&1; then
                 docker ps --all --filter "name=^${IPSEC_CONTAINER}\$" --format 'container: {{.Status}}'
-                sed -n 's/^  "\(running\|error\|applied_generation\)": \([^,]*\),\{0,1\}$/  \1: \2/p' "$STATE/ipsec/status.json" 2>/dev/null || true
-                connected=$(grep -c '"identity"' "$STATE/ipsec/status.json" 2>/dev/null) || true
+                report=$(ipsec_cat status.json) || report=""
+                printf '%s\n' "$report" | sed -n 's/^  "\(running\|error\|applied_generation\)": \([^,]*\),\{0,1\}$/  \1: \2/p'
+                connected=$(printf '%s\n' "$report" | grep -c '"identity"') || true
                 printf '  connections: %s\n' "${connected:-0}"
             else
                 echo "The IPsec component is not installed. Start it with: sudo ghostlink-server ipsec enable"
@@ -403,7 +468,7 @@ mesh_command() {
     invite=$(admin --json mesh invite --relay --local --hours 1 --note "this server" | sed -n 's/^  "invite": "\(glmesh1:[^"]*\)".*/\1/p')
     [ -n "$invite" ] || die "could not create an invite; is the mesh on? (sudo ghostlink-server mesh enable)"
     # Other nodes reach this host at its public address, which the agent can't always see.
-    host=$(sed -n 's/^  "hostname": "\([^"]*\)".*/\1/p' "$STATE/state.json" | head -n 1)
+    host=$(state_cat state.json | sed -n 's/^  "hostname": "\([^"]*\)".*/\1/p' | head -n 1)
     case "$host" in
         *[!0-9.]*) address=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 { print $1 }') ;;
         *) address=$host ;;
@@ -445,8 +510,11 @@ admin() {
 }
 
 # save_private runs an admin command into a new file only root can read. With set -C the shell
-# creates the file exclusively, so it never writes through a symlink left in its place. The
-# command runs in a subshell, so that a failed check (die exits) still removes the file below.
+# creates the file exclusively, once, and the command writes into that open file, so nothing is
+# written through a symlink left in its place or into a file that was already there. Only a file
+# created here is taken away again when the command fails; one that could not be created, because
+# it appeared meanwhile, is not touched. The command runs in a subshell of its own, so that a
+# failed check in it (die exits) still removes the file.
 save_private() {
     output=$1
     shift
@@ -455,11 +523,15 @@ save_private() {
     fi
     previous=$(umask)
     umask 077
-    if (set -C; admin "$@" > "$output"); then
+    if (
+        set -C
+        exec 3> "$output" || exit 1
+        set +C
+        (admin "$@" >&3) || { rm -f -- "$output"; exit 1; }
+    ); then
         umask "$previous"
     else
         umask "$previous"
-        rm -f "$output"
         exit 1
     fi
 }
@@ -760,7 +832,7 @@ case "$command" in
         need_root status
         need_docker
         docker ps --all --filter "name=^${CONTAINER}\$" --format 'container: {{.Status}}'
-        [ ! -f "$STATE/state.json" ] || state_summary "$STATE/state.json" || true
+        state_cat state.json | state_summary || true
         if docker inspect "$IPSEC_CONTAINER" >/dev/null 2>&1; then
             docker ps --all --filter "name=^${IPSEC_CONTAINER}\$" --format 'IPsec component: {{.Status}} (UDP 500, 4500)'
         fi
@@ -770,15 +842,22 @@ case "$command" in
     stop) need_root stop; need_docker; docker stop "$CONTAINER" >/dev/null && echo "stopped" ;;
     remove)
         need_root remove
-        if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-            ipsec_stop_container
-            # A stop lets the server save its usage and history first.
-            docker stop "$CONTAINER" >/dev/null 2>&1 || true
-            docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
-            for repository in ghostlink-server ghostlink-ipsec; do
-                docker image ls --format '{{.Repository}}:{{.Tag}}' "$repository" 2>/dev/null |
-                    while read -r image; do docker image rm "$image" >/dev/null 2>&1 || true; done
-            done
+        if command -v docker >/dev/null 2>&1; then
+            # The containers restart unless they were stopped, so one left behind by a Docker that
+            # was not running would start again with it, after the state and the account are gone.
+            start_docker || true
+            if docker info >/dev/null 2>&1; then
+                ipsec_stop_container
+                # A stop lets the server save its usage and history first.
+                docker stop "$CONTAINER" >/dev/null 2>&1 || true
+                docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
+                for repository in ghostlink-server ghostlink-ipsec; do
+                    docker image ls --format '{{.Repository}}:{{.Tag}}' "$repository" 2>/dev/null |
+                        while read -r image; do docker image rm "$image" >/dev/null 2>&1 || true; done
+                done
+            else
+                echo "ghostlink-server: Docker is not running, so its containers ghostlink-server and ghostlink-ipsec were not removed. When Docker runs, remove them: sudo docker rm --force $CONTAINER $IPSEC_CONTAINER" >&2
+            fi
         fi
         rm -f "$SYSCTL_FILE"
         ;;

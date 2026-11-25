@@ -125,10 +125,13 @@ fn ipv4_range(prefix: &str) -> Option<(u32, u32)> {
     Some((start, start | !mask))
 }
 
+/// A number written with digits only. `u64::from_str` also takes a leading `+`, which the
+/// worker's parser (Go's `ParseUint`) refuses: such a value used to import and then fail at every
+/// connection.
 fn number(name: &str, value: &str, max: u64) -> Result<u64> {
-    value
-        .parse::<u64>()
-        .ok()
+    Some(value)
+        .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n <= max)
         .with_context(|| format!("{name} must be a number up to {max}"))
 }
@@ -148,6 +151,19 @@ fn range(name: &str, value: &str, max: u64) -> Result<(u64, u64)> {
     }
 }
 
+/// A validated range rewritten from its numbers, in the one form the worker's parser takes:
+/// `N`, or `lo-hi` when a range was written. Spaces and tabs around the hyphen pass validation
+/// (they are trimmed), but the worker refuses them, so the text that goes on is never the text
+/// that was written.
+fn canonical_range(name: &str, value: &str, max: u64) -> Result<String> {
+    let (lo, hi) = range(name, value, max)?;
+    Ok(if value.contains('-') {
+        format!("{lo}-{hi}")
+    } else {
+        lo.to_string()
+    })
+}
+
 fn boolean(name: &str, value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "on" | "true" | "1" | "yes" => Ok(true),
@@ -159,6 +175,8 @@ fn boolean(name: &str, value: &str) -> Result<bool> {
 /// Validates an AmneziaWG signature-packet chain such as `<b 0x0102><r 16><t>`.
 fn signature_chain(name: &str, value: &str) -> Result<()> {
     ensure!(value.len() <= 4096, "{name} is too long");
+    // The value goes to the worker as it is, and a carriage return would end its line there.
+    ensure!(!value.contains('\r'), "{name} must be on one line");
     let mut rest = value.trim();
     ensure!(!rest.is_empty(), "{name} is empty");
     while !rest.is_empty() {
@@ -198,6 +216,11 @@ fn endpoint(value: &str) -> Result<(String, u16)> {
         let (host, port) = value
             .rsplit_once(':')
             .context("Endpoint must be host:port")?;
+        // Without brackets the port cannot be told from the last group of an IPv6 address.
+        ensure!(
+            !host.contains(':'),
+            "An IPv6 endpoint needs brackets: [address]:port"
+        );
         (host.to_string(), port)
     };
     let port = port
@@ -216,6 +239,19 @@ fn endpoint(value: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
+/// A configuration line as `parse` reads it: without its comment (`#` or `;` to the end of the
+/// line) and without the white space around it.
+fn significant(line: &str) -> &str {
+    line.split(['#', ';']).next().unwrap_or("").trim()
+}
+
+/// True for the line that opens the `[Interface]` section: in any case, with any white space
+/// around it and a comment after it, as `parse` finds it. Whoever adds a setting to the section
+/// uses this, so both agree on where it begins.
+pub(crate) fn opens_interface(line: &str) -> bool {
+    significant(line).eq_ignore_ascii_case("[interface]")
+}
+
 pub fn parse(text: &str) -> Result<WgConfig> {
     ensure!(text.len() <= MAX_CONFIG, "Configuration exceeds 64 KiB");
     ensure!(
@@ -229,7 +265,7 @@ pub fn parse(text: &str) -> Result<WgConfig> {
     let mut interface: BTreeMap<String, String> = BTreeMap::new();
     let mut peer: BTreeMap<String, String> = BTreeMap::new();
     for raw in text.lines() {
-        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
+        let line = significant(raw);
         if line.is_empty() {
             continue;
         }
@@ -288,33 +324,38 @@ pub fn parse(text: &str) -> Result<WgConfig> {
             "listenport" => {
                 number("ListenPort", value, 65535)?;
             }
+            // What goes to the worker is rewritten from the validated numbers (see
+            // `canonical_range`), never the text that was written.
             "jc" => {
-                number("Jc", value, 128)?;
-                obfuscation.insert("jc", value.clone());
+                let count = number("Jc", value, 128)?;
+                obfuscation.insert("jc", count.to_string());
             }
             "jmin" | "jmax" => {
-                number(name, value, 1280)?;
-                obfuscation.insert(if name == "jmin" { "jmin" } else { "jmax" }, value.clone());
+                let size = number(name, value, 1280)?;
+                obfuscation.insert(
+                    if name == "jmin" { "jmin" } else { "jmax" },
+                    size.to_string(),
+                );
             }
             "s1" | "s2" | "s3" | "s4" => {
-                number(name, value, 1280)?;
+                let size = number(name, value, 1280)?;
                 let uapi = match name.as_str() {
                     "s1" => "s1",
                     "s2" => "s2",
                     "s3" => "s3",
                     _ => "s4",
                 };
-                obfuscation.insert(uapi, value.clone());
+                obfuscation.insert(uapi, size.to_string());
             }
             "h1" | "h2" | "h3" | "h4" => {
-                range(name, value, u32::MAX as u64)?;
+                let header = canonical_range(name, value, u32::MAX as u64)?;
                 let uapi = match name.as_str() {
                     "h1" => "h1",
                     "h2" => "h2",
                     "h3" => "h3",
                     _ => "h4",
                 };
-                obfuscation.insert(uapi, value.replace(' ', ""));
+                obfuscation.insert(uapi, header);
             }
             "i1" | "i2" | "i3" | "i4" | "i5" => {
                 signature_chain(name, value)?;
@@ -341,7 +382,7 @@ pub fn parse(text: &str) -> Result<WgConfig> {
             | "rejectaftertime"
             | "keepalivetimeout"
             | "maxhandshakeattempts" => {
-                range(name, value, u32::MAX as u64)?;
+                let amount = canonical_range(name, value, u32::MAX as u64)?;
                 let uapi = match name.as_str() {
                     "contentpaddingaddition" => "content_padding_addition",
                     "rekeyaftertime" => "rekey_after_time",
@@ -350,7 +391,7 @@ pub fn parse(text: &str) -> Result<WgConfig> {
                     "keepalivetimeout" => "keepalive_timeout",
                     _ => "max_handshake_attempts",
                 };
-                obfuscation.insert(uapi, value.replace(' ', ""));
+                obfuscation.insert(uapi, amount);
             }
             "randomtrailers" | "disablecookies" => {
                 let enabled = boolean(name, value)?;
@@ -413,8 +454,7 @@ pub fn parse(text: &str) -> Result<WgConfig> {
                 }
             }
             "persistentkeepalive" => {
-                range("PersistentKeepalive", value, 65535)?;
-                keepalive = Some(value.replace(' ', ""));
+                keepalive = Some(canonical_range("PersistentKeepalive", value, 65535)?);
             }
             "advancedsecurity" => ensure!(
                 !boolean("AdvancedSecurity", value)?,
@@ -536,6 +576,139 @@ mod tests {
             gap.as_str(),
         ] {
             assert!(!allowed(split).full_tunnel(), "{split} is split");
+        }
+    }
+
+    /// What the worker's parser (Go's ParseUint, split at the hyphen) takes for a number or a
+    /// range: digits, or two digit strings joined by one hyphen. No sign, space or tab.
+    fn plain(value: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        match value.split_once('-') {
+            Some((lo, hi)) => digits(lo) && digits(hi),
+            None => digits(value),
+        }
+    }
+
+    /// `u64::from_str` takes a leading "+", but the worker refuses it: such a key used to import
+    /// and then fail at every connection (code review 2026-11-25, M3).
+    #[test]
+    fn numbers_are_plain_digits() {
+        for bad in [
+            "Jc = +4",
+            "Jmin = +10",
+            "S1 = +24",
+            "H1 = +100",
+            "H1 = 100-+199",
+            "MTU = +1420",
+            "ListenPort = +51820",
+            "RekeyTimeout = +5",
+            "I1 = <r +16>",
+        ] {
+            assert!(parse(&config(bad, "")).is_err(), "accepted: {bad}");
+        }
+        assert!(parse(&config("", "PersistentKeepalive = +25")).is_err());
+        assert!(parse(&config("", "PersistentKeepalive = 25-+35")).is_err());
+        for good in [
+            "Jc = 4",
+            "MTU = 1420",
+            "ListenPort = 51820",
+            "H1 = 100-199",
+            "I1 = <r 16>",
+        ] {
+            assert!(parse(&config(good, "")).is_ok(), "refused: {good}");
+        }
+    }
+
+    /// Validation trims around the hyphen, so a tab there passed, and only spaces were removed
+    /// from what goes to the worker, which refuses a tab (code review 2026-11-25, M3).
+    #[test]
+    fn ranges_reach_the_worker_in_one_plain_form() {
+        let c = parse(&config(
+            "H1 = 100\t-\t199\nH2 = 200 - 299\nRekeyTimeout = 5\t-\t7\nContentPaddingAddition = 004\nJc = 004\nJmin = 010",
+            "PersistentKeepalive = 25 \t- 35",
+        ))
+        .unwrap();
+        assert_eq!(c.obfuscation["h1"], "100-199");
+        assert_eq!(c.obfuscation["h2"], "200-299");
+        assert_eq!(c.obfuscation["rekey_timeout"], "5-7");
+        assert_eq!(c.obfuscation["content_padding_addition"], "4");
+        assert_eq!(c.obfuscation["jc"], "4");
+        assert_eq!(c.obfuscation["jmin"], "10");
+        assert_eq!(c.peer.keepalive.as_deref(), Some("25-35"));
+        for (name, value) in &c.obfuscation {
+            assert!(plain(value), "{name} = {value:?}");
+        }
+        assert!(plain(c.peer.keepalive.as_deref().unwrap()));
+        // A single number stays a single number.
+        let single = parse(&config("H1 = 1234", "PersistentKeepalive = 25")).unwrap();
+        assert_eq!(single.obfuscation["h1"], "1234");
+        assert_eq!(single.peer.keepalive.as_deref(), Some("25"));
+    }
+
+    /// A signature chain goes to the worker as it was written, and a carriage return inside it
+    /// would end the worker's line.
+    #[test]
+    fn signature_chains_stay_on_one_line() {
+        for bad in ["I1 = <b 0x01>\r<r 4>", "I1 = <r\r4>"] {
+            assert!(parse(&config(bad, "")).is_err(), "accepted: {bad:?}");
+        }
+        // A line ending at the end of the line is no part of the value.
+        let windows = config("I1 = <b 0x01> <r 4>\t<t>", "").replace('\n', "\r\n");
+        assert!(parse(&windows).is_ok());
+    }
+
+    /// An address or prefix is parsed and written out again from its values, so a tab inside one
+    /// is refused and a tab beside one never reaches the worker.
+    #[test]
+    fn tabs_never_reach_the_worker_through_addresses() {
+        let with = |from: &str, to: &str| parse(&config("", "").replace(from, to));
+        for (from, to) in [
+            ("AllowedIPs = 0.0.0.0/0, ::/0", "AllowedIPs = 10.0.0.0/\t8"),
+            ("AllowedIPs = 0.0.0.0/0, ::/0", "AllowedIPs = 10.0.0.0\t/8"),
+            ("Address = 10.8.1.2/32", "Address = 10.8.1.2/3\t2"),
+            ("DNS = 1.1.1.1, 1.0.0.1", "DNS = 1.1.\t1.1"),
+        ] {
+            assert!(with(from, to).is_err(), "accepted: {to:?}");
+        }
+        let c = with(
+            "AllowedIPs = 0.0.0.0/0, ::/0",
+            "AllowedIPs = 10.0.0.0/8,\t192.168.0.0/16\t,\t::/0",
+        )
+        .unwrap();
+        assert_eq!(c.peer.allowed_ips, ["10.0.0.0/8", "192.168.0.0/16", "::/0"]);
+    }
+
+    /// Without brackets the port cannot be told from the last group of an IPv6 address.
+    #[test]
+    fn endpoints_put_ipv6_addresses_in_brackets() {
+        let endpoint = |value: &str| {
+            parse(&config("", "").replace("vpn.example.com:51820", value))
+                .map(|c| (c.peer.host, c.peer.port))
+        };
+        assert_eq!(
+            endpoint("vpn.example.com:51820").unwrap(),
+            ("vpn.example.com".into(), 51820)
+        );
+        assert_eq!(
+            endpoint("203.0.113.5:443").unwrap(),
+            ("203.0.113.5".into(), 443)
+        );
+        assert_eq!(
+            endpoint("[2001:db8::1]:51820").unwrap(),
+            ("2001:db8::1".into(), 51820)
+        );
+        for bad in [
+            "2001:db8::1:51820",
+            "2001:db8::1",
+            "::1:51820",
+            "[2001:db8::1]",
+            "[2001:db8::1]51820",
+            "[2001:db8::1]:0",
+            "vpn.example.com",
+            "vpn.example.com:0",
+            ":51820",
+        ] {
+            assert!(endpoint(bad).is_err(), "accepted: {bad}");
         }
     }
 }

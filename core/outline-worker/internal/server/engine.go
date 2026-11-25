@@ -76,6 +76,8 @@ type Engine struct {
 	monitor   *Monitor
 	logLevel  string
 	reloads   atomic.Int64
+	// beforeStart is set by tests: an error it returns is the instance failing to start.
+	beforeStart func(config []byte) error
 }
 
 func NewEngine(monitor *Monitor, logLevel string) *Engine {
@@ -127,6 +129,11 @@ func (e *Engine) PeerStatus() map[string]map[string]awg.PeerStatus {
 func (e *Engine) Reloads() int64 { return e.reloads.Load() }
 
 func (e *Engine) start(config []byte, guard *udpGuard) (*box.Box, error) {
+	if e.beforeStart != nil {
+		if err := e.beforeStart(config); err != nil {
+			return nil, err
+		}
+	}
 	instance, err := newBox(config)
 	if err != nil {
 		return nil, err

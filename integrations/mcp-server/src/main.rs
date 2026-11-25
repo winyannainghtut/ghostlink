@@ -134,9 +134,9 @@ async fn main() -> anyhow::Result<()> {
                                 agent_token: Some(token.clone()),
                                 action,
                             },
-                            // Match the CLI default: a connect can legitimately wait behind
+                            // The CLI's default too: a connect can legitimately wait behind
                             // another operation and a dynamic-key fetch before it is accepted.
-                            Duration::from_secs(75),
+                            Duration::from_secs(ghostlink_contracts::REQUEST_TIMEOUT_SECONDS),
                         )
                         .await;
                         response["result"] = json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}],"structuredContent":result,"isError":!result.success});

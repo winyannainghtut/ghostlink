@@ -1,10 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="Ghostlink" Language="1033" Version="$(var.Version)" Manufacturer="Ghostlink contributors" UpgradeCode="4F528F86-19CA-46DC-83EA-6B8784640206">
+  <!-- MsiVersion is the numeric a.b.c of the release (scripts/build-windows.ps1 derives it): Windows
+       Installer takes no pre-release such as 0.9.1-rc.1. Version is the whole semantic version. -->
+  <Product Id="*" Name="Ghostlink" Language="1033" Version="$(var.MsiVersion)" Manufacturer="Ghostlink contributors" UpgradeCode="4F528F86-19CA-46DC-83EA-6B8784640206">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="Personal Outline-compatible VPN client" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Ghostlink is already installed." Schedule="afterInstallInitialize" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Property Id="ARPNOREPAIR" Value="yes" />
+    <Property Id="ARPCOMMENTS" Value="Ghostlink $(var.Version)" />
     <Property Id="GHOSTLINK_OWNER_SID" Secure="yes">
       <RegistrySearch Id="ExistingOwner" Root="HKLM" Key="Software\Ghostlink" Name="OwnerSID" Type="raw" Win64="yes" />
     </Property>
@@ -14,7 +17,10 @@
          previous owner is kept. AppSearch runs only in the first sequence, and so do these. -->
     <SetProperty Id="GhostlinkOwnerFromCommandLine" Value="[GHOSTLINK_OWNER_SID]" Before="AppSearch" Sequence="first" />
     <SetProperty Id="GHOSTLINK_OWNER_SID" Action="RestoreGhostlinkOwnerFromCommandLine" Value="[GhostlinkOwnerFromCommandLine]" After="AppSearch" Sequence="first">GhostlinkOwnerFromCommandLine</SetProperty>
-    <SetProperty Id="GHOSTLINK_OWNER_SID" Value="[UserSID]" Before="LaunchConditions" Sequence="both">NOT GHOSTLINK_OWNER_SID</SetProperty>
+    <!-- With no owner, the user who installs is the owner. A deployment tool installs as SYSTEM
+         (S-1-5-18), who is nobody to own the service for: then no owner is set, and the launch
+         condition below asks for GHOSTLINK_OWNER_SID. -->
+    <SetProperty Id="GHOSTLINK_OWNER_SID" Value="[UserSID]" Before="LaunchConditions" Sequence="both"><![CDATA[NOT GHOSTLINK_OWNER_SID AND UserSID <> "S-1-5-18"]]></SetProperty>
     <Property Id="WINDOWS_BUILD"><RegistrySearch Id="WindowsBuildSearch" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Win64="yes" /></Property>
     <Condition Message="Ghostlink supports Windows 10/11 x64."><![CDATA[Installed OR (VersionNT64 AND WINDOWS_BUILD >= 10240)]]></Condition>
     <Condition Message="The authorized user's SID is required. Supply GHOSTLINK_OWNER_SID when installing unattended.">Installed OR GHOSTLINK_OWNER_SID</Condition>

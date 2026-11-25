@@ -65,13 +65,11 @@ func NewService(store *Store, engine *Engine, monitor *Monitor) *Service {
 		report: func(string, error) {}, ipsecSeen: map[string]ipsecBaseline{}, meshLive: mesh.NewLive(),
 		asn: newASNManager(store.Dir())}
 	service.asnCtx, service.asnCancel = context.WithCancel(context.Background())
-	// The provider lookup downloads its list when it is turned on, and forgets it when it is turned off.
+	// The provider lookup downloads its list when it is turned on, and forgets it when it is turned
+	// off (it follows the setting as it is when the hook runs: see syncASN).
 	service.OnChange(func(previous, next *State) {
-		switch {
-		case !previous.Monitor.ASNLookup && next.Monitor.ASNLookup:
-			service.RefreshASN(time.Now())
-		case previous.Monitor.ASNLookup && !next.Monitor.ASNLookup:
-			service.asn.Drop()
+		if previous.Monitor.ASNLookup != next.Monitor.ASNLookup {
+			service.syncASN(time.Now())
 		}
 	})
 	// Mesh agents waiting for a new configuration wake on every change to the mesh.
@@ -207,6 +205,23 @@ func (s *Service) engineUp() {
 	}
 }
 
+// noteEngineDown records at once, for the health shown to the owner, that a change which could not
+// be applied left the engine down: neither the new configuration nor, when it was put back, the
+// previous one would start (Engine.Apply says so by leaving nothing running). It is reported and
+// tried again like an engine that failed to start (ensureEngine), at the next check, but until then
+// the health would have said the engine ran.
+func (s *Service) noteEngineDown(err error) {
+	if running, _ := s.engine.Running(); running {
+		return
+	}
+	s.engineMu.Lock()
+	defer s.engineMu.Unlock()
+	if message := err.Error(); message != s.engineErr {
+		s.engineErr = message
+		s.report("engine", fmt.Errorf("the VPN engine is down after a change that could not be applied; it is tried again every 30 s: %w", err))
+	}
+}
+
 // engineError is why the engine is down, or "" while it runs.
 func (s *Service) engineError() string {
 	s.engineMu.Lock()
@@ -308,6 +323,7 @@ func (s *Service) change(fn func(*State) error, checkPorts bool) (*State, *State
 	reload := !bytes.Equal(before, after)
 	if reload {
 		if err := s.engine.Apply(next); err != nil {
+			s.noteEngineDown(err)
 			return nil, nil, err
 		}
 		// A change can also bring up an engine that could not start (a busy port moved).
@@ -321,7 +337,9 @@ func (s *Service) change(fn func(*State) error, checkPorts bool) (*State, *State
 	if err := s.store.Save(); err != nil {
 		s.store.State = previous
 		if reload {
-			_ = s.engine.Apply(previous)
+			if restoreErr := s.engine.Apply(previous); restoreErr != nil {
+				s.noteEngineDown(restoreErr)
+			}
 		}
 		return nil, nil, err
 	}
@@ -477,7 +495,11 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 func (s *Service) Close() error {
-	s.asnCancel() // a list being downloaded is dropped, not waited for
+	// A list being downloaded is dropped, not waited for. Under the store lock, which a download
+	// is begun under (see beginASN): none begins after this, so none is added to the wait below.
+	s.store.Lock()
+	s.asnCancel()
+	s.store.Unlock()
 	s.asnWG.Wait()
 	s.startup.Wait() // the check of the IPsec certificate that Start began, if it is still running
 	return s.engine.Close()

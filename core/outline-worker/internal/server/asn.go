@@ -63,18 +63,24 @@ var (
 type asnManager struct {
 	dir   string
 	table atomic.Pointer[asn.Table]
+	// read parses a saved or downloaded list (tests replace it).
+	read func(path string) (*asn.Table, error)
 
 	mu      sync.Mutex
 	updated time.Time // when the list in memory was downloaded
 	failed  string    // why the last try failed ("" after a success)
 	tried   time.Time // when the last try began
-	busy    bool
-	// generation counts the times the lookup was turned off: a download that began before is
-	// not put in use.
+	// busy is set from the start of a download to the end of the goroutine that runs it, also
+	// when the download was ended because the lookup was turned off: that stops within moments.
+	busy bool
+	// generation counts the times the lookup was turned off: a download, or the reading of the
+	// saved list, that began before is not put in use.
 	generation int
+	// cancel ends the download that is running (see Drop).
+	cancel context.CancelFunc
 }
 
-func newASNManager(dir string) *asnManager { return &asnManager{dir: dir} }
+func newASNManager(dir string) *asnManager { return &asnManager{dir: dir, read: readASNFile} }
 
 func (m *asnManager) path() string { return filepath.Join(m.dir, ASNFile) }
 
@@ -110,6 +116,9 @@ func (m *asnManager) Status(enabled bool) asnStatus {
 // Load reads the list saved by an earlier download, if there is one. A damaged file is removed
 // so it is downloaded again.
 func (m *asnManager) Load() error {
+	m.mu.Lock()
+	generation := m.generation
+	m.mu.Unlock()
 	info, err := os.Stat(m.path())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -117,15 +126,20 @@ func (m *asnManager) Load() error {
 	if err != nil {
 		return err
 	}
-	table, err := readASNFile(m.path())
+	table, err := m.read(m.path())
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Reading takes a while. If the lookup was turned off meanwhile, which deleted the list, what
+	// was read is not used; nor is it when a download has put a list in use since.
+	if m.generation != generation || m.table.Load() != nil {
+		return nil
+	}
 	if err != nil {
 		_ = os.Remove(m.path())
 		return fmt.Errorf("the saved list could not be read and was removed: %w", err)
 	}
-	m.mu.Lock()
 	m.table.Store(table)
 	m.updated = info.ModTime()
-	m.mu.Unlock()
 	return nil
 }
 
@@ -167,28 +181,41 @@ func (m *asnManager) Due(now time.Time) bool {
 	return m.table.Load() == nil || now.Sub(m.updated) > asnRefreshAge
 }
 
-// begin marks a download as running, and returns the generation it belongs to. It reports false
-// when a download is running already.
-func (m *asnManager) begin(now time.Time) (int, bool) {
+// begin marks a download as running. It returns the context the download runs under, which ends
+// when the lookup is turned off (see Drop) or parent ends, and the generation the download
+// belongs to. It reports false when a download is running already.
+func (m *asnManager) begin(parent context.Context, now time.Time) (context.Context, int, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.busy {
-		return 0, false
+		return nil, 0, false
 	}
+	var ctx context.Context
+	ctx, m.cancel = context.WithCancel(parent)
 	m.busy, m.tried = true, now
-	return m.generation, true
+	return ctx, m.generation, true
 }
 
-// finish records how a download went. The list in use is kept when it failed.
-func (m *asnManager) finish(err error) {
+// finish records how a download of the given generation went, and reports whether the download
+// still counts: it does not when the lookup was turned off while it ran, and then it says nothing
+// about the lookup, which may be on again by now. The list in use is kept when a download failed.
+func (m *asnManager) finish(generation int, err error) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.busy = false
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	if generation != m.generation {
+		return false
+	}
 	if err != nil {
 		m.failed = err.Error()
 	} else {
 		m.failed = ""
 	}
+	return true
 }
 
 func (m *asnManager) download(ctx context.Context, generation int) error {
@@ -224,14 +251,19 @@ func (m *asnManager) download(ctx context.Context, generation int) error {
 	if written > asnMaxDownload {
 		return fmt.Errorf("the list is larger than %d MB, so it was refused", asnMaxDownload>>20)
 	}
-	table, err := readASNFile(pending)
+	table, err := m.read(pending)
 	if err != nil {
 		return fmt.Errorf("the list from %s was refused: %w", ASNSource, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Under the lock, so that a lookup turned off at this moment either deletes the list this
+	// puts in place, or is seen here.
 	if m.generation != generation {
 		return errors.New("the lookup was turned off while the list was downloading")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := os.Rename(pending, m.path()); err != nil {
 		return err
@@ -241,22 +273,31 @@ func (m *asnManager) download(ctx context.Context, generation int) error {
 	return nil
 }
 
-// Drop forgets the list and deletes it, when the lookup is turned off.
+// Drop forgets the list and deletes it, when the lookup is turned off. A download that is running
+// is ended, and what it found is not put in use.
 func (m *asnManager) Drop() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
 	m.table.Store(nil)
 	m.updated, m.failed, m.tried = time.Time{}, "", time.Time{}
 	m.generation++
-	m.mu.Unlock()
 	_ = os.Remove(m.path())
 	_ = os.Remove(m.path() + ".pending")
 }
 
-// RefreshASN downloads the list in the background, now, whatever its age (the owner turned the
-// lookup on or asked for it). It does nothing when a download is running. A try that fails is
-// reported and tried again later (refreshASNIfDue).
-func (s *Service) RefreshASN(now time.Time) {
-	generation, ok := s.asn.begin(now)
+// beginASN downloads the list in the background, unless a download is running or the service is
+// closing. Called with the store locked and the lookup on, so the setting cannot change before the
+// download has begun, and Close, which takes the same lock, cannot start waiting for the downloads
+// in between.
+func (s *Service) beginASN(now time.Time) {
+	if s.asnCtx.Err() != nil {
+		return
+	}
+	ctx, generation, ok := s.asn.begin(s.asnCtx, now)
 	if !ok {
 		return
 	}
@@ -264,9 +305,12 @@ func (s *Service) RefreshASN(now time.Time) {
 	s.asnWG.Add(1)
 	go func() {
 		defer s.asnWG.Done()
-		err := s.asn.download(s.asnCtx, generation)
-		s.asn.finish(err)
-		switch {
+		err := s.asn.download(ctx, generation)
+		switch current := s.asn.finish(generation, err); {
+		case !current:
+			// Turned off while it ran. If it was turned on again meanwhile, its own download was
+			// refused because this one still ran: it is due now.
+			s.refreshASNIfDue(time.Now())
 		case err != nil && s.asnCtx.Err() == nil:
 			s.report("provider lookup", err)
 		case err == nil && failedBefore:
@@ -275,15 +319,41 @@ func (s *Service) RefreshASN(now time.Time) {
 	}()
 }
 
+// RefreshASN downloads the list in the background, now, whatever its age (the owner asked for it).
+// It does nothing when a download is running, and reports false, doing nothing, when the lookup is
+// off. A try that fails is reported and tried again later (refreshASNIfDue).
+func (s *Service) RefreshASN(now time.Time) bool {
+	s.store.Lock()
+	defer s.store.Unlock()
+	if !s.store.State.Monitor.ASNLookup {
+		return false
+	}
+	s.beginASN(now)
+	return true
+}
+
 // refreshASNIfDue downloads the list in the background when the lookup is on and the list is
 // missing or old, and the last try was not lately. Called at start and every hour.
 func (s *Service) refreshASNIfDue(now time.Time) {
-	enabled := false
-	s.Read(func(state *State) { enabled = state.Monitor.ASNLookup })
-	if !enabled || !s.asn.Due(now) {
-		return
+	s.store.Lock()
+	defer s.store.Unlock()
+	if s.store.State.Monitor.ASNLookup && s.asn.Due(now) {
+		s.beginASN(now)
 	}
-	s.RefreshASN(now)
+}
+
+// syncASN makes the lookup follow the setting as it is now: on downloads the list, off forgets it
+// and ends a download that is running. It reads the setting itself and acts before the setting can
+// change again, instead of acting on the change that called it: changes made at once run their
+// hooks in any order, and the hook of an older one must not undo a newer one.
+func (s *Service) syncASN(now time.Time) {
+	s.store.Lock()
+	defer s.store.Unlock()
+	if s.store.State.Monitor.ASNLookup {
+		s.beginASN(now)
+	} else {
+		s.asn.Drop()
+	}
 }
 
 // annotateASN adds the provider of each address to the clients listed, when the lookup is on.

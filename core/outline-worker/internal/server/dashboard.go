@@ -37,16 +37,24 @@ const (
 // has its own port and needs the login token, and its API calls go through the same handlers
 // as the management API.
 type Dashboard struct {
-	service  *Service
-	api      *API
-	static   fs.FS
+	service *Service
+	api     *API
+	static  fs.FS
+	// applying lets one Apply at a time through, from reading the configuration to acting on it.
+	// It is separate from mu, which every request takes, so requests are not held up while Apply
+	// waits for the state.
+	applying sync.Mutex
 	mu       sync.Mutex
 	server   *http.Server
 	running  DashboardConfig
 	sessions map[string]time.Time
 	limiter  *failureLimiter
+	// closed is set by Close, after which Apply does nothing.
+	closed bool
 	// Listen is replaceable in tests.
 	listen func(network, address string) (net.Listener, error)
+	// afterRead is set by tests: it runs in Apply right after the configuration was read.
+	afterRead func()
 }
 
 func NewDashboard(service *Service, api *API) *Dashboard {
@@ -56,13 +64,25 @@ func NewDashboard(service *Service, api *API) *Dashboard {
 }
 
 // Apply starts, moves or stops the listener to match the stored configuration. A new token
-// signs everyone out.
+// signs everyone out. It does nothing once the dashboard is closed.
+//
+// The configuration is read inside the turn Apply calls take, so that Apply calls made at once act
+// on what the state is when each gets its turn, in that order: the last to act has read last. Read
+// before taking the turn, an older reading could act after a newer one.
 func (d *Dashboard) Apply() error {
+	d.applying.Lock()
+	defer d.applying.Unlock()
 	var config DashboardConfig
 	var certPEM, keyPEM string
 	d.service.Read(func(s *State) { config, certPEM, keyPEM = s.Dashboard, s.API.CertPEM, s.API.KeyPEM })
+	if d.afterRead != nil {
+		d.afterRead()
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
 	if config.Token != d.running.Token {
 		d.sessions = map[string]time.Time{}
 	}
@@ -109,9 +129,12 @@ func (d *Dashboard) Apply() error {
 	return nil
 }
 
+// Close stops the listener. After it, Apply does nothing, so a change saved while the server stops
+// cannot open the port again.
 func (d *Dashboard) Close() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.closed = true
 	if d.server != nil {
 		_ = d.server.Close()
 		d.server = nil

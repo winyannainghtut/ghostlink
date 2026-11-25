@@ -26,5 +26,10 @@ libc = "0.2"
 windows-service = "0.8"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_Threading"] }
 
+# Its own main: the test binary is also the stand-in tunnel worker the service starts.
+[[test]]
+name = "cleanup_barrier"
+harness = false
+
 [lints]
 workspace = true

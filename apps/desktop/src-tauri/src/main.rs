@@ -1,11 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use ghostlink_contracts::{Action, Request, Response, SCHEMA_VERSION};
+use ghostlink_contracts::{Action, ConnectionState, Request, Response, Status, SCHEMA_VERSION};
 use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{TrayIcon, TrayIconBuilder},
     Manager,
 };
+
+/// How long the app waits for the service: as long as the CLI and the MCP bridge do. The service
+/// may be busy with a tunnel start or a call to a server for longer than 30 seconds (the old
+/// limit), and its answer must not be reported as a timeout while the operation goes on and
+/// succeeds.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(ghostlink_contracts::REQUEST_TIMEOUT_SECONDS);
 
 #[tauri::command]
 async fn vpn_request(action: Action) -> Response {
@@ -32,7 +38,7 @@ async fn vpn_request(action: Action) -> Response {
             agent_token: None,
             action,
         },
-        Duration::from_secs(30),
+        REQUEST_TIMEOUT,
     )
     .await
 }
@@ -75,7 +81,6 @@ fn save_download(
         Some("conf") => "conf",
         Some(_) => return Err("This kind of file cannot be saved".into()),
     };
-    use std::io::Write;
     if content.len() > 4 << 20 {
         return Err("The file is too large".into());
     }
@@ -93,24 +98,97 @@ fn save_download(
         .path()
         .download_dir()
         .map_err(|_| "Could not find your Downloads folder".to_string())?;
+    save_in(&dir, &stem, extension, &content).map(|path| path.display().to_string())
+}
+
+/// Writes `content` to a NEW file in `dir`, named after `stem`: the first of the numbered names
+/// that is free. The file holds keys and client configurations, so it is private to this user
+/// from the moment it exists (mode 0600 on Unix; on Windows a protected ACL for SYSTEM and this
+/// user), where a file made the ordinary way takes the folder's permissions; and one that cannot
+/// be written completely is not left behind.
+fn save_in(
+    dir: &std::path::Path,
+    stem: &str,
+    extension: &str,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
     for n in 0..100 {
-        let path = dir.join(download_name(&stem, extension, n));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let path = dir.join(download_name(stem, extension, n));
+        match ghostlink_contracts::private::create_file(&path) {
             Ok(mut file) => {
-                file.write_all(content.as_bytes())
-                    .and_then(|_| file.sync_all())
-                    .map_err(|_| "Could not write the file".to_string())?;
-                return Ok(path.display().to_string());
+                let written = file
+                    .write_all(content.as_bytes())
+                    .and_then(|_| file.sync_all());
+                if written.is_err() {
+                    // Closed first: Windows does not delete a file that is open.
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err("Could not write the file".into());
+                }
+                return Ok(path);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err("Could not create the file in Downloads".into()),
         }
     }
     Err("Too many files with this name in Downloads".into())
+}
+
+/// What the tray icon's tooltip says about the connection, from the service's status; None is a
+/// service that does not answer. It names the server by its ID, cut to 40 characters: the
+/// platforms cut a tooltip at about 127.
+fn tray_tooltip(status: Option<&Status>) -> String {
+    let Some(status) = status else {
+        return "Ghostlink: the service is not running".into();
+    };
+    let server: String = status
+        .profile
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let to = if server.is_empty() {
+        String::new()
+    } else {
+        format!(" to {server}")
+    };
+    match status.status {
+        ConnectionState::Connected => format!("Ghostlink: connected{to}"),
+        ConnectionState::Connecting | ConnectionState::Reconnecting => {
+            format!("Ghostlink: connecting{to}")
+        }
+        ConnectionState::Disconnecting => "Ghostlink: disconnecting".into(),
+        ConnectionState::Failed => "Ghostlink: connection failed".into(),
+        ConnectionState::Disconnected => "Ghostlink: disconnected".into(),
+    }
+}
+
+/// Keeps the tray icon's tooltip in step with the connection: the service is asked every few
+/// seconds, and the tooltip is set only when its text changes. The menu is untouched.
+async fn follow_connection(tray: TrayIcon) {
+    let endpoint = std::env::var("GHOSTLINK_ENDPOINT")
+        .unwrap_or_else(|_| ghostlink_contracts::default_endpoint());
+    let mut shown = String::new();
+    loop {
+        let request = Request {
+            schema_version: SCHEMA_VERSION,
+            agent_token: None,
+            action: Action::Status {},
+        };
+        let response = ghostlink_contracts::call(&endpoint, request, Duration::from_secs(3)).await;
+        let status: Option<Status> = response
+            .data
+            .filter(|_| response.success)
+            .and_then(|data| serde_json::from_value(data).ok());
+        let text = tray_tooltip(status.as_ref());
+        if text != shown {
+            let _ = tray.set_tooltip(Some(&text));
+            shown = text;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 }
 
 fn main() {
@@ -147,7 +225,8 @@ fn main() {
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
-            tray.build(app)?;
+            let tray = tray.build(app)?;
+            tauri::async_runtime::spawn(follow_connection(tray));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -162,7 +241,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::download_name;
+    use super::{download_name, save_in, tray_tooltip, ConnectionState, Status, REQUEST_TIMEOUT};
 
     #[test]
     fn conf_files_keep_names_that_wireguard_can_import() {
@@ -196,5 +275,113 @@ mod tests {
             download_name(&long, "mobileconfig", 0),
             format!("{long}.mobileconfig")
         );
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ghostlink-desktop-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An export never replaces a file that is already there: it takes the next free name.
+    #[test]
+    fn exports_take_the_next_free_name_and_never_replace_a_file() {
+        let dir = scratch("names");
+        let first = save_in(&dir, "maya-vpn", "html", "one").unwrap();
+        let second = save_in(&dir, "maya-vpn", "html", "two").unwrap();
+        assert_eq!(first.file_name().unwrap(), "maya-vpn.html");
+        assert_eq!(second.file_name().unwrap(), "maya-vpn (1).html");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exports hold keys and client configurations: they are private to this user from the moment
+    /// they exist, not world-readable under the default umask or the folder's inherited ACL.
+    #[cfg(unix)]
+    #[test]
+    fn exports_are_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let path = save_in(&dir, "maya-wireguard", "conf", "[Interface]\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows the ACL has SYSTEM and this user only, and takes nothing from the folder: no
+    /// entry is inherited (icacls marks those `(I)`), where an ordinary file in the same folder
+    /// has the folder's.
+    #[cfg(windows)]
+    #[test]
+    fn exports_are_private_to_this_user() {
+        let dir = scratch("acl");
+        let acl = |path: &std::path::Path| {
+            let out = std::process::Command::new("icacls")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "icacls failed");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let path = save_in(&dir, "maya-wireguard", "conf", "[Interface]\n").unwrap();
+        let private = acl(&path);
+        assert!(
+            !private.contains("(I)"),
+            "inherits from the folder: {private}"
+        );
+        assert!(private.contains("AUTHORITY\\SYSTEM:"), "{private}");
+        let entries = private.lines().filter(|l| l.contains(":(")).count();
+        assert_eq!(entries, 2, "SYSTEM and this user, nobody else: {private}");
+        let ordinary = dir.join("ordinary.txt");
+        std::fs::write(&ordinary, "x").unwrap();
+        assert!(acl(&ordinary).contains("(I)"), "the control inherits");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tray's tooltip tells the state of the connection (it said "Ghostlink" whatever it was).
+    #[test]
+    fn the_tray_tooltip_follows_the_connection() {
+        let status = |state: ConnectionState, profile: Option<&str>| Status {
+            status: state,
+            profile: profile.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(
+            tray_tooltip(Some(&status(ConnectionState::Connected, Some("home")))),
+            "Ghostlink: connected to home"
+        );
+        assert_eq!(
+            tray_tooltip(Some(&status(ConnectionState::Reconnecting, Some("home")))),
+            "Ghostlink: connecting to home"
+        );
+        assert_eq!(
+            tray_tooltip(Some(&status(ConnectionState::Disconnected, None))),
+            "Ghostlink: disconnected"
+        );
+        assert_eq!(
+            tray_tooltip(Some(&status(ConnectionState::Failed, Some("home")))),
+            "Ghostlink: connection failed"
+        );
+        assert_eq!(
+            tray_tooltip(Some(&status(ConnectionState::Connected, None))),
+            "Ghostlink: connected"
+        );
+        assert_eq!(tray_tooltip(None), "Ghostlink: the service is not running");
+        // A long server ID cannot push the text past what the platforms show (127 characters).
+        let long = "x".repeat(200);
+        let text = tray_tooltip(Some(&status(ConnectionState::Connected, Some(&long))));
+        assert!(text.chars().count() <= 127, "{text}");
+        assert!(text.ends_with(&"x".repeat(40)));
+    }
+
+    /// The app waits for the service as long as the CLI and the MCP bridge do; it used to give up
+    /// after 30 seconds, while a tunnel start or a call to a server was still going on.
+    #[test]
+    fn the_app_waits_as_long_as_the_other_clients() {
+        assert_eq!(ghostlink_contracts::REQUEST_TIMEOUT_SECONDS, 75);
+        assert_eq!(REQUEST_TIMEOUT, std::time::Duration::from_secs(75));
     }
 }

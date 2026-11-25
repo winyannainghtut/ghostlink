@@ -20,7 +20,7 @@ use std::{
 struct Args {
     #[arg(long, global = true)]
     json: bool,
-    #[arg(long, global = true, default_value_t = 75, value_parser = clap::value_parser!(u64).range(1..=600))]
+    #[arg(long, global = true, default_value_t = ghostlink_contracts::REQUEST_TIMEOUT_SECONDS, value_parser = clap::value_parser!(u64).range(1..=600))]
     timeout: u64,
     #[arg(long, global = true, env = "GHOSTLINK_ENDPOINT", default_value_t = ghostlink_contracts::default_endpoint())]
     endpoint: String,
@@ -614,6 +614,8 @@ async fn run(args: &Args) -> Response {
     } else {
         None
     };
+    // The file an `agent grant` token is saved in, made before the grant is issued.
+    let mut token_output: Option<PrivateOutput> = None;
     let action = match &args.command {
         Command::Key {
             command:
@@ -630,6 +632,9 @@ async fn run(args: &Args) -> Response {
                 "access key",
                 "--file",
                 "--stdin",
+                // What the parsers take, as the desktop app's file picker does: a WireGuard
+                // configuration or an Amnezia vpn:// key may be up to 64 KiB.
+                ghostlink_engine::access::MAX_CREDENTIAL as u64,
                 Duration::from_secs(args.timeout),
             )
             .await
@@ -749,6 +754,18 @@ async fn run(args: &Args) -> Response {
                         "--token-file must name a new file in an existing folder; it will not overwrite an existing one",
                     );
                 }
+                // The file is made now, before the grant exists: a path that cannot be written
+                // (no permission, a full disk) is found here, not after the old grant stopped
+                // working. It is removed again if the grant fails or the token cannot be saved.
+                match PrivateOutput::create(token_file) {
+                    Ok(file) => token_output = Some(file),
+                    Err(_) => {
+                        return Response::err(
+                            "permission_denied",
+                            "Could not create a NEW private token file there; choose a writable unused path. No grant was issued",
+                        )
+                    }
+                }
                 Action::AgentGrant {
                     name: name.clone(),
                     control: *control,
@@ -770,10 +787,9 @@ async fn run(args: &Args) -> Response {
         timeout,
     )
     .await;
-    if let Command::Agent {
-        command: AgentCommand::Grant { token_file, .. },
-    } = &args.command
-    {
+    // The token file was made before the call. Whatever happens from here, except a complete
+    // save, drops `output` and so removes it: no empty file stays behind to block a retry.
+    if let Some(mut output) = token_output.take() {
         if response.success {
             let value = response
                 .data
@@ -786,24 +802,11 @@ async fn run(args: &Args) -> Response {
                     return Response::err("internal", "Token issuance did not return a credential")
                 }
             };
-            let result = (|| -> std::io::Result<()> {
-                let mut options = std::fs::OpenOptions::new();
-                options.create_new(true).write(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options.open(token_file)?;
-                #[cfg(windows)]
-                ghostlink_engine::storage::restrict_acl(token_file)
-                    .map_err(|_| std::io::Error::other("Cannot protect token file"))?;
-                writeln!(file, "{issued}")?;
-                file.sync_all()?;
-                Ok(())
-            })();
-            if result.is_err() {
-                return Response::err("permission_denied", "Could not create a NEW private token file; revoke this grant or issue it again to a writable unused path");
+            let saved = output
+                .write(&format!("{issued}\n"))
+                .and_then(|_| output.finish());
+            if saved.is_err() {
+                return Response::err("permission_denied", "The grant was issued, but its token could not be written to the new private token file; revoke this grant or issue it again to a writable unused path");
             }
             response.data.as_mut().unwrap()["token_saved"] = json!(true);
         }
@@ -909,49 +912,53 @@ fn print(response: &Response, json_output: bool) {
     }
 }
 
-/// Reads a credential from a file or a pipe, never from an argument or an interactive terminal.
-/// A pipe is read within `timeout`.
+/// What a management key may take: a small JSON document.
+const MAX_MANAGEMENT_KEY: u64 = 16 * 1024;
+
+/// The text of `source` if it is UTF-8 and at most `limit` bytes. It never reads more than
+/// `limit + 1` bytes, whatever the source is or does.
+fn read_limited(source: impl std::io::Read, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut value = String::new();
+    source.take(limit + 1).read_to_string(&mut value)?;
+    if value.len() as u64 > limit {
+        return Err(std::io::Error::other("too large"));
+    }
+    Ok(value)
+}
+
+/// Reads a credential of at most `limit` bytes from a file or a pipe, never from an argument or
+/// an interactive terminal. A pipe is read within `timeout`.
 async fn read_secret(
     file: Option<&PathBuf>,
     stdin: bool,
     what: &str,
     file_flag: &str,
     stdin_flag: &str,
+    limit: u64,
     timeout: Duration,
 ) -> Result<String, Response> {
-    const LIMIT: u64 = 16384;
+    let kib = limit / 1024;
     if let Some(file) = file {
-        return std::fs::metadata(file)
-            .and_then(|m| {
-                if m.len() <= LIMIT {
-                    std::fs::read_to_string(file)
-                } else {
-                    Err(std::io::Error::other("too large"))
-                }
-            })
+        return std::fs::File::open(file)
+            .and_then(|file| read_limited(file, limit))
             .map_err(|_| {
                 Response::err(
                     "invalid_profile",
-                    &format!("Cannot read the {what} file (maximum 16 KiB)"),
+                    &format!("Cannot read the {what} file (maximum {kib} KiB)"),
                 )
             });
     }
     if stdin {
-        use std::io::{IsTerminal, Read};
+        use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
             return Err(Response::err("invalid_request", &format!("Pipe the {what} to stdin or use {file_flag}; interactive terminal entry is disabled to avoid echoing credentials")));
         }
         // On a blocking thread: a pipe that never closes must not hold the CLI past --timeout
         // or keep Ctrl+C from being handled.
-        let read = tokio::task::spawn_blocking(|| {
-            let mut value = String::new();
-            std::io::stdin()
-                .take(LIMIT + 1)
-                .read_to_string(&mut value)
-                .map(|_| value)
-        });
+        let read = tokio::task::spawn_blocking(move || read_limited(std::io::stdin(), limit));
         return match tokio::time::timeout(timeout, read).await {
-            Ok(Ok(Ok(value))) if value.len() as u64 <= LIMIT => Ok(value),
+            Ok(Ok(Ok(value))) => Ok(value),
             Err(_) => Err(Response::err(
                 "timeout",
                 &format!(
@@ -960,7 +967,7 @@ async fn read_secret(
             )),
             _ => Err(Response::err(
                 "invalid_profile",
-                &format!("Cannot read the {what} from stdin"),
+                &format!("Cannot read the {what} from stdin (maximum {kib} KiB)"),
             )),
         };
     }
@@ -1068,6 +1075,7 @@ async fn server_action(command: &ServerCommand, timeout: u64) -> Result<Action, 
                 "management key",
                 "--key-file",
                 "--key-stdin",
+                MAX_MANAGEMENT_KEY,
                 Duration::from_secs(timeout),
             )
             .await?,
@@ -1369,21 +1377,58 @@ fn conf_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(conf)
 }
 
+/// A NEW file only this user can open, for a secret. It is private from the moment it exists, not
+/// restricted after the folder's inherited permissions applied to it, and it is removed again
+/// unless [`PrivateOutput::finish`] is reached: also when the command fails half-way or is
+/// interrupted, so a failed attempt leaves no empty or partial secret behind (which would also
+/// make a retry to the same path fail).
+struct PrivateOutput {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    complete: bool,
+}
+
+impl PrivateOutput {
+    /// # Errors
+    /// Fails, without touching anything, if a file or link is already at `path`.
+    fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            path: path.into(),
+            file: Some(ghostlink_contracts::private::create_file(path)?),
+            complete: false,
+        })
+    }
+    fn write(&mut self, content: &str) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.write_all(content.as_bytes()),
+            None => Err(std::io::Error::other("The file is already closed")),
+        }
+    }
+    /// Syncs and closes the file, and keeps it.
+    fn finish(mut self) -> std::io::Result<()> {
+        if let Some(file) = self.file.take() {
+            file.sync_all()?;
+        }
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl Drop for PrivateOutput {
+    fn drop(&mut self) {
+        if !self.complete {
+            // Closed first: Windows does not delete a file that is open without sharing.
+            drop(self.file.take());
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Writes `content` to a NEW file only this user can read.
 fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(windows)]
-    ghostlink_engine::storage::restrict_acl(path)
-        .map_err(|_| std::io::Error::other("Cannot protect the file"))?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()
+    let mut output = PrivateOutput::create(path)?;
+    output.write(content)?;
+    output.finish()
 }
 
 fn on_off(value: &Option<String>) -> Option<bool> {
@@ -1592,9 +1637,7 @@ fn finish_server_response(
             });
         }
         ServerCommand::Keys {
-            command: ServerKeysCommand::Create {
-                output, import_as, ..
-            },
+            command: ServerKeysCommand::Create { output, .. },
         } => {
             if let Some(path) = output {
                 let Some(access_key) = data["access_key"].as_str().filter(|k| !k.trim().is_empty())
@@ -1617,7 +1660,12 @@ fn finish_server_response(
                 }
                 data["saved_to"] = json!(path.display().to_string());
             }
-            if output.is_some() || import_as.is_some() {
+            // The key leaves the answer only once it is kept somewhere else: in the file written
+            // above (or this returned early), or saved on this device (`imported`). If the
+            // service could not save it (`import_error`) and no file has it, this answer is the
+            // one place it is, and it stays in it.
+            let kept = output.is_some() || data.get("imported").is_some_and(|v| !v.is_null());
+            if kept {
                 if let Some(key) = data.as_object_mut() {
                     key.remove("access_key");
                     key.remove("config");
@@ -1694,5 +1742,133 @@ mod tests {
         assert_eq!(default_speed_limit("0").ok(), Some(0));
         assert_eq!(default_speed_limit("2.5").ok(), Some(2_500_000));
         assert!(default_speed_limit("default").is_err());
+    }
+
+    /// The CLI, the MCP bridge and the desktop app wait for the service for the same time (the
+    /// desktop app gave up after 30 seconds, while the others still waited).
+    #[test]
+    fn the_default_wait_is_the_one_every_client_uses() {
+        let args = Args::parse_from(["ghostlink", "status"]);
+        assert_eq!(args.timeout, ghostlink_contracts::REQUEST_TIMEOUT_SECONDS);
+        assert_eq!(args.timeout, 75);
+    }
+
+    /// A key file of any size a parser takes is read: 64 KiB (WireGuard configurations, Amnezia
+    /// keys, as in the desktop app's file picker), where the CLI stopped at 16 KiB. A management
+    /// key stays small. One byte more is refused, and nothing past the limit is ever read.
+    #[test]
+    fn credential_files_are_read_up_to_what_the_parsers_take() {
+        let limit = ghostlink_engine::access::MAX_CREDENTIAL as u64;
+        assert_eq!(limit, 64 * 1024);
+        let text = |n: usize| "a".repeat(n);
+        assert_eq!(
+            read_limited(text(20 * 1024).as_bytes(), limit)
+                .unwrap()
+                .len(),
+            20 * 1024
+        );
+        assert_eq!(
+            read_limited(text(64 * 1024).as_bytes(), limit)
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+        assert!(read_limited(text(64 * 1024 + 1).as_bytes(), limit).is_err());
+        assert!(read_limited(text(16 * 1024 + 1).as_bytes(), MAX_MANAGEMENT_KEY).is_err());
+        assert!(read_limited(&[0xff, 0xfe][..], limit).is_err(), "not UTF-8");
+        // A source that never ends is cut off after one byte too many (this would not return).
+        assert!(read_limited(std::io::repeat(b'a'), 10).is_err());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ghostlink-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A secret file that was not written completely is not left behind: it would hold a partial
+    /// secret, or nothing, and block a retry to the same path.
+    #[test]
+    fn a_secret_file_that_was_not_completed_is_removed() {
+        let dir = scratch("output");
+        let path = dir.join("token");
+        let mut output = PrivateOutput::create(&path).unwrap();
+        output.write("half").unwrap();
+        assert!(path.exists());
+        drop(output); // as on any failure or interruption
+        assert!(!path.exists(), "a half-written secret stayed behind");
+        let mut output = PrivateOutput::create(&path).unwrap();
+        output.write("whole\n").unwrap();
+        output.finish().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "whole\n");
+        // Never over a file that exists: it is neither opened nor removed.
+        assert!(PrivateOutput::create(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "whole\n");
+        assert!(write_private(&path, "other").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "whole\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn create_command(output: Option<PathBuf>, import_as: Option<&str>) -> ServerCommand {
+        ServerCommand::Keys {
+            command: ServerKeysCommand::Create {
+                server: "home".into(),
+                user: "1".into(),
+                protocol: "vless".into(),
+                import_as: import_as.map(String::from),
+                output,
+                auth: None,
+                server_address: None,
+                remote_id: None,
+                local_id: None,
+            },
+        }
+    }
+
+    fn issued(extra: serde_json::Value) -> Response {
+        let mut data = json!({"id": "7", "protocol": "vless", "access_key": "vless://TEST-ONLY@203.0.113.7:443", "config": "[Interface]\n"});
+        data.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Response::ok(data)
+    }
+
+    /// The key is removed from the answer once it is kept elsewhere: saved on this device, or in
+    /// the file. If the service could not save it, the answer is the one place it is.
+    #[test]
+    fn a_key_that_was_saved_nowhere_stays_in_the_answer() {
+        // Saved on this device: no need to print it.
+        let mut saved = issued(json!({"imported": {"name": "phone"}}));
+        finish_server_response(&create_command(None, Some("phone")), &mut saved).unwrap();
+        let data = saved.data.unwrap();
+        assert!(data.get("access_key").is_none() && data.get("config").is_none());
+        // The service could not save it, and no file has it: the key would be lost.
+        let mut failed = issued(json!({"import_error": "Service storage failed"}));
+        finish_server_response(&create_command(None, Some("phone")), &mut failed).unwrap();
+        let data = failed.data.unwrap();
+        assert_eq!(data["access_key"], "vless://TEST-ONLY@203.0.113.7:443");
+        assert_eq!(data["config"], "[Interface]\n");
+        assert_eq!(data["import_error"], "Service storage failed");
+        // Printed as before when neither is asked for.
+        let mut plain = issued(json!({}));
+        finish_server_response(&create_command(None, None), &mut plain).unwrap();
+        assert!(plain.data.unwrap().get("access_key").is_some());
+        // In a file: the file has it, whatever happened to the import.
+        let dir = scratch("keys");
+        let path = dir.join("key.txt");
+        let mut filed = issued(json!({"import_error": "Service storage failed"}));
+        finish_server_response(
+            &create_command(Some(path.clone()), Some("phone")),
+            &mut filed,
+        )
+        .unwrap();
+        let data = filed.data.unwrap();
+        assert!(data.get("access_key").is_none() && data["saved_to"].is_string());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "vless://TEST-ONLY@203.0.113.7:443\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

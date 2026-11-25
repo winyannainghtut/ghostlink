@@ -29,6 +29,10 @@ const MeshScript = "https://raw.githubusercontent.com/winyannainghtut/GHOSTLINK/
 // meshWait is how long a sync waits for a configuration change before answering anyway.
 var meshWait = 10 * time.Second
 
+// meshDrain is how long a mesh server that stops accepting (the port moved, or the mesh was turned
+// off) lets the requests it answers finish before it ends them.
+var meshDrain = 3 * time.Second
+
 // usedPorts lists every port the server listens on, for picking new ones.
 func (s *State) usedPorts() map[uint16]bool {
 	used := map[uint16]bool{s.API.Port: true, s.Dashboard.Port: true, s.Shadowsocks.Port: true, s.VLESS.Port: true,
@@ -81,18 +85,39 @@ type MeshServer struct {
 	service *Service
 	limiter *failureLimiter
 	listen  func(network, address string) (net.Listener, error)
-	mu      sync.Mutex
-	server  *http.Server
-	port    uint16
+	// mu guards what follows. It is not held while requests being answered are waited for: a sync
+	// that changes the mesh runs Apply from its own goroutine.
+	mu       sync.Mutex
+	server   *http.Server
+	listener net.Listener
+	port     uint16
+	// closed is set by Close, after which Apply does nothing.
+	closed bool
+	// draining are the servers that were replaced or stopped, whose listeners are closed and which
+	// are still finishing the requests they answer. Close ends them.
+	draining map[*http.Server]bool
+	// afterRead is set by tests: it runs in Apply right after the configuration was read.
+	afterRead func()
 }
 
 // NewMeshServer returns a stopped mesh server; Apply starts it when the mesh is on.
 func NewMeshServer(service *Service) *MeshServer {
-	return &MeshServer{service: service, limiter: newFailureLimiter(), listen: net.Listen}
+	return &MeshServer{service: service, limiter: newFailureLimiter(), listen: net.Listen, draining: map[*http.Server]bool{}}
 }
 
-// Apply starts, moves or stops the listener to match the stored mesh.
+// Apply starts, moves or stops the listener to match the stored mesh. It does nothing once the
+// server is closed.
+//
+// The configuration is read under m.mu, so that Apply calls made at once apply what the state is
+// when each gets its turn, and the last to apply has read last. The server it replaces stops
+// accepting at once, which frees its port, and finishes the requests it answers after m.mu is let
+// go of.
 func (m *MeshServer) Apply() error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
 	var port uint16
 	var certPEM, keyPEM string
 	m.service.Read(func(s *State) {
@@ -101,26 +126,32 @@ func (m *MeshServer) Apply() error {
 		}
 		certPEM, keyPEM = s.API.CertPEM, s.API.KeyPEM
 	})
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.afterRead != nil {
+		m.afterRead()
+	}
 	if m.server != nil && port == m.port {
+		m.mu.Unlock()
 		return nil
 	}
-	if m.server != nil {
-		// Shutdown, unlike Close, lets the syncs being answered finish. When the mesh is turned
-		// off, the waiting ones were just woken and answer "disabled", so their nodes take their
-		// links down instead of seeing a closed port, which they treat as an outage.
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := m.server.Shutdown(ctx); err != nil {
-			_ = m.server.Close()
-		}
-		cancel()
-		m.server = nil
+	old := m.server
+	if old != nil {
+		_ = m.listener.Close()
+		m.draining[old] = true
 	}
-	m.port = port
-	if port == 0 {
-		return nil
+	m.server, m.listener, m.port = nil, nil, port
+	var err error
+	if port != 0 {
+		err = m.start(port, certPEM, keyPEM)
 	}
+	m.mu.Unlock()
+	if old != nil {
+		m.finish(old)
+	}
+	return err
+}
+
+// start serves the agent API on port. Called with m.mu held.
+func (m *MeshServer) start(port uint16, certPEM, keyPEM string) error {
 	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		return err
@@ -139,18 +170,38 @@ func (m *MeshServer) Apply() error {
 		ErrorLog:          log.New(io.Discard, "", 0),
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}},
 	}
-	m.server = server
+	m.server, m.listener = server, listener
 	go func() { _ = server.Serve(tls.NewListener(listener, server.TLSConfig)) }()
 	return nil
 }
 
-// Close stops the listener.
+// finish lets a server that no longer accepts end the requests it answers, for up to meshDrain.
+// Shutdown, unlike Close, lets the syncs being answered finish. When the mesh is turned off, the
+// waiting ones were just woken and answer "disabled", so their nodes take their links down instead
+// of seeing a closed port, which they treat as an outage.
+func (m *MeshServer) finish(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), meshDrain)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+	}
+	m.mu.Lock()
+	delete(m.draining, server)
+	m.mu.Unlock()
+}
+
+// Close stops the listener, and with it every request being answered. After it, Apply does nothing,
+// so a change saved while the server stops cannot open the port again.
 func (m *MeshServer) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.closed = true
 	if m.server != nil {
 		_ = m.server.Close()
-		m.server = nil
+		m.server, m.listener = nil, nil
+	}
+	for server := range m.draining {
+		_ = server.Close()
 	}
 }
 
@@ -316,7 +367,14 @@ func (m *MeshServer) sync(w http.ResponseWriter, r *http.Request, host string) {
 			return
 		}
 	}
-	m.service.meshLive.Record(id, remoteAddr(r), &req, time.Now())
+	// The report is kept only for a node that is still in the mesh, checked under the lock the
+	// removal of a node is saved under: the node may have been removed since it was authenticated,
+	// and what is recorded after its removal would stay in memory for good.
+	m.service.Read(func(s *State) {
+		if s.Mesh != nil && s.Mesh.Node(id) != nil {
+			m.service.meshLive.Record(id, remoteAddr(r), &req, time.Now())
+		}
+	})
 	deadline := time.Now().Add(meshWait)
 	for {
 		wake := m.service.meshLive.Changed()
@@ -434,7 +492,8 @@ func (a *API) patchMesh(r *http.Request) (int, any, error) {
 	}
 	var info meshInfo
 	err := a.service.Change(func(s *State) error {
-		if patch.Enabled != nil && *patch.Enabled || (patch.CIDR != nil && s.Mesh == nil) {
+		turnOn := patch.Enabled != nil && *patch.Enabled
+		if turnOn || (patch.CIDR != nil && s.Mesh == nil) {
 			cidr, name := "", ""
 			if patch.CIDR != nil {
 				cidr = *patch.CIDR
@@ -444,6 +503,12 @@ func (a *API) patchMesh(r *http.Request) (int, any, error) {
 			}
 			if err := s.enableMesh(cidr, name, portFree); err != nil {
 				return InputError{err}
+			}
+			if !turnOn {
+				// Choosing the network of a mesh that does not exist yet creates it, and keeps it
+				// off, as choosing another network does for one that is off: only "enabled" turns
+				// the mesh on.
+				s.Mesh.Enabled = false
 			}
 		}
 		if s.Mesh == nil {

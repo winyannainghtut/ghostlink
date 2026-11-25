@@ -8,6 +8,7 @@ package awg
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -66,6 +67,12 @@ func (c *clientBind) connect() (*wireConn, error) {
 }
 
 func (c *clientBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
+	// connect reads done and bindCtx under connAccess, so a new generation of them is made under
+	// it too. (WireGuard's own lock keeps Open from running with Send, and the receive functions
+	// have ended before it runs; this keeps the bind right without relying on that.) Close does not
+	// take the lock before it cancels bindCtx, so that it can end a dial that holds it.
+	c.connAccess.Lock()
+	defer c.connAccess.Unlock()
 	select {
 	case <-c.done:
 		c.done = make(chan struct{})
@@ -128,7 +135,13 @@ func (c *clientBind) SetMark(uint32) error { return nil }
 func (c *clientBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	udpConn, err := c.connect()
 	if err != nil {
-		time.Sleep(time.Second)
+		// A dial that failed is not tried again for a second, so a network that is down does not
+		// make the sender spin. A closed bind is not a failure to wait out: WireGuard holds its
+		// network lock while it calls Send, so the second would delay the device's own shutdown
+		// and restart (BindUpdate waits for that lock) once for every packet still to be sent.
+		if !errors.Is(err, net.ErrClosed) {
+			time.Sleep(time.Second)
+		}
 		return err
 	}
 	destination := netip.AddrPort(ep.(remoteEndpoint))

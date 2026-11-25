@@ -4,9 +4,10 @@
 // Package hostfw manages a Ghostlink agent's own iptables chains on a host. An agent renders its
 // chains as iptables-restore input; Restore replaces exactly those chains (atomically per table,
 // with --noflush), EnsureJumps keeps one jump to each from its built-in chain (and from Docker's
-// DOCKER-USER for forwarded traffic), and Remove takes everything away again. Rules from other
-// software are never touched. It uses the iptables backend the host already uses (nft or
-// legacy), because a packet must pass both backends.
+// DOCKER-USER for forwarded traffic), Missing and HasJumps tell whether something on the host (a
+// firewall reload, iptables -F) took them away, and Remove takes everything away again. Rules
+// from other software are never touched. It uses the iptables backend the host already uses (nft
+// or legacy), because a packet must pass both backends.
 package hostfw
 
 import (
@@ -37,9 +38,23 @@ func (j Jump) args(op string, position ...string) []string {
 	return append(args, "-j", j.Target)
 }
 
+// Exec runs one command: its name, its arguments and what it reads from standard input. Run is
+// the real one.
+type Exec func(ctx context.Context, stdin, name string, args ...string) (string, error)
+
 // Firewall applies rules with one backend.
 type Firewall struct {
 	Backend string // "nft" or "legacy"
+	// Exec runs the iptables commands. nil means Run; a test gives it a fake host (see
+	// hostfwtest), so what an agent does after a firewall reload can be tried without iptables.
+	Exec Exec
+}
+
+func (f *Firewall) run(ctx context.Context, stdin, name string, args ...string) (string, error) {
+	if f.Exec != nil {
+		return f.Exec(ctx, stdin, name, args...)
+	}
+	return Run(ctx, stdin, name, args...)
 }
 
 // Run executes a command with a timeout, feeding it stdin.
@@ -97,20 +112,23 @@ func backendOf(version string) string {
 }
 
 func (f *Firewall) iptables(ctx context.Context, args ...string) error {
-	_, err := Run(ctx, "", "iptables-"+f.Backend, append([]string{"-w", "5"}, args...)...)
+	_, err := f.run(ctx, "", "iptables-"+f.Backend, append([]string{"-w", "5"}, args...)...)
 	return err
 }
+
+// tableNames are the tables an agent's chains are in, in the order they are restored.
+var tableNames = []string{"filter", "nat", "mangle"}
 
 // Restore replaces the chains declared in each table's iptables-restore input.
 func (f *Firewall) Restore(ctx context.Context, tables map[string]string) error {
 	if f.Backend != "nft" && f.Backend != "legacy" {
 		return errors.New("unknown iptables backend")
 	}
-	for _, table := range []string{"filter", "nat", "mangle"} {
+	for _, table := range tableNames {
 		if tables[table] == "" {
 			continue
 		}
-		if _, err := Run(ctx, tables[table], "iptables-"+f.Backend+"-restore", "--noflush", "-w", "5"); err != nil {
+		if _, err := f.run(ctx, tables[table], "iptables-"+f.Backend+"-restore", "--noflush", "-w", "5"); err != nil {
 			return err
 		}
 	}
@@ -127,11 +145,13 @@ func (f *Firewall) Restore(ctx context.Context, tables map[string]string) error 
 const dockerChain = "DOCKER-USER"
 
 // withDocker adds the DOCKER-USER copies of the jumps marked Docker, when the host has that chain.
+// With no jump marked Docker there is nothing to copy, so the host is not asked about the chain.
 func (f *Firewall) withDocker(ctx context.Context, jumps []Jump) []Jump {
-	if f.iptables(ctx, "-t", "filter", "-S", dockerChain) != nil {
+	copies := dockerCopies(jumps)
+	if len(copies) == 0 || f.iptables(ctx, "-t", "filter", "-S", dockerChain) != nil {
 		return jumps
 	}
-	return append(slices.Clone(jumps), dockerCopies(jumps)...)
+	return append(slices.Clone(jumps), copies...)
 }
 
 // dockerCopies are the DOCKER-USER copies of the filter FORWARD jumps marked Docker.
@@ -147,7 +167,9 @@ func dockerCopies(jumps []Jump) []Jump {
 }
 
 // EnsureJumps puts back a jump someone removed (for example a firewall reload), first in its
-// chain, and adds the DOCKER-USER copies once Docker made that chain.
+// chain, and adds the DOCKER-USER copies once Docker made that chain. It does not touch the rules
+// in the agent's chains, which a reload that removed the jump has usually emptied or deleted too
+// (see Missing): the rules come back with Restore.
 func (f *Firewall) EnsureJumps(ctx context.Context, jumps []Jump) error {
 	for _, j := range f.withDocker(ctx, jumps) {
 		if f.iptables(ctx, j.args("-C")...) == nil {
@@ -170,6 +192,29 @@ func (f *Firewall) HasJumps(ctx context.Context, jumps []Jump) bool {
 	return true
 }
 
+// Missing lists what the host has lost of an agent's firewall: jumps that are not in place (the
+// DOCKER-USER copies included) and chains that do not exist (table -> chains). A firewall reload,
+// netfilter-persistent or iptables -F takes the jumps away and, with them, usually the rules in
+// the chains, or the chains themselves. A jump put back into a chain that is empty protects
+// nothing, so an agent that finds something missing must restore the whole rule set (Restore,
+// then EnsureJumps), not only the jumps. Nothing in the list means nothing is missing.
+func (f *Firewall) Missing(ctx context.Context, jumps []Jump, chains map[string][]string) []string {
+	var missing []string
+	for _, j := range f.withDocker(ctx, jumps) {
+		if f.iptables(ctx, j.args("-C")...) != nil {
+			missing = append(missing, "jump "+j.Table+"/"+j.Chain+" -> "+j.Target)
+		}
+	}
+	for _, table := range tableNames {
+		for _, chain := range chains[table] {
+			if f.iptables(ctx, "-t", table, "-S", chain) != nil {
+				missing = append(missing, "chain "+table+"/"+chain)
+			}
+		}
+	}
+	return missing
+}
+
 // Remove deletes the jumps (also from DOCKER-USER), then flushes and deletes the chains
 // (table -> chains).
 func (f *Firewall) Remove(ctx context.Context, jumps []Jump, chains map[string][]string) {
@@ -177,7 +222,7 @@ func (f *Firewall) Remove(ctx context.Context, jumps []Jump, chains map[string][
 		for i := 0; i < 8 && f.iptables(ctx, j.args("-D")...) == nil; i++ {
 		}
 	}
-	for _, table := range []string{"filter", "nat", "mangle"} {
+	for _, table := range tableNames {
 		for _, chain := range chains[table] {
 			_ = f.iptables(ctx, "-t", table, "-F", chain)
 		}

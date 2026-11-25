@@ -2,9 +2,10 @@
 import { ChevronRight, Copy, FileDown, KeyRound, LayoutGrid, List, QrCode, Search, Trash2, UserPlus } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { ago, bytes, plural, speed } from '@shared/format';
-import { Button, Card, Empty, IconButton, Meter, Segmented, StatusDot, Switch, cx, useUI, type Status } from '@shared/glass';
+import { Button, Card, CardSkeleton, Empty, IconButton, Loading, Meter, Segmented, Skeleton, StatusDot, Switch, cx, useUI, type Status } from '@shared/glass';
 import { useNow, useStoredState } from '@shared/hooks';
 import { protocolName, type User } from '../api';
+import { SORT_KEYS, SORT_LABELS, protocolsOf, sortClients, type SortKey } from '../clients';
 import { DeviceIcon, hasConf, isApple, primaryKey, tunnelAddress, useKeyTools } from '../keys';
 import { providerText } from '../provider';
 import { speedLabel } from '../SpeedLimit';
@@ -22,6 +23,7 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useStoredState<Filter>('ghostlink-client-filter', 'all', FILTERS);
   const [mode, setMode] = useStoredState<'cards' | 'list'>('ghostlink-client-view', 'cards', ['cards', 'list']);
+  const [sort, setSort] = useStoredState<SortKey>('ghostlink-client-sort', 'added', SORT_KEYS);
   const [openId, setOpenId] = useState<string | null>(null);
   const tools = useKeyTools(reloadUsers);
 
@@ -33,7 +35,8 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
     return c;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [users, liveById]);
-  const shown = users.filter(u => (filter === 'all' || bucket(statusOf(u)) === filter) && (!query || [u.name, tunnelAddress(u) ?? '', lastClient[u.id]?.ip ?? '', providerText(lastClient[u.id])].some(v => v.toLowerCase().includes(query.toLowerCase()))));
+  const matching = users.filter(u => (filter === 'all' || bucket(statusOf(u)) === filter) && (!query || [u.name, tunnelAddress(u) ?? '', lastClient[u.id]?.ip ?? '', providerText(lastClient[u.id])].some(v => v.toLowerCase().includes(query.toLowerCase()))));
+  const shown = sortClients(matching, sort, liveById, statusOf);
 
   const setEnabled = async (user: User, enabled: boolean) => {
     try {
@@ -52,16 +55,25 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
       <div className="flex flex-wrap items-center gap-3">
         <label className="inset-glass flex h-10 min-w-[220px] flex-1 items-center gap-2 rounded-full px-4 sm:max-w-sm">
           <Search size={16} className="text-fg-3" />
-          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search name, tunnel IP, endpoint or provider" className="w-full bg-transparent text-[13.5px] outline-none placeholder:text-fg-3" aria-label="Search clients" />
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search name, IP, endpoint or provider" className="w-full bg-transparent text-[13.5px] outline-none placeholder:text-fg-3" aria-label="Search clients" />
         </label>
         <Segmented
           label="Status"
           value={filter}
           onChange={setFilter}
-          options={FILTERS.map(f => ({ value: f, label: <span>{f === 'all' ? 'All' : statusLabel[f]} <span className="num text-fg-3">{counts[f]}</span></span> }))}
+          options={FILTERS.map(f => ({ value: f, label: <span>{f === 'all' ? 'All' : statusLabel[f]} {loaded && <span className="num text-fg-3">{counts[f]}</span>}</span> }))}
         />
+        <label className="ml-auto flex items-center gap-2 text-[12.5px] text-fg-3">
+          Sort
+          <select className="field h-10 w-auto py-0 text-[13px]" value={sort} onChange={e => setSort(e.target.value as SortKey)} aria-label="Sort clients">
+            {SORT_KEYS.map(k => (
+              <option key={k} value={k}>
+                {SORT_LABELS[k]}
+              </option>
+            ))}
+          </select>
+        </label>
         <Segmented
-          className="ml-auto"
           label="Layout"
           value={mode}
           onChange={setMode}
@@ -72,7 +84,25 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
         />
       </div>
 
-      {loaded && !users.length ? (
+      {!loaded ? (
+        // The first answer is on its way: placeholders of the finished layout, not "No matching clients".
+        <Loading label="Loading clients" className={mode === 'cards' ? 'grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 min-[112.5rem]:grid-cols-4 min-[143.75rem]:grid-cols-5' : undefined}>
+          {mode === 'cards' ? (
+            [0, 1, 2].map(i => <CardSkeleton key={i} lines={4} className="min-h-[19rem]" />)
+          ) : (
+            <Card className="grid gap-4 p-5!">
+              {[0, 1, 2, 3].map(i => (
+                <div key={i} className="flex items-center gap-4">
+                  <Skeleton className="size-8 shrink-0" />
+                  <Skeleton className="h-3.5 w-1/5" />
+                  <Skeleton className="h-3.5 w-1/6" />
+                  <Skeleton className="ml-auto h-3.5 w-1/4" />
+                </div>
+              ))}
+            </Card>
+          )}
+        </Loading>
+      ) : !users.length ? (
         <Card>
           <Empty icon={<UserPlus size={22} />} title="No clients yet">
             <p>A client is a person or device. Create one and Ghostlink issues its key, address and QR code.</p>
@@ -130,6 +160,7 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
                           </button>
                           <div className="flex items-center gap-1.5 text-[12px] text-fg-3">
                             <StatusDot status={status} className="scale-75" /> {statusLabel[status]}
+                            {u.keys.length > 0 && <span className="truncate">· {protocolsOf(u.keys).map(protocolName).join(', ')}</span>}
                           </div>
                         </div>
                       </div>
@@ -162,9 +193,11 @@ export function Clients({ onNewClient }: { onNewClient: () => void }) {
           </table>
         </Card>
       )}
-      <p className="text-center text-[12px] text-fg-3">
-        {plural(shown.length, 'client')} shown · {stale ? 'the server is not answering, so live data is paused' : 'live data every second'}
-      </p>
+      {loaded && (
+        <p className="text-center text-[12px] text-fg-3">
+          {plural(shown.length, 'client')} shown · {stale ? 'the server is not answering, so live data is paused' : 'live data every second'}
+        </p>
+      )}
       {tools.sheet}
       <ClientSheet user={open} onClose={() => setOpenId(null)} />
     </div>
@@ -250,7 +283,7 @@ function ClientCard({ user, status, now, onOpen, onEnabled, tools }: {
             <IconButton label="Revoke key" className="hover:text-bad!" onClick={() => tools.revoke(user, key)}>
               <Trash2 size={16} />
             </IconButton>
-            <span className="ml-1 truncate text-[12px] text-fg-3">{protocolName(key.protocol)}</span>
+            <ProtocolBadges user={user} primary={key.protocol} />
           </>
         ) : (
           <Button size="sm" icon={<KeyRound size={14} />} onClick={onOpen}>
@@ -262,6 +295,23 @@ function ClientCard({ user, status, now, onOpen, onEnabled, tools }: {
         </Button>
       </div>
     </Card>
+  );
+}
+
+// Every protocol the client has a key for, not only the one of the key the quick actions use (that
+// one is marked). At most two names fit; the rest are counted, and named in the tooltip.
+function ProtocolBadges({ user, primary }: { user: User; primary: string }) {
+  const protocols = protocolsOf(user.keys);
+  const extra = protocols.length - 2;
+  return (
+    <span className="ml-1 flex min-w-0 items-center gap-1 overflow-hidden" title={protocols.map(protocolName).join(', ') + (protocols.length > 1 ? ` (the buttons use ${protocolName(primary)})` : '')}>
+      {protocols.slice(0, 2).map(p => (
+        <span key={p} className={cx('truncate rounded-full px-2 py-0.5 text-[11.5px]', p === primary ? 'bg-glass-strong text-fg-2' : 'text-fg-3 inset-glass')}>
+          {protocolName(p)}
+        </span>
+      ))}
+      {extra > 0 && <span className="shrink-0 text-[11.5px] text-fg-3">+{extra}</span>}
+    </span>
   );
 }
 

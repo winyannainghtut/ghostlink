@@ -10,11 +10,11 @@ jobs:
         os: [windows-2022, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.11'
           cache-dependency-path: core/outline-worker/go.sum
@@ -55,6 +55,12 @@ jobs:
       # bash on both systems: Windows' default PowerShell would only check the last command.
       - name: Process tests
         shell: bash
+        # On Linux the runner's user is not root, so the suite also checks that a connect without the
+        # administrator's consent to a full tunnel is refused before any engine starts. Not on Windows,
+        # where the runner is an administrator and the same check would really start the tunnel
+        # (docs/development/verification.md: set it only when the process is not elevated).
+        env:
+          GHOSTLINK_TEST_EXPECT_UNPRIVILEGED: ${{ runner.os == 'Linux' && '1' || '' }}
         run: |
           npm ci --ignore-scripts
           npm test

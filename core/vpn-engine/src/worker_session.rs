@@ -1,6 +1,7 @@
 use crate::{
     access::Outbound,
-    management::{Session, Shared, Snapshot},
+    management::{is_cleanup_barrier, Session, Shared, Snapshot},
+    netstate::Footprint,
     split, storage,
     vless::Security,
 };
@@ -22,10 +23,35 @@ use tokio::{
 };
 
 pub const WORKER_VERSION: &str =
-    "Ghostlink tunnel worker 0.9.0; sing-box 1.14.4; amneziawg-go 3.1.20260828";
+    "Ghostlink tunnel worker 0.9.1; sing-box 1.14.4; amneziawg-go 3.1.20260828";
 
 /// Tag of the tunnel outbound or endpoint in every generated configuration.
 pub const PROXY_TAG: &str = "proxy";
+
+/// The site the health probe asks (an HTTPS request through the tunnel that must answer 204), and
+/// the name its lookup is steered by in every generated configuration.
+const HEALTH_HOST: &str = "www.gstatic.com";
+const HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// The name of the TUN interface in every generated configuration.
+pub const TUN_NAME: &str = "Ghostlink";
+
+/// The addresses of the TUN interface in every generated configuration, with their prefix
+/// lengths (IPv4, IPv6).
+pub const TUN_CIDRS: [&str; 2] = ["172.28.85.1/30", "fdfe:85:85::1/126"];
+
+/// What a worker session leaves in the operating system if it ends without removing it: the
+/// TUN interface, and the addresses on it. The service looks for these when it verifies that
+/// nothing is left before it lifts the cleanup barrier.
+pub fn footprint() -> Footprint {
+    Footprint {
+        interface: Some(TUN_NAME.into()),
+        addresses: TUN_CIDRS
+            .iter()
+            .filter_map(|cidr| cidr.split('/').next()?.parse().ok())
+            .collect(),
+    }
+}
 
 pub async fn worker_available(executable: &Path) -> bool {
     if !executable.is_absolute() || !executable.is_file() {
@@ -205,7 +231,7 @@ pub fn config_with_direct(
         json!({"type":"mixed","tag":"health-proxy","listen":"127.0.0.1","listen_port":proxy_port,"users":[{"username":"ghostlink","password":secret}]}),
     ];
     if tunnel {
-        let mut tun = json!({"type":"tun","tag":"ghostlink-tun","interface_name":"Ghostlink","address":["172.28.85.1/30","fdfe:85:85::1/126"],"auto_route":true,"strict_route":true,"dns_mode":"hijack","mtu":1500,"stack":"mixed"});
+        let mut tun = json!({"type":"tun","tag":"ghostlink-tun","interface_name":TUN_NAME,"address":TUN_CIDRS,"auto_route":true,"strict_route":true,"dns_mode":"hijack","mtu":1500,"stack":"mixed"});
         // A WireGuard profile with limited AllowedIPs routes only those prefixes into the TUN.
         if let Outbound::WireGuard(config) = outbound {
             if !config.routes_everything() {
@@ -226,7 +252,12 @@ pub fn config_with_direct(
     let (outbound_json, endpoint_json) = proxy(outbound);
     let split = split::render(policy, PROXY_TAG);
     let mut direct_rules = vec![];
-    let mut dns_rules = vec![];
+    // The health probe's name always resolves through the tunnel's resolver, whatever the split
+    // policy says. In "only" mode every name that is not listed goes to the local resolver, and a
+    // WireGuard or AmneziaWG endpoint sends by address, so the probe's lookup would leave the
+    // device outside the tunnel, and the probe would test the local network's answer instead of
+    // the tunnel's. It comes first so that no policy rule for the site can take it over.
+    let mut dns_rules = vec![json!({"domain":[HEALTH_HOST],"server":"vpn-dns"})];
     for (host, port) in always_direct {
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         match bare.parse::<std::net::IpAddr>() {
@@ -351,6 +382,12 @@ pub async fn start(
         .kill_on_drop(false);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    // The service state is taken BEFORE the worker is started, so that nothing is awaited between
+    // starting it and handing it to the task below. A start that is cancelled (the service shuts
+    // down) has then either not started a worker or has handed it over; with the worker running
+    // (it is not killed when dropped, so that it can close its tunnel on parent-pipe EOF) it
+    // could otherwise be dropped here while it still ran.
+    let mut snapshot = shared.write().await;
     let mut child = command.spawn()?;
     let pid = child
         .id()
@@ -363,14 +400,12 @@ pub async fn start(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("Cannot monitor tunnel engine"))?;
-    {
-        let mut snapshot = shared.write().await;
-        *snapshot = Snapshot::default();
-        snapshot.status.status = ConnectionState::Connecting;
-        snapshot.status.profile = Some(name);
-        snapshot.status.protocol = Some(outbound.protocol().into());
-        snapshot.status.server = Some(outbound.server().0.to_string());
-    }
+    *snapshot = Snapshot::default();
+    snapshot.status.status = ConnectionState::Connecting;
+    snapshot.status.profile = Some(name);
+    snapshot.status.protocol = Some(outbound.protocol().into());
+    snapshot.status.server = Some(outbound.server().0.to_string());
+    drop(snapshot);
     let (stop, mut stop_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move {
         let _config_guard = config_guard;
@@ -413,7 +448,7 @@ pub async fn start(
                 }
                 _ = interval.tick(), if initialized => {
                     if crate::process::verify_listeners(pid, &[proxy_port, api_port]).is_err() { reason = Some("outline_engine_socket_owner_mismatch"); break; }
-                    let check = health.get("https://www.gstatic.com/generate_204").send();
+                    let check = health.get(HEALTH_URL).send();
                     let healthy = tokio::select! {
                         _ = stop_rx.recv() => { stopping = true; break; }
                         _ = &mut deadline, if !connected_once => { reason = Some("outline_server_unreachable_or_key_rejected"); break; }
@@ -438,16 +473,28 @@ pub async fn start(
                         snapshot.status.receive_bytes_per_second = 0; snapshot.status.send_bytes_per_second = 0;
                     }
                     drop(snapshot);
-                    if let Ok(response) = controller.get(format!("http://127.0.0.1:{api_port}/connections")).bearer_auth(&secret).send().await {
-                        if let Ok(data) = response.json::<Value>().await {
-                            if let (Some(rx), Some(tx)) = (data["downloadTotal"].as_u64(), data["uploadTotal"].as_u64()) {
-                                let now = Instant::now(); let elapsed = now.duration_since(last_counters.2).as_secs_f64().max(0.001);
-                                let mut snapshot = shared.write().await;
-                                snapshot.status.bytes_received = rx; snapshot.status.bytes_sent = tx;
-                                snapshot.status.receive_bytes_per_second = (rx.saturating_sub(last_counters.0) as f64 / elapsed) as u64;
-                                snapshot.status.send_bytes_per_second = (tx.saturating_sub(last_counters.1) as f64 / elapsed) as u64;
-                                last_counters = (rx, tx, now);
-                            }
+                    // The health request took a while, and the controller's secret goes out in
+                    // this one: the worker must still own the port it goes to.
+                    if crate::process::verify_listeners(pid, &[api_port]).is_err() { reason = Some("outline_engine_socket_owner_mismatch"); break; }
+                    let counters = async {
+                        let response = controller.get(format!("http://127.0.0.1:{api_port}/connections")).bearer_auth(&secret).send().await.ok()?;
+                        response.json::<Value>().await.ok()
+                    };
+                    // Like the health request, it must not hold up a stop or the end of the worker
+                    // (it may take its 3 seconds).
+                    let data = tokio::select! {
+                        _ = stop_rx.recv() => { stopping = true; break; }
+                        _ = child.wait() => { reason = Some("outline_engine_exited_check_service_permissions"); break; }
+                        data = counters => data,
+                    };
+                    if let Some(data) = data {
+                        if let (Some(rx), Some(tx)) = (data["downloadTotal"].as_u64(), data["uploadTotal"].as_u64()) {
+                            let now = Instant::now(); let elapsed = now.duration_since(last_counters.2).as_secs_f64().max(0.001);
+                            let mut snapshot = shared.write().await;
+                            snapshot.status.bytes_received = rx; snapshot.status.bytes_sent = tx;
+                            snapshot.status.receive_bytes_per_second = (rx.saturating_sub(last_counters.0) as f64 / elapsed) as u64;
+                            snapshot.status.send_bytes_per_second = (tx.saturating_sub(last_counters.1) as f64 / elapsed) as u64;
+                            last_counters = (rx, tx, now);
                         }
                     }
                 }
@@ -485,6 +532,10 @@ pub async fn start(
             ConnectionState::Disconnected
         };
         snapshot.status.last_error = reason.map(String::from);
+        // What to look for when the service verifies that nothing is left.
+        snapshot.footprint = reason
+            .filter(|reason| is_cleanup_barrier(reason))
+            .map(|_| footprint());
         snapshot.status.vpn_ip = None;
         snapshot.connected_since = None;
         snapshot.status.receive_bytes_per_second = 0;
@@ -526,8 +577,9 @@ mod tests {
             json!({"domain":["vpn.example.com"],"port":[34567],"outbound":"direct"})
         );
         assert_eq!(rules[4]["action"], "reject");
+        // After the probe's own rule (see `the_health_probe_resolves_through_the_tunnel`).
         assert_eq!(
-            config["dns"]["rules"][0],
+            config["dns"]["rules"][1],
             json!({"domain":["vpn.example.com"],"server":"bootstrap"})
         );
         assert!(config["outbounds"]
@@ -617,6 +669,80 @@ mod tests {
             unverified_cleanup(CleanFailure, None),
             Some("forced_stop_network_cleanup_unverified")
         );
+    }
+
+    /// "Only these sites" sends every other name to the local resolver, and a WireGuard or
+    /// AmneziaWG endpoint sends by address: the health probe's own lookup would leave the device
+    /// outside the tunnel unless its site is listed (code review 2026-11-25, M3). Its name always
+    /// goes to the tunnel's resolver, ahead of any rule of the policy.
+    #[test]
+    fn the_health_probe_resolves_through_the_tunnel() {
+        use ghostlink_contracts::SplitMode;
+        let wireguard = || {
+            crate::wireguard::parse("[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.8.1.2/32\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nEndpoint = 203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0\n").unwrap()
+        };
+        let probe = json!({"domain":["www.gstatic.com"],"server":"vpn-dns"});
+        for (mode, domains) in [
+            (SplitMode::Full, vec![]),
+            (SplitMode::Only, vec!["corp.example".to_string()]),
+            // The user listed the probe's own site: still resolved through the tunnel.
+            (SplitMode::Bypass, vec!["gstatic.com".to_string()]),
+        ] {
+            let policy = split::validate(&RoutingPolicy {
+                mode,
+                domains,
+                ..Default::default()
+            })
+            .unwrap();
+            let document = config(
+                &Outbound::WireGuard(wireguard()),
+                1,
+                2,
+                "secret",
+                true,
+                &policy,
+            );
+            assert_eq!(document["dns"]["rules"][0], probe, "{mode:?}");
+        }
+        assert_eq!(HEALTH_URL, format!("https://{HEALTH_HOST}/generate_204"));
+    }
+
+    /// The service verifies a cleanup barrier by looking for the TUN interface and addresses the
+    /// generated configuration creates, so the two must come from one definition.
+    #[test]
+    fn the_cleanup_check_looks_for_what_the_configuration_creates() {
+        let key = AccessKey::parse("ss://aes-256-gcm:test-only@192.0.2.10:8388").unwrap();
+        let document = config(
+            &Outbound::Shadowsocks(key),
+            1,
+            2,
+            "secret",
+            true,
+            &RoutingPolicy::default(),
+        );
+        let tun = &document["inbounds"][1];
+        assert_eq!(tun["type"], "tun");
+        let footprint = footprint();
+        assert_eq!(
+            tun["interface_name"],
+            footprint.interface.as_deref().unwrap()
+        );
+        let configured: Vec<std::net::IpAddr> = tun["address"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .unwrap()
+                    .split('/')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(footprint.addresses, configured);
+        assert_eq!(configured.len(), 2);
     }
 
     #[test]

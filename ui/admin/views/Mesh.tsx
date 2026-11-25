@@ -3,10 +3,10 @@
 import { Copy, Plus, Route, Shuffle, Trash2, X } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { MeshMap, type MeshNode, type Topology } from '@shared/MeshMap';
-import { ago, dateTime, plural, words } from '@shared/format';
+import { ago, dateTime, plural, speed, words } from '@shared/format';
 import { Button, Card, CardTitle, Check, Facts, Field, IconButton, Inner, Note, Segmented, Sheet, StatusDot, Switch, useUI } from '@shared/glass';
-import { usePoll } from '@shared/hooks';
-import { type MeshInfo, type MeshRule } from '../api';
+import { useBusy, usePoll } from '@shared/hooks';
+import { type Invite, type MeshInfo, type MeshRule } from '../api';
 import { useApi } from '../store';
 
 export function MeshCard() {
@@ -29,18 +29,21 @@ export function MeshCard() {
     await loadInfo();
     setTopology(await api<Topology>('GET', '/mesh/topology'));
   };
-  // Reports whether the server took the change; a failure is shown as a toast.
-  const change = async (method: string, path: string, body: unknown, message?: string) => {
-    try {
-      await api(method, path, body);
-    } catch (error) {
-      toast((error as Error).message, 'bad');
-      return false;
-    }
-    if (message) toast(message);
-    await refresh().catch(error => toast((error as Error).message, 'bad'));
-    return true;
-  };
+  // Reports whether the server took the change; a failure is shown as a toast. One change at a
+  // time: a double click on Approve, Save or Remove must not send it twice.
+  const { busy, run } = useBusy();
+  const change = async (method: string, path: string, body: unknown, message?: string) =>
+    (await run(async () => {
+      try {
+        await api(method, path, body);
+      } catch (error) {
+        toast((error as Error).message, 'bad');
+        return false;
+      }
+      if (message) toast(message);
+      await refresh().catch(error => toast((error as Error).message, 'bad'));
+      return true;
+    })) ?? false;
 
   if (!info) return null;
   if (!info.enabled) {
@@ -113,7 +116,7 @@ export function MeshCard() {
           </div>
         </div>
         <aside className="max-h-[min(62vh,800px)] overflow-y-auto">
-          {node ? <NodePanel node={node} topology={topology!} onClose={() => setSelected(null)} change={change} /> : <Overview nodes={nodes} info={info} onSelect={setSelected} change={change} />}
+          {node ? <NodePanel node={node} topology={topology!} onClose={() => setSelected(null)} change={change} busy={busy} /> : <Overview nodes={nodes} info={info} onSelect={setSelected} change={change} busy={busy} />}
         </aside>
       </div>
       <InviteSheet open={invite} info={info} onClose={() => (setInvite(false), loadInfo().catch(() => {}))} />
@@ -135,9 +138,19 @@ type Change = (method: string, path: string, body: unknown, message?: string) =>
 
 const STATE_LABELS: Record<string, string> = { online: 'Online', offline: 'Offline', pending: 'Waiting for approval', disabled: 'Disabled' };
 
-function Overview({ nodes, info, onSelect, change }: { nodes: MeshNode[]; info: MeshInfo; onSelect: (id: string) => void; change: Change }) {
+// "in 3 h", "in 2 days": when an open invite stops working.
+function expiresIn(unix: number, now = Date.now() / 1000): string {
+  const s = unix - now;
+  if (s <= 0) return 'expired';
+  if (s < 3600) return `in ${Math.max(1, Math.round(s / 60))} min`;
+  if (s < 86400) return `in ${Math.round(s / 3600)} h`;
+  return `in ${Math.round(s / 86400)} days`;
+}
+
+function Overview({ nodes, info, onSelect, change, busy }: { nodes: MeshNode[]; info: MeshInfo; onSelect: (id: string) => void; change: Change; busy: boolean }) {
   const { confirm } = useUI();
   const pending = nodes.filter(n => n.status === 'pending');
+  const invites = info.invites ?? [];
   return (
     <div className="grid grid-cols-1 gap-4">
       {pending.length > 0 && (
@@ -149,10 +162,10 @@ function Overview({ nodes, info, onSelect, change }: { nodes: MeshNode[]; info: 
                 <div className="truncate text-[13.5px]">{n.name}</div>
                 <div className="mono truncate text-[11.5px] text-fg-3" title={n.seen_from || n.address}>{n.seen_from || n.address}</div>
               </div>
-              <Button size="sm" variant="cta" onClick={() => change('PATCH', `/mesh/nodes/${n.id}`, { status: 'active' }, `${n.name} is in the mesh.`)}>
+              <Button size="sm" variant="cta" disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${n.id}`, { status: 'active' }, `${n.name} is in the mesh.`)}>
                 Approve
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => change('DELETE', `/mesh/nodes/${n.id}`, undefined, `${n.name} rejected.`)}>
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => change('DELETE', `/mesh/nodes/${n.id}`, undefined, `${n.name} rejected.`)}>
                 Reject
               </Button>
             </div>
@@ -174,6 +187,16 @@ function Overview({ nodes, info, onSelect, change }: { nodes: MeshNode[]; info: 
           ))}
         </ul>
       </div>
+      {invites.length > 0 && (
+        <Inner className="grid grid-cols-1 gap-2">
+          <h3 className="text-[14px]">Open invites</h3>
+          <Note>An invite that is not used up or expired still lets a server join with its command. Revoke one you no longer need.</Note>
+          {invites.map(invite => (
+            <InviteRow key={invite.id} invite={invite} busy={busy} onRevoke={() => change('DELETE', `/mesh/invites/${invite.id}`, undefined, 'Invite revoked: its command no longer works.')} />
+          ))}
+        </Inner>
+      )}
+      <MeshSettings info={info} nodes={nodes.length} change={change} busy={busy} />
       <Inner className="grid gap-1">
         <Check checked={info.ping} onChange={on => change('PATCH', '/mesh', { ping: on })}>
           Nodes can always ping each other
@@ -183,6 +206,7 @@ function Overview({ nodes, info, onSelect, change }: { nodes: MeshNode[]; info: 
           size="sm"
           variant="ghost"
           className="mt-2 justify-self-start"
+          disabled={busy}
           onClick={async () => {
             if (await confirm({ title: 'Turn the mesh off?', text: 'Connected nodes take their links down within seconds. Nodes, invites and rules are kept for when you turn it on again.', action: 'Turn off', danger: true })) await change('PATCH', '/mesh', { enabled: false }, 'Mesh turned off.');
           }}
@@ -194,10 +218,60 @@ function Overview({ nodes, info, onSelect, change }: { nodes: MeshNode[]; info: 
   );
 }
 
-function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topology: Topology; onClose: () => void; change: Change }) {
+function InviteRow({ invite, busy, onRevoke }: { invite: Invite; busy: boolean; onRevoke: () => void }) {
+  const flags = [invite.relay && 'relay', invite.approval && 'needs approval'].filter(Boolean).join(' · ');
+  const tags = invite.tags ?? [];
+  return (
+    <div className="inset-glass flex items-center gap-2 rounded-[18px] py-2 pr-2 pl-3.5">
+      <div className="min-w-0 flex-1 text-[12.5px]">
+        <div className="truncate text-fg">{invite.note || (tags.length ? `Tags: ${tags.join(', ')}` : 'Invite')}</div>
+        <div className="num truncate text-[11.5px] text-fg-3">
+          {plural(invite.uses_left, 'use')} left · {expiresIn(invite.expires_unix)}
+          {flags && ` · ${flags}`}
+          {invite.note && tags.length > 0 && ` · ${tags.join(', ')}`}
+        </div>
+      </div>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={onRevoke}>
+        Revoke
+      </Button>
+    </div>
+  );
+}
+
+// The mesh's own name, and its network: the network can be chosen until the first node joins.
+function MeshSettings({ info, nodes, change, busy }: { info: MeshInfo; nodes: number; change: Change; busy: boolean }) {
+  const [name, setName] = useState(info.name);
+  const [cidr, setCidr] = useState(info.cidr);
+  useEffect(() => setName(info.name), [info.name]);
+  useEffect(() => setCidr(info.cidr), [info.cidr]);
+  const changed = name.trim() !== info.name || (nodes === 0 && cidr.trim() !== info.cidr);
+  const save = () => {
+    const patch: Record<string, unknown> = {};
+    if (name.trim() !== info.name) patch.name = name.trim();
+    if (cidr.trim() !== info.cidr && nodes === 0) patch.cidr = cidr.trim();
+    return change('PATCH', '/mesh', patch, 'Mesh settings saved.');
+  };
+  return (
+    <Inner className="grid gap-3">
+      <h3 className="text-[14px]">This mesh</h3>
+      <Field label="Name">
+        <input className="field" maxLength={63} spellCheck={false} value={name} onChange={e => setName(e.target.value)} />
+      </Field>
+      <Field label="Network" hint={nodes === 0 ? 'can be changed until the first node joins' : 'fixed once nodes have joined'}>
+        <input className="field mono" spellCheck={false} value={cidr} disabled={nodes > 0} onChange={e => setCidr(e.target.value)} />
+      </Field>
+      <Button size="sm" className="justify-self-end" disabled={busy || !changed || !name.trim()} onClick={save}>
+        Save
+      </Button>
+    </Inner>
+  );
+}
+
+function NodePanel({ node, topology, onClose, change, busy }: { node: MeshNode; topology: Topology; onClose: () => void; change: Change; busy: boolean }) {
   const { confirm } = useUI();
   const [tags, setTags] = useState((node.tags ?? []).join(', '));
   const [routes, setRoutes] = useState<string[]>(node.approved_routes ?? []);
+  const [name, setName] = useState(node.name);
   // The topology poll brings new arrays every 5 s: follow the saved values only when they change,
   // so tags being typed and subnet switches not yet saved stay as they are.
   const savedTags = (node.tags ?? []).join(', ');
@@ -206,14 +280,15 @@ function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topolo
     setTags(savedTags);
     setRoutes(savedRoutes ? savedRoutes.split('\n') : []);
   }, [node.id, savedTags, savedRoutes]);
-  const name = (id: string) => topology.nodes.find(n => n.id === id)?.name ?? id;
+  useEffect(() => setName(node.name), [node.id, node.name]);
+  const label = (id: string) => topology.nodes.find(n => n.id === id)?.name ?? id;
   const links = topology.links.filter(l => l.a === node.id || l.b === node.id);
   const state = node.status !== 'active' ? node.status : node.online ? 'online' : 'offline';
   const stateLabel = STATE_LABELS[state] ?? state;
   return (
     <div className="grid gap-4">
       <div className="flex items-center justify-between">
-        <h3 className="text-[17px]">{node.name}</h3>
+        <h3 className="min-w-0 truncate text-[17px]">{node.name}</h3>
         <IconButton label="Back to all nodes" onClick={onClose}>
           <X size={17} />
         </IconButton>
@@ -226,19 +301,28 @@ function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topolo
           ['Reached at', node.endpoint ? <span className="mono">{node.endpoint}</span> : 'Behind NAT (connects out)'],
           ['Seen from', node.seen_from ? <span className="mono">{node.seen_from}</span> : '—'],
           ['Last seen', <span className="num">{node.last_seen_unix ? ago(node.last_seen_unix) : 'Never'}</span>],
+          ...(node.online ? [['Traffic', <span className="num">↓ {speed(node.rx_bps)} · ↑ {speed(node.tx_bps)}</span>] as [string, ReactNode]] : []),
           ['Agent', node.version ? `${node.version} (${node.os})` : '—'],
           ...(node.error ? [['Problem', <span className="text-bad">{node.error}</span>] as [string, ReactNode]] : []),
         ]}
       />
       {node.status === 'pending' && (
-        <Button variant="cta" onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'active' }, `${node.name} is in the mesh.`)}>
+        <Button variant="cta" disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'active' }, `${node.name} is in the mesh.`)}>
           Approve
         </Button>
       )}
+      <Field label="Name" hint="how other nodes reach it, name.mesh">
+        <div className="flex gap-2">
+          <input className="field" maxLength={63} spellCheck={false} value={name} onChange={e => setName(e.target.value)} />
+          <Button size="md" disabled={busy || !name.trim() || name.trim() === node.name} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { name: name.trim() }, 'Name saved.')}>
+            Save
+          </Button>
+        </div>
+      </Field>
       <Field label="Tags" hint="for access rules">
         <div className="flex gap-2">
           <input className="field" spellCheck={false} value={tags} onChange={e => setTags(e.target.value)} />
-          <Button size="md" onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { tags: words(tags.toLowerCase()) }, 'Tags saved.')}>
+          <Button size="md" disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { tags: words(tags.toLowerCase()) }, 'Tags saved.')}>
             Save
           </Button>
         </div>
@@ -253,9 +337,13 @@ function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topolo
               <Switch checked={routes.includes(route)} onChange={on => setRoutes(on ? [...routes, route] : routes.filter(r => r !== route))} label={`Share ${route}`} />
             </label>
           ))}
-          <Button size="sm" className="justify-self-end" onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { approved_routes: routes }, 'Subnets saved.')}>
+          <Button size="sm" className="justify-self-end" disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { approved_routes: routes }, 'Subnets saved.')}>
             Save subnets
           </Button>
+          <Check checked={node.masquerade} onChange={on => change('PATCH', `/mesh/nodes/${node.id}`, { masquerade: on })}>
+            Masquerade traffic into these subnets
+          </Check>
+          <Note>On, the hosts in a shared subnet need no route back to the mesh: the node answers for them. Turn it off if they have one.</Note>
         </Inner>
       )}
       <div className="grid gap-1">
@@ -268,25 +356,45 @@ function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topolo
         <div>
           <h4 className="mb-2 text-[13.5px]">Links</h4>
           <ul className="grid gap-1.5">
-            {links.map(l => (
-              <li key={l.a + l.b} className="inset-glass flex items-center justify-between gap-2 rounded-[16px] px-3 py-2 text-[12.5px]">
-                <span>{name(l.a === node.id ? l.b : l.a)}</span>
-                <span className={l.path === 'direct' ? 'text-ok' : l.path === 'relay' ? 'text-relay' : 'text-bad'}>{l.path === 'relay' ? `Via ${name(l.via ?? '')}` : l.path === 'direct' ? 'Direct' : 'Down'}</span>
-                <span className="num text-fg-2">{l.rtt_ms > 0 ? `${l.rtt_ms.toFixed(1)} ms` : '—'}</span>
-              </li>
-            ))}
+            {links.map(l => {
+              // rx is what the link's first node receives from its second, tx what it sends to it.
+              const mine = l.a === node.id;
+              const down = mine ? l.rx_bps : l.tx_bps, up = mine ? l.tx_bps : l.rx_bps;
+              return (
+                <li key={l.a + l.b} className="inset-glass grid gap-1 rounded-[16px] px-3 py-2 text-[12.5px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate">{label(mine ? l.b : l.a)}</span>
+                    <span className={l.path === 'direct' ? 'text-ok' : l.path === 'relay' ? 'text-relay' : 'text-bad'}>{l.path === 'relay' ? `Via ${label(l.via ?? '')}` : l.path === 'direct' ? 'Direct' : 'Down'}</span>
+                    <span className="num shrink-0 text-fg-2">{l.rtt_ms > 0 ? `${l.rtt_ms.toFixed(1)} ms` : '—'}</span>
+                  </div>
+                  {l.path === 'direct' && (
+                    <div className="num flex items-center justify-between gap-2 text-[11.5px] text-fg-3">
+                      <span>
+                        ↓ {speed(down)} · ↑ {speed(up)}
+                      </span>
+                      <span>{l.handshake_age_s > 0 ? `handshake ${l.handshake_age_s < 60 ? `${l.handshake_age_s} s` : `${Math.round(l.handshake_age_s / 60)} min`} ago` : 'no handshake yet'}</span>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
       <div className="flex flex-wrap gap-2">
         {node.status === 'disabled' ? (
-          <Button onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'active' }, `${node.name} enabled.`)}>Enable</Button>
+          <Button disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'active' }, `${node.name} enabled.`)}>
+            Enable
+          </Button>
         ) : (
-          <Button onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'disabled' }, `${node.name} is disconnected until you enable it.`)}>Disable</Button>
+          <Button disabled={busy} onClick={() => change('PATCH', `/mesh/nodes/${node.id}`, { status: 'disabled' }, `${node.name} is disconnected until you enable it.`)}>
+            Disable
+          </Button>
         )}
         <Button
           variant="danger"
           icon={<Trash2 size={14} />}
+          disabled={busy}
           onClick={async () => {
             if (!(await confirm({ title: `Remove ${node.name} from the mesh?`, text: 'Its agent removes the mesh interface and stops. Joining again needs a new invite.', action: 'Remove node', danger: true }))) return;
             onClose();
@@ -301,39 +409,47 @@ function NodePanel({ node, topology, onClose, change }: { node: MeshNode; topolo
 }
 
 function InviteSheet({ open, info, onClose }: { open: boolean; info: MeshInfo; onClose: () => void }) {
-  const { toast } = useUI();
+  const { copy } = useUI();
   const { api } = useApi();
   const [tags, setTags] = useState('');
+  const [note, setNote] = useState('');
   const [uses, setUses] = useState('1');
   const [hours, setHours] = useState('24');
   const [relay, setRelay] = useState(false);
   const [approval, setApproval] = useState(false);
   const [result, setResult] = useState<{ command: string; expires_unix: number; uses_left: number } | null>(null);
   const [error, setError] = useState('');
+  // A double click on Create invite made two invites, each a working way into the mesh.
+  const { busy, run } = useBusy();
   useEffect(() => {
     if (open) {
       setResult(null);
       setError('');
       setTags('');
+      setNote('');
       setUses('1');
       setHours('24');
       setRelay(false);
       setApproval(false);
     }
   }, [open]);
-  const create = async () => {
-    const count = Number(uses) || 1, valid = Number(hours) || 24;
-    // Whole numbers only: the desktop app's service refuses a fraction before the server sees it.
-    if (![count, valid].every(Number.isInteger) || count < 1 || valid < 1) {
-      setError('An invite works 1-1000 times for 1 hour to 90 days, in whole numbers.');
-      return;
-    }
-    try {
-      setResult(await api('POST', '/mesh/invites', { tags: words(tags.toLowerCase()), uses: count, expires_hours: valid, relay, approval }));
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
+  const create = () =>
+    run(async () => {
+      const count = Number(uses) || 1, valid = Number(hours) || 24;
+      // Whole numbers only: the desktop app's service refuses a fraction before the server sees it.
+      if (![count, valid].every(Number.isInteger) || count < 1 || valid < 1) {
+        setError('An invite works 1-1000 times for 1 hour to 90 days, in whole numbers.');
+        return;
+      }
+      setError('');
+      try {
+        const request: Record<string, unknown> = { tags: words(tags.toLowerCase()), uses: count, expires_hours: valid, relay, approval };
+        if (note.trim()) request.note = note.trim();
+        setResult(await api('POST', '/mesh/invites', request));
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   return (
     <Sheet
       open={open}
@@ -343,7 +459,7 @@ function InviteSheet({ open, info, onClose }: { open: boolean; info: MeshInfo; o
       footer={
         result ? (
           <>
-            <Button icon={<Copy size={14} />} onClick={() => navigator.clipboard.writeText(result.command).then(() => toast('Join command copied. Run it on the server you want to add.'))}>
+            <Button icon={<Copy size={14} />} onClick={() => copy(result.command, 'Join command copied. Run it on the server you want to add.')}>
               Copy command
             </Button>
             <Button variant="cta" onClick={onClose}>
@@ -355,8 +471,8 @@ function InviteSheet({ open, info, onClose }: { open: boolean; info: MeshInfo; o
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="cta" onClick={create}>
-              Create invite
+            <Button variant="cta" disabled={busy} onClick={create}>
+              {busy ? 'Creating…' : 'Create invite'}
             </Button>
           </>
         )
@@ -374,6 +490,9 @@ function InviteSheet({ open, info, onClose }: { open: boolean; info: MeshInfo; o
         </div>
       ) : (
         <div className="grid gap-4">
+          <Field label="Note" hint="optional, to tell the invites apart in the list">
+            <input className="field" data-autofocus maxLength={100} value={note} onChange={e => setNote(e.target.value)} placeholder="For example the Frankfurt web server" />
+          </Field>
           <Field label="Tags" hint="for access rules, for example web or db">
             <input className="field" spellCheck={false} value={tags} onChange={e => setTags(e.target.value)} />
           </Field>
@@ -408,6 +527,7 @@ function RulesSheet({ open, onClose, onSaved }: { open: boolean; onClose: () => 
   const { api } = useApi();
   const [rules, setRules] = useState<DraftRule[]>([]);
   const [error, setError] = useState('');
+  const { busy, run } = useBusy();
   useEffect(() => {
     if (open) {
       setError('');
@@ -431,19 +551,22 @@ function RulesSheet({ open, onClose, onSaved }: { open: boolean; onClose: () => 
           </Button>
           <Button
             variant="cta"
-            onClick={async () => {
-              try {
-                const clean: MeshRule[] = rules.map(r => ({ from: r.from.trim() || '*', to: r.to.trim() || '*', protocol: r.protocol, ports: r.protocol === 'tcp' || r.protocol === 'udp' ? words(r.ports) : [] }));
-                await api('PUT', '/mesh/rules', { rules: clean });
-                toast(clean.length ? `Saved ${plural(clean.length, 'rule')}. Everything else between nodes is blocked.` : 'No rules: every node reaches every node.');
-                onClose();
-                await onSaved();
-              } catch (e) {
-                setError((e as Error).message);
-              }
-            }}
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                try {
+                  const clean: MeshRule[] = rules.map(r => ({ from: r.from.trim() || '*', to: r.to.trim() || '*', protocol: r.protocol, ports: r.protocol === 'tcp' || r.protocol === 'udp' ? words(r.ports) : [] }));
+                  await api('PUT', '/mesh/rules', { rules: clean });
+                  toast(clean.length ? `Saved ${plural(clean.length, 'rule')}. Everything else between nodes is blocked.` : 'No rules: every node reaches every node.');
+                  onClose();
+                  await onSaved();
+                } catch (e) {
+                  setError((e as Error).message);
+                }
+              })
+            }
           >
-            Save rules
+            {busy ? 'Saving…' : 'Save rules'}
           </Button>
         </>
       }

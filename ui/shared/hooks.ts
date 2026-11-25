@@ -1,4 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { exclusive, type Lock } from './lock';
+
+// The state of a button that changes something: `busy` disables it and shows its "Saving…" label,
+// and `run` refuses a second start while the first is running (a double click would otherwise
+// create two keys or two invites). The work's own failures are the caller's to report.
+export function useBusy(): { busy: boolean; run: <T>(work: () => Promise<T>) => Promise<T | undefined> } {
+  const lock = useRef<Lock>({ running: false });
+  const [busy, setBusy] = useState(false);
+  const run = useCallback(
+    <T,>(work: () => Promise<T>) =>
+      exclusive(lock.current, async () => {
+        setBusy(true);
+        try {
+          return await work();
+        } finally {
+          setBusy(false);
+        }
+      }),
+    [],
+  );
+  return { busy, run };
+}
 
 // A preference kept in localStorage (finish, motion, view mode). Unknown stored values fall back.
 export function useStoredState<T extends string>(key: string, fallback: T, allowed: readonly T[]): [T, (value: T) => void] {

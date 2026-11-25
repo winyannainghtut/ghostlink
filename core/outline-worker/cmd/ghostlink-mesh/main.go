@@ -114,6 +114,26 @@ func firewall(backend string) *hostfw.Firewall {
 	return &hostfw.Firewall{Backend: backend}
 }
 
+// offeredEndpoint checks join's --endpoint and returns what to offer other nodes: an address in
+// another form, or one nobody can send to (unspecified, link-local, multicast), is an error. A
+// loopback address is accepted, but not offered, with a note saying so: `ghostlink-server mesh
+// join-here` passes the address its host name resolves to, which on a test machine (host name
+// 127.0.0.1) or a host whose own name maps to 127.0.1.1 is a loopback address, and joining must
+// still work there.
+func offeredEndpoint(endpoint string) (offered, note string, err error) {
+	if endpoint == "" {
+		return "", "", nil
+	}
+	if err := meshproto.ValidEndpoint(endpoint); err != nil {
+		return "", "", err
+	}
+	if !meshproto.ReachableEndpoint(endpoint) {
+		return "", endpoint + " is a loopback address, which no other node can reach, so it is not offered to them; " +
+			"use --endpoint with this machine's public address if other nodes should connect to it", nil
+	}
+	return endpoint, "", nil
+}
+
 // hostName turns the machine's host name into a node name.
 func hostName() string {
 	name, _ := os.Hostname()
@@ -158,11 +178,14 @@ func join(flags *flag.FlagSet, dir *string, args []string) {
 	if *port == 0 || *port > 65535 {
 		fail("--port must be 1-65535")
 	}
-	if *endpoint != "" {
-		if err := meshproto.ValidEndpoint(*endpoint); err != nil {
-			fail("--endpoint: %v", err)
-		}
+	offered, note, err := offeredEndpoint(*endpoint)
+	if err != nil {
+		fail("--endpoint: %v", err)
 	}
+	if note != "" {
+		fmt.Fprintln(os.Stderr, "ghostlink-mesh: "+note)
+	}
+	*endpoint = offered
 	if !meshagent.ValidInterface(*iface) {
 		fail("--interface: use a short lower-case name such as glmesh0")
 	}

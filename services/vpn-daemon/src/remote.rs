@@ -88,8 +88,9 @@ fn text(value: &Value, limit: usize, fallback: &str) -> String {
 
 pub(crate) async fn handle(daemon: &Mutex<Daemon>, request: Request) -> Response {
     let operation = request.action.name();
-    // 1. Authorize, audit and read the sealed key while holding the lock only briefly.
-    let (actor, plan) = {
+    // 1. Authorize, audit and read the sealed key while holding the lock only briefly. The audit
+    // log has a lock of its own, so what is recorded at the end needs no hold on the service.
+    let (actor, plan, audit_log) = {
         let guard = daemon.lock().await;
         let actor = match guard.authorize(&request) {
             Ok(actor) => actor,
@@ -102,7 +103,7 @@ pub(crate) async fn handle(daemon: &Mutex<Daemon>, request: Request) -> Response
             return Response::err("internal", "Audit storage is unavailable");
         }
         match guard.plan(request.action) {
-            Ok(plan) => (actor, plan),
+            Ok(plan) => (actor, plan, guard.audit_log.clone()),
             Err(response) => {
                 let _ = guard.audit(&actor, operation, outcome(&response));
                 return response;
@@ -136,10 +137,9 @@ pub(crate) async fn handle(daemon: &Mutex<Daemon>, request: Request) -> Response
             },
         },
     };
-    let _ = daemon
-        .lock()
-        .await
-        .audit(&actor, operation, outcome(&response));
+    // Not through the service lock: a connect that holds it for seconds would otherwise hold this
+    // answer back, although the remote call is long done.
+    let _ = audit_log.record(&actor, operation, outcome(&response));
     response
 }
 
@@ -390,6 +390,60 @@ mod tests {
         .unwrap();
         assert_eq!(old.summary("old")["label"], "");
         let _ = std::fs::remove_dir_all(&daemon.args.data_dir);
+    }
+
+    /// The outcome of a call to a server is recorded through the audit log's own lock: the answer
+    /// does not wait for the service, which a connect may hold for many seconds, once the call is
+    /// done (it used to take the service lock again just to write that line).
+    #[tokio::test]
+    async fn the_answer_of_a_remote_call_does_not_wait_for_the_service_lock() {
+        use std::{sync::Arc, time::Duration};
+        // A "server" that takes the connection and drops it a moment later: the call fails.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(800));
+                drop(stream);
+            }
+        });
+        let key = format!(
+            r#"{{"apiUrl":"https://127.0.0.1:{port}/abcdefghijklmnop0123","certSha256":"{}"}}"#,
+            "ab".repeat(32)
+        );
+        let daemon = Arc::new(Mutex::new(crate::test_daemon("remote-lock")));
+        let request = Request {
+            schema_version: ghostlink_contracts::SCHEMA_VERSION,
+            agent_token: None,
+            action: Action::ManagedServerAdd {
+                name: "home".into(),
+                management_key: key,
+                replace: false,
+                label: None,
+            },
+        };
+        let call = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { handle(&daemon, request).await }
+        });
+        // The call is on its way: the service lock was needed only to plan it. Now something
+        // else (a connect, say) holds the service for longer than the call takes.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let held = daemon.lock().await;
+        let response = tokio::time::timeout(Duration::from_secs(15), call)
+            .await
+            .expect("the answer waited for the service lock")
+            .unwrap();
+        assert!(!response.success);
+        // The outcome is in the audit log all the same.
+        let audit = std::fs::read_to_string(held.args.data_dir.join("audit.jsonl")).unwrap();
+        assert!(
+            audit.contains(r#""operation":"managed_server_add","outcome":"server_unreachable""#),
+            "{audit}"
+        );
+        let dir = held.args.data_dir.clone();
+        drop(held);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

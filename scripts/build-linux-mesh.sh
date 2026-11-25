@@ -50,7 +50,10 @@ chmod -R u=rwX,go=rX "$work/pkg"
 
 sed -e "s|@VERSION@|$version|" -e "s|@GOARCH@|$goarch|" -e "s|@PKG@|$work/pkg|g" \
   packages/linux/mesh/ghostlink-mesh.nfpm.yaml > "$work/nfpm.yaml"
-for packager in deb rpm; do
-  nfpm package --config "$work/nfpm.yaml" --packager "$packager" --target "$out/"
-done
+# The file names carry the version as released (0.9.0-rc.1), which install-mesh.sh and the release
+# notes expect. nfpm's own names write a pre-release as 0.9.0~rc.1, which GitHub may rename on
+# upload. Inside the packages it stays 0.9.0~rc.1, so that it sorts before 0.9.0.
+case "$goarch" in amd64) rpm_arch=x86_64 ;; arm64) rpm_arch=aarch64 ;; esac
+nfpm package --config "$work/nfpm.yaml" --packager deb --target "$out/ghostlink-mesh_${version}-1_${goarch}.deb"
+nfpm package --config "$work/nfpm.yaml" --packager rpm --target "$out/ghostlink-mesh-${version}-1.${rpm_arch}.rpm"
 ls -l "$out"/ghostlink-mesh[_-]*

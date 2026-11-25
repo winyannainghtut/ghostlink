@@ -69,11 +69,17 @@ try {
     Pop-Location
     Remove-Item -LiteralPath $verifyDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
+# The Go toolchain named in go.mod (its toolchain line, else its go line), so that the instructions
+# cannot name another one than the module pins.
+$goModule = Get-Content -LiteralPath (Join-Path $repository 'core\outline-worker\go.mod') -Raw
+if ($goModule -match '(?m)^toolchain go(\d+(?:\.\d+)+)\s*$') { $goVersion = $Matches[1] }
+elseif ($goModule -match '(?m)^go (\d+(?:\.\d+)+)\s*$') { $goVersion = $Matches[1] }
+else { throw 'go.mod names no Go version' }
 $instructions = @"
 Ghostlink $Version corresponding source: tunnel worker (ghostlink-tunnel), server (ghostlink-server),
 IPsec agent (ghostlink-ipsec-agent) and mesh agent (ghostlink-mesh)
 
-Build toolchain: Go 1.26.10 (pinned in go.mod).
+Build toolchain: Go $goVersion (pinned in go.mod).
 Windows x64: CGO_ENABLED=0 GOOS=windows GOARCH=amd64
   go build -mod=vendor -trimpath -buildvcs=false -tags with_gvisor,with_utls,with_wireguard -ldflags "-s -w" -o ghostlink-tunnel.exe .
 Linux x64: CGO_ENABLED=0 GOOS=linux GOARCH=amd64

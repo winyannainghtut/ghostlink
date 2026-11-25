@@ -46,7 +46,7 @@ trap cleanup EXIT
 
 main() {
     # An invite in the environment stays out of the process list and sudo's log.
-    local invite=${GHOSTLINK_MESH_INVITE:-} version="" package="" open_firewall=0 port=51820
+    local invite=${GHOSTLINK_MESH_INVITE:-} version="" package="" open_firewall=0 port=51820 port_given=0
     unset GHOSTLINK_MESH_INVITE
     local join_args=()
     while [ $# -gt 0 ]; do
@@ -55,7 +55,7 @@ main() {
             --join=*) invite=${1#--join=}; shift ;;
             --name | --advertise-routes | --endpoint)
                 [ $# -ge 2 ] || die "$1 needs a value"; join_args+=("$1" "$2"); shift 2 ;;
-            --port) [ $# -ge 2 ] || die "--port needs a value"; port=$2; join_args+=(--port "$2"); shift 2 ;;
+            --port) [ $# -ge 2 ] || die "--port needs a value"; port=$2; port_given=1; join_args+=(--port "$2"); shift 2 ;;
             --relay | --no-hosts) join_args+=("$1"); shift ;;
             --open-firewall) open_firewall=1; shift ;;
             --version) [ $# -ge 2 ] || die "--version needs a value"; version=${2#v}; shift 2 ;;
@@ -104,6 +104,10 @@ main() {
     command -v curl >/dev/null 2>&1 || missing+=(curl)
     command -v jq >/dev/null 2>&1 || missing+=(jq)
     command -v iptables >/dev/null 2>&1 || missing+=(iptables)
+    # The WireGuard check below makes a link with ip; a minimal image may not have it.
+    if ! command -v ip >/dev/null 2>&1; then
+        if [ "$family" = deb ]; then missing+=(iproute2); else missing+=(iproute); fi
+    fi
     if [ ${#missing[@]} -gt 0 ]; then
         say "Installing ${missing[*]}"
         pkg_install "$family" "${missing[@]}"
@@ -117,10 +121,13 @@ main() {
     ip link del glmeshtest0 >/dev/null 2>&1 || true
 
     local file installed=""
-    command -v ghostlink-mesh >/dev/null 2>&1 && installed=$(ghostlink-mesh version 2>/dev/null | sed 's/^Ghostlink mesh agent //')
+    # An agent that cannot say its version (damaged, or too old) counts as none, not as the end of the run.
+    if command -v ghostlink-mesh >/dev/null 2>&1; then
+        installed=$(ghostlink-mesh version 2>/dev/null | sed 's/^Ghostlink mesh agent //' || true)
+    fi
     if [ -n "$package" ]; then
         file=$(basename "$package")
-        version=$(printf '%s\n' "$file" | sed -E -e 's/^ghostlink-mesh[_-]//' -e 's/-1(_[a-z0-9]+\.deb|\.[a-z0-9_]+\.rpm)$//')
+        version=$(package_version "$file")
     else
         if [ -z "$version" ]; then
             version=$(curl -fsSL --retry 3 "https://api.github.com/repos/$REPO/releases?per_page=20" |
@@ -152,6 +159,12 @@ main() {
         say "Joining the mesh"
         # Bash before 4.4 (Amazon Linux 2, EL7) calls an empty array unbound under set -u.
         GHOSTLINK_MESH_INVITE="$invite" ghostlink-mesh join ${join_args[@]+"${join_args[@]}"}
+    fi
+    # Run again without --port, a node keeps the port it joined with, not the default.
+    if [ "$port_given" = 0 ]; then
+        local saved
+        saved=$(node_port)
+        [ -z "$saved" ] || port=$saved
     fi
     # Before the agent starts: a firewalld reload can remove the agent's iptables rules.
     [ "$open_firewall" = 0 ] || open_host_firewall "$port"
@@ -190,7 +203,22 @@ EOF
 
 firewalld_running() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }
 
+# package_version FILE-NAME: the version a package file name carries, as the agent reports it. The
+# file names nfpm writes spell a pre-release 0.9.0~rc.1 (an rpm also turns - into _ after the ~);
+# a semantic version has neither, so both map back.
+package_version() {
+    printf '%s\n' "$1" | sed -E -e 's/^ghostlink-mesh[_-]//' -e 's/-1(_[a-z0-9]+\.deb|\.[a-z0-9_]+\.rpm)$//' | tr '~_' '--'
+}
+
 mesh_interface() { jq -r '.interface // "glmesh0"' /var/lib/ghostlink-mesh/node.json 2>/dev/null || echo glmesh0; }
+
+# node_port prints the UDP port this server's mesh node listens on (node.json), nothing when it
+# is not a node or the file has no usable port.
+node_port() {
+    local saved
+    saved=$(jq -r '.listen_port // empty' /var/lib/ghostlink-mesh/node.json 2>/dev/null || true)
+    if [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ge 1 ] && [ "$saved" -le 65535 ]; then echo "$saved"; fi
+}
 
 # open_host_firewall allows the WireGuard port in an active ufw or firewalld. With firewalld the
 # mesh interface also goes into the trusted zone: its own nftables table would otherwise reject
@@ -199,7 +227,7 @@ mesh_interface() { jq -r '.interface // "glmesh0"' /var/lib/ghostlink-mesh/node.
 open_host_firewall() {
     local port=$1 iface
     iface=$(mesh_interface)
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
         if ufw allow "$port/udp" comment 'Ghostlink mesh' >/dev/null; then
             say "Allowed UDP $port in ufw"
         else
@@ -231,4 +259,5 @@ pkg_install() {
     fi
 }
 
-main "$@"
+# Run the installer, unless the file is sourced to call one of its functions (the tests do).
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then main "$@"; fi

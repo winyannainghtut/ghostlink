@@ -2,10 +2,11 @@
 import { Activity, Info as InfoIcon } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { FinishPicker, type Appearance } from '@shared/appearance';
-import { Button, Card, Note, Segmented, Sheet, Switch, useUI } from '@shared/glass';
+import { Button, Card, Note, Segmented, Sheet, Switch } from '@shared/glass';
 import { request, type RoutingPolicy } from '../ipc';
 import { useService } from '../service';
 import { VERSION } from '../version';
+import { DiagnosticsSheet } from './DiagnosticsSheet';
 import { SplitSheet, splitSummary } from './SplitSheet';
 
 function Row({ title, detail, children }: { title: string; detail: string; children: ReactNode }) {
@@ -22,10 +23,9 @@ function Row({ title, detail, children }: { title: string; detail: string; child
 
 export function Settings({ appearance }: { appearance: Appearance }) {
   const { info, act, available } = useService();
-  const { toast } = useUI();
   const [summary, setSummary] = useState('');
   const [split, setSplit] = useState<null | undefined>(undefined);
-  const [doctor, setDoctor] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState(false);
   const [about, setAbout] = useState(false);
   const loadSummary = () =>
     request<{ policy: RoutingPolicy | null }>({ type: 'routing_policy_get' })
@@ -61,17 +61,8 @@ export function Settings({ appearance }: { appearance: Appearance }) {
           ]}
         />
       </Row>
-      <Row title="Diagnostics" detail="What the local service reports about engines, permissions and the last connection.">
-        <Button
-          icon={<Activity size={15} />}
-          onClick={async () => {
-            try {
-              setDoctor(JSON.stringify(await request({ type: 'doctor' }), null, 2));
-            } catch (e) {
-              toast((e as Error).message, 'bad');
-            }
-          }}
-        >
+      <Row title="Diagnostics" detail="What the local service reports about its engines, permissions and the last connection, and the log of what it did.">
+        <Button icon={<Activity size={15} />} onClick={() => setDiagnostics(true)}>
           Run diagnostics
         </Button>
       </Row>
@@ -83,9 +74,7 @@ export function Settings({ appearance }: { appearance: Appearance }) {
       <Note>Ghostlink uses your own server or one shared with you. An access key does not include a subscription or create a server. Connecting needs the installed Ghostlink service.</Note>
 
       <SplitSheet profile={split} onClose={() => setSplit(undefined)} onSaved={loadSummary} />
-      <Sheet open={doctor !== null} onClose={() => setDoctor(null)} size="medium" title="Connection diagnostics" footer={<Button variant="cta" onClick={() => setDoctor(null)}>Done</Button>}>
-        <pre className="inset-glass mono max-h-[60vh] overflow-auto rounded-[20px] p-4 text-[12px] leading-relaxed whitespace-pre-wrap text-fg-2">{doctor}</pre>
-      </Sheet>
+      <DiagnosticsSheet open={diagnostics} onClose={() => setDiagnostics(false)} version={info?.version} />
       <Sheet open={about} onClose={() => setAbout(false)} title="Private by choice" subtitle={`Ghostlink ${info?.version ?? VERSION}`} footer={<Button variant="cta" onClick={() => setAbout(false)}>Done</Button>}>
         <div className="grid gap-3 text-[13.5px] text-fg-2">
           <p>Ghostlink is an independent personal VPN for keys from Outline, Amnezia and VLESS servers, and for WireGuard and AmneziaWG files, plus your own Ghostlink servers.</p>

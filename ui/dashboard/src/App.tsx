@@ -1,6 +1,6 @@
 // The dashboard shell: glass waves behind a floating navigation bar, three views and the sheets.
 import { LogOut, Plus, Settings2 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Server } from '@admin/api';
 import { Island } from '@admin/Island';
 import { StoreProvider, useStore } from '@admin/store';
@@ -9,10 +9,12 @@ import { NewClient } from '@admin/views/NewClient';
 import { Network } from '@admin/views/Network';
 import { Overview } from '@admin/views/Overview';
 import { SettingsSheet } from '@admin/views/Settings';
+import { AppBar } from '@shared/AppBar';
 import { WaveBackground } from '@shared/WaveBackground';
-import { FinishPicker, Mark, MotionButton, useAppearance, type Appearance } from '@shared/appearance';
-import { Button, Card, IconButton, Segmented, UIProvider } from '@shared/glass';
+import { Mark, useAppearance, type Appearance } from '@shared/appearance';
+import { Button, Card, CardSkeleton, Field, IconButton, Loading, Segmented, Skeleton, UIProvider } from '@shared/glass';
 import { useStoredState } from '@shared/hooks';
+import { parseLoginLink } from './loginLink';
 import { dashboardTransport, loginToken, signIn, signOut } from './session';
 
 const VIEWS = ['overview', 'clients', 'network'] as const;
@@ -24,23 +26,24 @@ export function App() {
   const [phase, setPhase] = useState<'loading' | 'signin' | 'ready'>('loading');
   const [message, setMessage] = useState('');
 
+  // Only the newest sign-in may set the page, if a second one starts while the first runs. A token
+  // pasted into the sign-in card is used instead of the one in the address.
+  const attempt = useRef(0);
+  const start = useCallback((token?: string | null) => {
+    const mine = ++attempt.current;
+    setPhase('loading');
+    signIn(token).then(result => {
+      if (mine !== attempt.current) return;
+      if (result.server) {
+        setServer(result.server);
+        setPhase('ready');
+      } else {
+        setMessage(result.error);
+        setPhase('signin');
+      }
+    });
+  }, []);
   useEffect(() => {
-    // Only the newest sign-in may set the page, if a second one starts while the first runs.
-    let attempt = 0;
-    const start = () => {
-      const mine = ++attempt;
-      setPhase('loading');
-      signIn().then(result => {
-        if (mine !== attempt) return;
-        if (result.server) {
-          setServer(result.server);
-          setPhase('ready');
-        } else {
-          setMessage(result.error);
-          setPhase('signin');
-        }
-      });
-    };
     start();
     // Opening the login link again in this tab changes only the part after #, which does not
     // reload the page: sign in with the new token here.
@@ -49,14 +52,25 @@ export function App() {
     };
     window.addEventListener('hashchange', again);
     return () => window.removeEventListener('hashchange', again);
-  }, []);
+  }, [start]);
 
   return (
     <UIProvider>
       <WaveBackground />
       <div className="relative z-10 min-h-screen">
-        {phase === 'loading' && <div className="grid min-h-screen place-items-center text-[13px] text-fg-3">Connecting to the server…</div>}
-        {phase === 'signin' && <SignIn message={message} />}
+        {phase === 'loading' && (
+          <div className="grid min-h-screen place-items-center px-4">
+            <Loading label="Connecting to the server" className="grid w-full max-w-md justify-items-center gap-4">
+              <Mark className="size-12" />
+              <CardSkeleton lines={2} className="w-full" />
+              <Skeleton className="h-3 w-40" />
+              <p className="text-[13px] text-fg-3" aria-hidden="true">
+                Connecting to the server…
+              </p>
+            </Loading>
+          </div>
+        )}
+        {phase === 'signin' && <SignIn message={message} onToken={start} />}
         {phase === 'ready' && server && (
           <StoreProvider
             transport={dashboardTransport}
@@ -74,7 +88,19 @@ export function App() {
   );
 }
 
-function SignIn({ message }: { message: string }) {
+function SignIn({ message, onToken }: { message: string; onToken: (token: string) => void }) {
+  const [text, setText] = useState('');
+  const [problem, setProblem] = useState('');
+  const submit = () => {
+    const token = parseLoginLink(text);
+    if (!token) {
+      setProblem('That is not a login link. It looks like https://…/#t=… and is printed by the command above.');
+      return;
+    }
+    setProblem('');
+    setText('');
+    onToken(token);
+  };
   return (
     <div className="grid min-h-screen place-items-center px-4">
       <Card className="w-full max-w-md text-center">
@@ -84,6 +110,22 @@ function SignIn({ message }: { message: string }) {
           Open the login link printed by <code className="mono rounded-md bg-field px-1.5 py-0.5 text-[12.5px]">sudo ghostlink-server dashboard</code> on the server.
         </p>
         {message && <p className="mt-4 text-[13px] text-bad">{message}</p>}
+        {/* The link may have lost its #t= on the way (a chat app, a redirect): paste it here. */}
+        <form
+          className="mt-5 grid gap-3 text-left"
+          onSubmit={event => {
+            event.preventDefault();
+            submit();
+          }}
+        >
+          <Field label="Or paste the link here" hint="the whole link, or just the part after #t=">
+            <input className="field mono" type="password" autoComplete="off" spellCheck={false} autoFocus value={text} onChange={e => setText(e.target.value)} placeholder="https://…/#t=…" />
+          </Field>
+          {problem && <p className="text-[12.5px] text-bad">{problem}</p>}
+          <Button type="submit" variant="cta" disabled={!text.trim()} className="justify-self-end">
+            Sign in
+          </Button>
+        </form>
       </Card>
     </div>
   );
@@ -97,44 +139,38 @@ function Shell({ appearance, onSignOut }: { appearance: Appearance; onSignOut: (
 
   return (
     <>
-      <header className="sticky top-0 z-30 px-3 pt-3 sm:px-5 sm:pt-4 2xl:px-8">
-        <nav className="glass mx-auto flex max-w-[2400px] flex-wrap items-center gap-x-4 gap-y-3 rounded-[28px] px-4 py-3 lg:flex-nowrap">
-          {/* The side slots are equal, so the middle stays centred, and as wide as the right-hand
-              buttons need (about 362 px), so they never reach into the middle. */}
-          <div className="flex min-w-0 items-center gap-3 lg:w-[368px]">
-            <Mark className="size-9 shrink-0" />
-            <div className="min-w-0 leading-tight">
-              <div className="text-[15px] font-semibold tracking-[-0.02em]">GHOSTLINK</div>
-              <div className="mono truncate text-[11.5px] text-fg-3" title={`${server.name} · version ${server.version}`}>
-                {server.hostname} · v{server.version}
-              </div>
-            </div>
+      <AppBar
+        appearance={appearance}
+        subtitle={
+          <div className="mono truncate text-[11.5px] text-fg-3" title={`${server.name} · version ${server.version}`}>
+            {server.hostname} · v{server.version}
           </div>
-          <div className="order-3 flex w-full flex-wrap items-center justify-center gap-3 lg:order-none lg:w-auto lg:flex-1">
-            <Segmented
-              label="View"
-              value={view}
-              onChange={setView}
-              options={[
-                { value: 'overview', label: 'Overview' },
-                { value: 'clients', label: 'Clients' },
-                { value: 'network', label: 'Network' },
-              ]}
-            />
-            <Island />
-          </div>
-          <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5 lg:w-[368px] lg:flex-nowrap">
-            <MotionButton motion={appearance.motion} onChange={appearance.setMotion} />
-            <FinishPicker value={appearance.finish} onChange={appearance.setFinish} />
+        }
+        switcher={
+          <Segmented
+            label="View"
+            value={view}
+            onChange={setView}
+            className="shrink-0"
+            options={[
+              { value: 'overview', label: 'Overview' },
+              { value: 'clients', label: 'Clients' },
+              { value: 'network', label: 'Network' },
+            ]}
+          />
+        }
+        status={<Island />}
+        actions={
+          <>
             <IconButton label="Server settings" onClick={() => setSettings(true)}>
               <Settings2 size={17} />
             </IconButton>
             <Button variant="cta" icon={<Plus size={16} strokeWidth={2.4} />} onClick={() => setNewClient(true)} className="ml-1">
               New client
             </Button>
-          </div>
-        </nav>
-      </header>
+          </>
+        }
+      />
       <main className="mx-auto max-w-[2400px] px-3 pt-5 pb-24 sm:px-5 2xl:px-8">
         {view === 'overview' && <Overview onNewClient={() => setNewClient(true)} />}
         {view === 'clients' && <Clients onNewClient={() => setNewClient(true)} />}

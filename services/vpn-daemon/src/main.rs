@@ -330,10 +330,53 @@ impl Daemon {
         }
         self.session = None;
     }
+    /// The block on another connection after an engine ended without confirming that it removed
+    /// its routes, DNS settings and filters. It is lifted only by [`Daemon::lift_cleanup_barrier`]:
+    /// every request that needs a clean start (connect, switch, disconnect) asks again, which is
+    /// how a failed check is retried, so a service is not left blocked until it is restarted.
     async fn cleanup_failure(&self) -> Option<Response> {
-        let state = self.state.read().await;
-        matches!(state.status.last_error.as_deref(), Some("forced_stop_network_cleanup_unverified" | "network_cleanup_unverified"))
-            .then(|| Response::err("cleanup_unverified", "Network cleanup could not be verified; inspect routing and DNS before another connection"))
+        let blocked = self
+            .state
+            .read()
+            .await
+            .status
+            .last_error
+            .as_deref()
+            .is_some_and(management::is_cleanup_barrier);
+        if blocked && !self.lift_cleanup_barrier().await {
+            return Some(Response::err("cleanup_unverified", "Network cleanup could not be verified; inspect routing and DNS before another connection. Ghostlink checks again at every connect and disconnect"));
+        }
+        None
+    }
+    /// Looks again at what the engine of the last session left in the operating system and, only
+    /// if nothing of it is there any more, lifts the block. It never lifts it when it cannot
+    /// tell: no footprint was recorded (OpenVPN stopped before it reported an address), or the
+    /// system could not be asked. What is checked is the interface the engine created and the
+    /// addresses it assigned (see `netstate`), not every route, rule and DNS setting.
+    async fn lift_cleanup_barrier(&self) -> bool {
+        let Some(footprint) = self.state.read().await.footprint.clone() else {
+            return false;
+        };
+        // The system is asked on a blocking thread, which waits on it.
+        let remains = tokio::task::spawn_blocking(move || footprint.remains()).await;
+        if !matches!(remains, Ok(Ok(false))) {
+            return false;
+        }
+        {
+            let mut snapshot = self.state.write().await;
+            // No session can have started since: this request holds the service.
+            if snapshot
+                .status
+                .last_error
+                .as_deref()
+                .is_some_and(management::is_cleanup_barrier)
+            {
+                snapshot.status.last_error = None;
+                snapshot.footprint = None;
+            }
+        }
+        let _ = self.audit("service", "network_cleanup_check", "verified");
+        true
     }
     async fn connect(&mut self, name: Option<String>, switching: bool) -> Result<Response> {
         let name = match name.or_else(|| self.store.default_profile.clone()) {
@@ -357,6 +400,19 @@ impl Daemon {
             if status.profile.as_deref() == Some(&name) {
                 return Ok(Response::ok(status));
             }
+            // Another server is active, and this is not a switch. That is the answer, given
+            // before anything else is done for this request: reading the saved key and fetching
+            // a dynamic one can take 15 seconds while every other request waits, and a key that
+            // cannot be read or fetched must not turn "busy" into "invalid".
+            let what = if stored.summary.kind == "openvpn" {
+                "profile"
+            } else {
+                "server"
+            };
+            return Ok(Response::err(
+                "busy",
+                &format!("Another {what} is active; use switch"),
+            ));
         }
         let clear = storage::unseal(&stored.sealed_content)?;
         let content = String::from_utf8(clear)?;
@@ -380,12 +436,6 @@ impl Daemon {
             #[cfg(unix)]
             if outbound.full_tunnel() && !self.args.allow_full_tunnel {
                 return Ok(Response::err("permission_denied", "Full tunnel requires the administrator to authorize route changes with --allow-full-tunnel after protecting SSH access"));
-            }
-            if self.session.as_ref().is_some_and(|s| !s.finished()) && !switching {
-                return Ok(Response::err(
-                    "busy",
-                    "Another server is active; use switch",
-                ));
             }
             self.disconnect().await;
             if let Some(error) = self.cleanup_failure().await {
@@ -427,12 +477,6 @@ impl Daemon {
         }
         if !self.args.openvpn.is_absolute() || !self.args.openvpn.is_file() {
             return Ok(Response::err("engine_unavailable", "Install OpenVPN Community and configure the service with its absolute executable path"));
-        }
-        if self.session.as_ref().is_some_and(|s| !s.finished()) && !switching {
-            return Ok(Response::err(
-                "busy",
-                "Another profile is active; use switch",
-            ));
         }
         self.disconnect().await;
         if let Some(error) = self.cleanup_failure().await {
@@ -1001,6 +1045,7 @@ pub(crate) fn test_daemon(name: &str) -> Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostlink_engine::netstate::Footprint;
 
     fn request(action: Action) -> Request {
         Request {
@@ -1053,6 +1098,67 @@ mod tests {
             .await;
         assert_eq!(refused.error.unwrap().code, "invalid_request");
         assert!(!daemon.args.data_dir.join("state.json").exists());
+        let _ = fs::remove_dir_all(&daemon.args.data_dir);
+    }
+
+    /// A session that ended with a cleanup barrier, and what it may have left in the system.
+    async fn ended_with_barrier(daemon: &Daemon, error: &str, footprint: Option<Footprint>) {
+        let mut snapshot = daemon.state.write().await;
+        snapshot.status.status = ConnectionState::Failed;
+        snapshot.status.last_error = Some(error.into());
+        snapshot.footprint = footprint;
+    }
+
+    fn footprint(interface: Option<&str>, address: &str) -> Option<Footprint> {
+        Some(Footprint {
+            interface: interface.map(String::from),
+            addresses: vec![address.parse().unwrap()],
+        })
+    }
+
+    /// The service is not blocked for good (code review 2026-11-25, C3): a request that needs a
+    /// clean start looks again at what the engine left, and lifts the barrier only if nothing of
+    /// it is there. Where it cannot tell, or something is left, the barrier stays. This machine's
+    /// own loopback address stands in for what an engine left behind.
+    #[tokio::test]
+    async fn a_cleanup_barrier_is_lifted_only_when_nothing_is_left() {
+        let mut daemon = test_daemon("barrier");
+        let disconnect = || request(Action::Disconnect {});
+        for barrier in [
+            "network_cleanup_unverified",
+            "forced_stop_network_cleanup_unverified",
+        ] {
+            // No footprint was recorded: cannot tell, so blocked.
+            ended_with_barrier(&daemon, barrier, None).await;
+            let answer = daemon.handle(disconnect()).await;
+            assert_eq!(answer.error.unwrap().code, "cleanup_unverified");
+            // Its address is still configured here: blocked, and still reported as failed.
+            ended_with_barrier(&daemon, barrier, footprint(None, "127.0.0.1")).await;
+            let answer = daemon.handle(disconnect()).await;
+            assert_eq!(answer.error.unwrap().code, "cleanup_unverified");
+            let state = daemon.state.read().await;
+            assert_eq!(state.status.last_error.as_deref(), Some(barrier));
+            assert!(state.footprint.is_some());
+            drop(state);
+            // Nothing is left: lifted, and the service is idle again.
+            ended_with_barrier(
+                &daemon,
+                barrier,
+                footprint(Some("Ghostlink-none"), "203.0.113.99"),
+            )
+            .await;
+            let answer = daemon.handle(disconnect()).await;
+            assert!(answer.success, "{:?}", answer.error.map(|e| e.message));
+            let state = daemon.state.read().await;
+            assert_eq!(state.status.status, ConnectionState::Disconnected);
+            assert!(state.status.last_error.is_none() && state.footprint.is_none());
+        }
+        // The check is recorded, once for each lifting.
+        let audit = fs::read_to_string(daemon.args.data_dir.join("audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("network_cleanup_check").count(), 2);
+        // Another failure is no barrier, and is left as it is until disconnected.
+        ended_with_barrier(&daemon, "connection_timeout", None).await;
+        assert!(daemon.handle(disconnect()).await.success);
         let _ = fs::remove_dir_all(&daemon.args.data_dir);
     }
 }

@@ -6,6 +6,7 @@ import { useState, type ReactNode } from 'react';
 import { confName, fileSafe } from '@shared/format';
 import { Button, Sheet, useUI } from '@shared/glass';
 import { APPLE, protocolName, svgURL, type Key, type KeySummary, type ServerApi, type User } from './api';
+import { profilePath, type ProfileOptions } from './protocols';
 import { useApi } from './store';
 
 export const isApple = (protocol: string) => (APPLE as string[]).includes(protocol);
@@ -38,12 +39,13 @@ export async function saveConf({ saveFile }: ServerApi, user: User, key: Key): P
   return saved(where, '.conf') + ' Import it in the WireGuard or AmneziaWG app.';
 }
 
-export async function saveProfile({ apiText, saveFile }: ServerApi, user: User, key: Key, askPassword = false): Promise<string> {
-  const content = await apiText(`/users/${user.id}/keys/${key.id}/profile${askPassword ? '?prompt_password=1' : ''}`);
+export async function saveProfile({ apiText, saveFile }: ServerApi, user: User, key: Key, options: ProfileOptions = {}): Promise<string> {
+  const content = await apiText(profilePath(user, key, options));
   const where = await saveFile({ name: `${fileSafe(user.name)}-${key.protocol}-${key.id}`, extension: 'mobileconfig', content, mime: 'application/x-apple-aspen-config' });
-  return askPassword
-    ? `${saved(where, 'Profile')} It has no password inside: the device asks for the certificate's password while installing, so give it to ${user.name} separately.`
-    : `${saved(where, 'Profile')} Send it privately (AirDrop, Mail or Files); opening it installs the VPN.`;
+  const auto = options.onDemand ? ' The VPN connects by itself whenever the device is online.' : '';
+  return options.askPassword
+    ? `${saved(where, 'Profile')} It has no password inside: the device asks for the certificate's password while installing, so give it to ${user.name} separately.${auto}`
+    : `${saved(where, 'Profile')} Send it privately (AirDrop, Mail or Files); opening it installs the VPN.${auto}`;
 }
 
 export async function saveKit({ apiText, saveFile }: ServerApi, user: User): Promise<string> {
@@ -65,7 +67,7 @@ const scanHint = (key: Key, content: string) =>
         : 'Scan with the AmneziaVPN app.';
 
 export function useKeyTools(onChanged?: () => void) {
-  const { toast, confirm } = useUI();
+  const { toast, confirm, copy } = useUI();
   const server = useApi();
   const { api } = server;
   const [qr, setQr] = useState<{ url: string; title: string; note: string } | null>(null);
@@ -99,14 +101,13 @@ export function useKeyTools(onChanged?: () => void) {
     copyKey: (user: User, id: string) =>
       run(async () => {
         const key = await full(user, id);
-        await navigator.clipboard.writeText(key.access_key);
-        toast('Key copied. Share it only with ' + user.name + '.');
+        await copy(key.access_key, 'Key copied. Share it only with ' + user.name + '.');
       }),
-    downloadProfile: (user: User, id: string, askPassword = false) =>
+    downloadProfile: (user: User, id: string, options: ProfileOptions = {}) =>
       run(async () => {
         const key = await full(user, id);
-        const note = await saveProfile(server, user, key, askPassword);
-        if (askPassword && key.certificate_password) setSecret({ title: `Password for ${user.name}'s profile`, note, password: key.certificate_password });
+        const note = await saveProfile(server, user, key, options);
+        if (options.askPassword && key.certificate_password) setSecret({ title: `Password for ${user.name}'s profile`, note, password: key.certificate_password });
         else toast(note);
       }),
     downloadKit: (user: User) => run(async () => toast(await saveKit(server, user))),
@@ -141,7 +142,7 @@ export function useKeyTools(onChanged?: () => void) {
         title={secret?.title ?? ''}
         footer={
           <>
-            <Button icon={<Copy size={14} />} onClick={() => secret && navigator.clipboard.writeText(secret.password).then(() => toast('Password copied.'), () => toast('Could not copy the password.', 'bad'))}>
+            <Button icon={<Copy size={14} />} onClick={() => secret && copy(secret.password, 'Password copied.', 'Could not copy the password. Select it in the box and copy it yourself.')}>
               Copy password
             </Button>
             <Button variant="cta" onClick={() => setSecret(null)}>

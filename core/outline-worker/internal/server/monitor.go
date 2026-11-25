@@ -50,7 +50,7 @@ type Monitor struct {
 	external   map[string]externalRate
 	rates      map[string][2]int64
 	sampleDay  int64
-	historyMu  sync.Mutex
+	historyMu  sync.Mutex // taken before mu where both are held (see Flush)
 	history    *History
 	flushedUp  map[string]int64
 	flushedDn  map[string]int64
@@ -63,6 +63,9 @@ type Monitor struct {
 	// peerRx is each WireGuard/AmneziaWG peer's receive counter at the last poll, by
 	// "protocol/public key".
 	peerRx map[string]uint64
+	// afterFlushRead is set by tests: it runs in Flush after the counters were read, before they
+	// are written to the history.
+	afterFlushRead func()
 }
 
 type userCounters struct {

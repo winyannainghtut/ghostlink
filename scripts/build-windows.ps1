@@ -8,6 +8,13 @@ if (-not $Version) {
     $Version = (& node (Join-Path $PSScriptRoot 'release-version.mjs')).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $Version) { throw 'Version declarations disagree; run node scripts/release-version.mjs' }
 }
+# Windows Installer takes a numeric a.b.c product version (the first two fields up to 255, the third
+# up to 65535), not a semantic version with a pre-release such as 0.9.1-rc.1. The installer carries
+# the numeric core; the file names and everything else keep the whole version.
+if ($Version -match '^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$') {
+    if ([int]$Matches[1] -gt 255 -or [int]$Matches[2] -gt 255 -or [int]$Matches[3] -gt 65535) { throw "Version '$Version' is too large for a Windows Installer product version (255.255.65535 at most)" }
+    $msiVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+} else { throw "Version '$Version' is not a semantic version" }
 if (-not $SkipCompile) {
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
     & "$PSScriptRoot\cargo.ps1" build --release --locked --workspace
@@ -23,6 +30,12 @@ if (-not $SkipCompile) {
     finally { Pop-Location; $env:CGO_ENABLED = $previousCgo }
 }
 $stage = Join-Path $repository 'artifacts\windows-x64\Ghostlink'
+# Start from an empty stage: a file an earlier build left there (a license that no longer ships, say)
+# would go into the portable archive and, harvested from this folder, into the installer.
+if (Test-Path -LiteralPath $stage) {
+    if ((Get-Item -LiteralPath $stage -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing to clear a linked staging directory' }
+    Remove-Item -LiteralPath $stage -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $stage,(Join-Path $stage 'engine'),(Join-Path $stage 'licenses') | Out-Null
 foreach ($name in @('ghostlink.exe','ghostlinkd.exe','ghostlink-mcp.exe')) { Copy-Item -LiteralPath (Join-Path $repository "target\release\$name") -Destination (Join-Path $stage $name) }
 Copy-Item -LiteralPath (Join-Path $repository 'target\release\ghostlink-tunnel.exe') -Destination (Join-Path $stage 'engine\ghostlink-tunnel.exe')
@@ -38,7 +51,7 @@ $objectDirectory = Join-Path $repository 'artifacts\windows-x64\wix'
 New-Item -ItemType Directory -Force -Path $objectDirectory | Out-Null
 # One explicit output file per source: a directory -out needs a trailing backslash, which
 # Windows PowerShell 5.1 turns into an escaped quote when the path contains a space.
-$candleArguments = @('-nologo', '-arch', 'x64', "-dVersion=$Version", "-dStage=$stage", "-dRoot=$repository", "-dLicenses=$(Join-Path $stage 'licenses')")
+$candleArguments = @('-nologo', '-arch', 'x64', "-dVersion=$Version", "-dMsiVersion=$msiVersion", "-dStage=$stage", "-dRoot=$repository", "-dLicenses=$(Join-Path $stage 'licenses')")
 & (Join-Path $wixDirectory 'candle.exe') @candleArguments -out (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $repository 'packages\windows\Ghostlink.wxs')
 Assert-Success 'Installer compilation'
 & (Join-Path $wixDirectory 'candle.exe') @candleArguments -out (Join-Path $objectDirectory 'licenses.wixobj') $harvest

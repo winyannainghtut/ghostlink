@@ -2,6 +2,7 @@
 // monitoring retention.
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Button, Check, Field, Inner, Note, Sheet, useUI } from '@shared/glass';
+import { useBusy, usePoll } from '@shared/hooks';
 import { defaultSpeedChange, defaultSpeedText } from '../limits';
 import { lookupState } from '../provider';
 import { useApi, useStore } from '../store';
@@ -21,6 +22,25 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
   const [speedDefault, setSpeedDefault] = useState(defaultSpeedText(server.default_speed_limit_bps));
   const [error, setError] = useState('');
   const speedField = useRef<HTMLInputElement>(null);
+  // One save at a time (a double click would send it twice), and one provider download or key
+  // replacement at a time.
+  const { busy, run } = useBusy();
+  const { busy: working, run: work } = useBusy();
+  // The list download takes a few seconds: while the server says it is updating, ask again so the
+  // sheet shows when it is done instead of the state it had when it was opened.
+  const updating = !!server.asn?.updating;
+  const wasUpdating = useRef(false);
+  usePoll(async () => {
+    if (open && updating) await reloadServer();
+  }, 2000, [open, updating]);
+  useEffect(() => {
+    if (wasUpdating.current && !updating && server.asn) {
+      if (server.asn.error) toast(`The provider list could not be updated: ${server.asn.error}`, 'bad');
+      else toast('The provider list is up to date.');
+    }
+    wasUpdating.current = updating;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updating]);
 
   useEffect(() => {
     if (!open) return;
@@ -37,7 +57,8 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const save = async () => {
+  const save = () => run(saveNow);
+  const saveNow = async () => {
     const patch: Record<string, unknown> = {};
     if (name.trim() !== server.name) patch.name = name.trim();
     if (hostname.trim() !== server.hostname) patch.hostname = hostname.trim();
@@ -80,6 +101,27 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
     }
   };
 
+  const updateList = () =>
+    work(async () => {
+      try {
+        await api('POST', '/asn/update');
+        await reloadServer();
+        toast('Downloading the provider list…', 'info');
+      } catch (e) {
+        toast((e as Error).message, 'bad');
+      }
+    });
+  const rotatePSK = () =>
+    work(async () => {
+      if (!(await confirm({ title: 'Replace the IPsec group key?', text: 'Every device that signs in with the shared group key is disconnected, and its profile must be installed again. Certificates and IKEv2 are not affected.', action: 'Replace the key', danger: true }))) return;
+      try {
+        await api('PATCH', '/server', { rotate_ipsec_psk: true });
+        toast('The IPsec group key is replaced. Download the profiles of the clients that use it again.');
+      } catch (e) {
+        toast((e as Error).message, 'bad');
+      }
+    });
+
   return (
     <Sheet
       open={open}
@@ -93,8 +135,8 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="cta" onClick={save}>
-            Save
+          <Button variant="cta" disabled={busy} onClick={save}>
+            {busy ? 'Saving…' : 'Save'}
           </Button>
         </>
       }
@@ -102,7 +144,7 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
       <div className="grid gap-5">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Server name">
-            <input className="field" maxLength={64} value={name} onChange={e => setName(e.target.value)} />
+            <input className="field" data-autofocus maxLength={64} value={name} onChange={e => setName(e.target.value)} />
           </Field>
           <Field label="Address in new keys" hint="public IP or DNS name">
             <input className="field mono" spellCheck={false} value={hostname} onChange={e => setHostname(e.target.value)} />
@@ -132,6 +174,11 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
                 Off by default. When on, the server downloads a public list of address ranges (about 11 MB) from {server.asn.source} and shows, beside each address a client connects from, who runs it (for example "AS64496 · Example Telecom"). Only the list is downloaded: nothing about your clients is sent to anyone (iptoasn.com sees this server's address, as any website does when you visit it). It is downloaded again every 30 days, and turning this off deletes it.
                 {lookupState(server.asn, Date.now() / 1000) && <span className="mt-1 block text-fg-3">{lookupState(server.asn, Date.now() / 1000)}</span>}
               </Note>
+              {server.asn.enabled && (
+                <Button size="sm" variant="ghost" className="justify-self-start" disabled={updating || working} onClick={updateList}>
+                  {updating ? 'Downloading the list…' : 'Update the list now'}
+                </Button>
+              )}
             </>
           )}
           <div className="grid grid-cols-3 gap-3">
@@ -147,6 +194,15 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
           </div>
           <Note>Older records are deleted automatically, and the history file never grows past the size limit (oldest site totals go first, daily totals last).</Note>
         </Inner>
+        {server.protocols.ipsec?.enabled && (
+          <Inner className="grid gap-2">
+            <h3 className="text-[14px]">IPsec group key</h3>
+            <Note>The shared key of IPsec profiles that sign in with it instead of a certificate. Replace it if it may have leaked: every such profile must then be installed again.</Note>
+            <Button size="sm" variant="ghost" className="justify-self-start" disabled={working} onClick={rotatePSK}>
+              Replace the group key
+            </Button>
+          </Inner>
+        )}
         <Inner className="grid gap-1.5 text-[13px]">
           <h3 className="text-[14px]">This dashboard</h3>
           <p className="text-fg-2">

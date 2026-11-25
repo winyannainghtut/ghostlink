@@ -4,6 +4,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -83,6 +84,63 @@ func TestEngineThatCannotStartLeavesTheAPIUp(t *testing.T) {
 	server.service.ensureEngine()
 	if running, _ := server.service.engine.Running(); !running {
 		t.Fatal("a stopped engine was not started again")
+	}
+}
+
+// A change that cannot be applied, with the previous configuration that cannot be put back either,
+// leaves the engine down, and the health says so at once, in the answer of /live too. Before, it
+// said nothing until the engine's next check, which comes every 30 seconds.
+func TestAChangeThatLeavesTheEngineDownSaysSoAtOnce(t *testing.T) {
+	server := newTestServer(t, nil)
+	if got := server.service.Health().EngineError; got != "" {
+		t.Fatalf("an engine error before anything went wrong: %q", got)
+	}
+	var reports []string
+	var mu sync.Mutex
+	server.service.SetReporter(func(what string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			reports = append(reports, what+": "+err.Error())
+		}
+	})
+	// From now on no instance can start, the one that ran before included.
+	server.service.engine.beforeStart = func([]byte) error { return errors.New("test: the engine cannot start") }
+	rules := map[string]any{"blocked_domains": []string{"blocked.example"}}
+	if status := server.call(t, "PUT", "/rules", rules, nil); status == http.StatusOK {
+		t.Fatal("a change was accepted although the engine could not start with it")
+	}
+	if running, _ := server.service.engine.Running(); running {
+		t.Fatal("the engine runs although no instance could start")
+	}
+	if got := server.service.Health().EngineError; !strings.Contains(got, "the engine cannot start") {
+		t.Fatalf("the health after the failed change: engine error %q", got)
+	}
+	var live struct {
+		Health Health `json:"health"`
+	}
+	server.must(t, http.StatusOK, "GET", "/live", nil, &live)
+	if !strings.Contains(live.Health.EngineError, "the engine cannot start") {
+		t.Fatalf("/live after the failed change: engine error %q", live.Health.EngineError)
+	}
+	mu.Lock()
+	if len(reports) != 1 || !strings.Contains(reports[0], "engine: the VPN engine is down after a change") {
+		t.Fatalf("reports: %q", reports)
+	}
+	mu.Unlock()
+
+	// The next check says the same thing, and does not report it again; once an instance can start,
+	// the engine runs and the error goes.
+	server.service.ensureEngine()
+	mu.Lock()
+	if len(reports) != 1 {
+		t.Fatalf("the same failure was reported again: %q", reports)
+	}
+	mu.Unlock()
+	server.service.engine.beforeStart = nil
+	server.service.ensureEngine()
+	if running, _ := server.service.engine.Running(); !running || server.service.Health().EngineError != "" {
+		t.Fatalf("the engine did not come back: engine error %q", server.service.Health().EngineError)
 	}
 }
 
@@ -239,6 +297,65 @@ func TestPortsOfAProtocolThatIsOffStayReserved(t *testing.T) {
 	if after.Protocols[VLESS].Port != moved || after.Protocols[VLESS].Enabled || after.DashboardPort != before.DashboardPort ||
 		after.Protocols[WireGuard].Port != before.Protocols[WireGuard].Port {
 		t.Fatalf("after the refusals and a move of VLESS: %+v, dashboard port %d", after.Protocols, after.DashboardPort)
+	}
+}
+
+// The port of a mesh that is off, and that of the DNS listener of IKEv2/IPsec while it is off, stay
+// reserved like those of the VPN protocols: nothing else may be moved onto them, so that turning
+// them on later is not refused for a port someone else took.
+func TestPortsOfAMeshAndOfIPsecDNSThatAreOffStayReserved(t *testing.T) {
+	withLowestPort(t, 1024)
+	var dnsPort uint16
+	server := newTestServer(t, func(s *State) {
+		onlyShadowsocks(s)
+		if _, err := s.ensureDashboard(portFree); err != nil {
+			t.Fatal(err)
+		}
+		// IKEv2/IPsec was on once and is off now: it keeps the port of its DNS listener.
+		port, err := pickPort(s.usedPorts(), portFree, "tcp", "udp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dnsPort, s.IPsec.DNSPort = port, port
+	})
+	var info meshInfo
+	server.must(t, http.StatusOK, "PATCH", "/mesh", map[string]any{"enabled": true}, &info)
+	server.must(t, http.StatusOK, "PATCH", "/mesh", map[string]any{"enabled": false}, nil)
+	meshPort := info.Port
+	server.service.Read(func(s *State) {
+		if ports := s.Listening(); ports["mesh"] != "" || ports[ipsecDNSTag] != "" {
+			t.Errorf("services that are off listen: %v", ports)
+		}
+	})
+
+	move := func(protocol string, port uint16) map[string]any {
+		return map[string]any{"protocols": map[string]any{protocol: map[string]any{"port": port}}}
+	}
+	for _, refused := range []struct {
+		patch map[string]any
+		want  string
+	}{
+		{move(VLESS, meshPort), "mesh and vless cannot share port"},
+		{map[string]any{"dashboard_port": meshPort}, "dashboard and mesh cannot share port"},
+		{move(VLESS, dnsPort), "vless and ipsec-dns cannot share port"},
+		{move(WireGuard, dnsPort), "wireguard and ipsec-dns cannot share port"},
+		{map[string]any{"dashboard_port": dnsPort}, "dashboard and ipsec-dns cannot share port"},
+	} {
+		if status := server.call(t, "PATCH", "/server", refused.patch, nil); status != http.StatusBadRequest ||
+			!strings.Contains(server.last, refused.want) || !strings.Contains(server.last, "keeps its port") {
+			t.Fatalf("%v: status %d %s", refused.patch, status, server.last)
+		}
+	}
+	// A port nothing keeps is still free to move to, and the mesh can be turned on again.
+	moved := server.unreservedPort(t)
+	var after serverInfo
+	server.must(t, http.StatusOK, "PATCH", "/server", move(VLESS, moved), &after)
+	if after.Protocols[VLESS].Port != moved {
+		t.Fatalf("VLESS did not move: %+v", after.Protocols)
+	}
+	server.must(t, http.StatusOK, "PATCH", "/mesh", map[string]any{"enabled": true}, &info)
+	if !info.Enabled || info.Port != meshPort {
+		t.Fatalf("the mesh turned on again: %+v, its port was %d", info, meshPort)
 	}
 }
 

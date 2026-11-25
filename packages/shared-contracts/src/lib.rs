@@ -2,8 +2,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+pub mod private;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
+
+/// How long a client waits for the service to answer one request, in seconds. The service may
+/// itself be waiting on a remote server (25 seconds per call) or on a tunnel start, so every
+/// client (CLI, MCP bridge, desktop app) uses this one value: none reports a timeout while the
+/// others would still be waiting. A timeout stops the wait, not the operation.
+pub const REQUEST_TIMEOUT_SECONDS: u64 = 75;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

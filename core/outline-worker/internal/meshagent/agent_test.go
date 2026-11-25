@@ -266,10 +266,15 @@ func TestForwardingUsers(t *testing.T) {
 // fakeCoordinator answers every sync with status and counts them.
 func fakeCoordinator(t *testing.T, status string) (*Node, *atomic.Int32) {
 	t.Helper()
+	return fakeCoordinatorFunc(t, func(int) meshproto.SyncResponse { return meshproto.SyncResponse{Status: status} })
+}
+
+// fakeCoordinatorFunc answers the n-th sync (from 1) with answer(n) and counts them.
+func fakeCoordinatorFunc(t *testing.T, answer func(n int) meshproto.SyncResponse) (*Node, *atomic.Int32) {
+	t.Helper()
 	syncs := &atomic.Int32{}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		syncs.Add(1)
-		_ = json.NewEncoder(w).Encode(meshproto.SyncResponse{Status: status})
+		_ = json.NewEncoder(w).Encode(answer(int(syncs.Add(1))))
 	}))
 	t.Cleanup(server.Close)
 	private, err := wgtypes.GeneratePrivateKey()

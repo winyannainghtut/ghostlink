@@ -356,34 +356,39 @@ func (s *State) EngineConfig(logLevel string) ([]byte, error) {
 }
 
 // Listening describes the ports the engine needs, for conflict checks.
-func (s *State) Listening() map[string]string {
+func (s *State) Listening() map[string]string { return s.listening(false) }
+
+// listening is Listening; with reserved it counts the services that are off too, those that keep
+// their port for when they are turned on: the VPN protocols, the mesh once it has a port, and the
+// DNS listener of IKEv2/IPsec once it has one.
+func (s *State) listening(reserved bool) map[string]string {
 	ports := map[string]string{"api": "tcp/" + strconv.Itoa(int(s.API.Port))}
 	if s.Dashboard.Port != 0 {
 		ports["dashboard"] = "tcp/" + strconv.Itoa(int(s.Dashboard.Port))
 	}
-	if s.Shadowsocks.Enabled {
+	if s.Shadowsocks.Enabled || reserved {
 		for _, port := range s.shadowsocksPorts() {
 			ports[shadowsocksTag(s, port)] = "tcp+udp/" + strconv.Itoa(int(port))
 		}
 	}
-	if s.VLESS.Enabled {
+	if s.VLESS.Enabled || reserved {
 		ports[VLESS] = "tcp/" + strconv.Itoa(int(s.VLESS.Port))
 	}
-	if s.WireGuard.Enabled {
+	if s.WireGuard.Enabled || reserved {
 		ports[WireGuard] = "udp/" + strconv.Itoa(int(s.WireGuard.Port))
 	}
-	if s.AmneziaWG.Enabled {
+	if s.AmneziaWG.Enabled || reserved {
 		ports[AmneziaWG] = "udp/" + strconv.Itoa(int(s.AmneziaWG.Port))
 	}
-	if s.meshEnabled() {
+	if s.meshEnabled() || (reserved && s.Mesh != nil && s.Mesh.Port != 0) {
 		ports["mesh"] = "tcp/" + strconv.Itoa(int(s.Mesh.Port))
 	}
 	if s.appleEnabled() {
 		// strongSwan owns 500 and 4500 (iOS cannot use other ports); the DNS listener is ours.
 		ports["ipsec-ike"], ports["ipsec-natt"] = "udp/500", "udp/4500"
-		if s.IPsec.DNSPort != 0 {
-			ports[ipsecDNSTag] = "tcp+udp/" + strconv.Itoa(int(s.IPsec.DNSPort))
-		}
+	}
+	if s.IPsec.DNSPort != 0 && (s.appleEnabled() || reserved) {
+		ports[ipsecDNSTag] = "tcp+udp/" + strconv.Itoa(int(s.IPsec.DNSPort))
 	}
 	return ports
 }
@@ -438,8 +443,11 @@ func portsConflict(a, b string) bool {
 }
 
 // CheckPorts rejects port collisions between the API and enabled protocols.
-func (s *State) CheckPorts() error {
-	ports := s.Listening()
+func (s *State) CheckPorts() error { return s.checkPorts(false) }
+
+// checkPorts is CheckPorts; with reserved it counts the services that are off too (see listening).
+func (s *State) checkPorts(reserved bool) error {
+	ports := s.listening(reserved)
 	if s.Dashboard.Port != 0 && (s.Dashboard.Port < 1024 || s.Dashboard.Port == 443) {
 		return fmt.Errorf("the dashboard needs its own port from 1024 to 65535 (not 443)")
 	}
@@ -471,15 +479,15 @@ func (s *State) CheckPorts() error {
 	return nil
 }
 
-// checkReservedPorts is CheckPorts with every VPN protocol counted, on or off: a protocol that
-// is off keeps its port for when it is turned on, so no other service may take it.
+// checkReservedPorts is CheckPorts with every service that has a port counted, on or off: a
+// service that is off keeps its port for when it is turned on, so no other service may take it.
+// That is every VPN protocol, the mesh once it has a port and the DNS listener of IKEv2/IPsec once
+// it has one (which turning the mesh or IKEv2/IPsec on again would use).
 func (s *State) checkReservedPorts() error {
 	if err := s.CheckPorts(); err != nil {
 		return err
 	}
-	all := *s
-	all.Shadowsocks.Enabled, all.VLESS.Enabled, all.WireGuard.Enabled, all.AmneziaWG.Enabled = true, true, true, true
-	if err := all.CheckPorts(); err != nil {
+	if err := s.checkPorts(true); err != nil {
 		return fmt.Errorf("%w (a protocol that is off keeps its port for when it is turned on)", err)
 	}
 	return nil

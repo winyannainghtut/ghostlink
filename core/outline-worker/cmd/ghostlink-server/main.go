@@ -222,17 +222,26 @@ func serve(dir, logLevel string) {
 		exit = 1
 		stop()
 	}
+	stopServing(httpServer, accounted, dashboard, meshServer, service)
+	fmt.Fprintln(os.Stderr, "ghostlink-server: stopped")
+	os.Exit(exit)
+}
+
+// stopServing ends the server's parts, in an order that matters. The management API stops taking
+// requests first. Then the accounting loop ends (accounted is closed once its last pass is done):
+// that pass can save a change, such as a client reaching a data limit, and the hooks of a change
+// move the dashboard and mesh listeners to match it, which would open one again if it were closed
+// already. Only then do the dashboard and the mesh listener close, and the VPN engine last.
+func stopServing(api interface{ Shutdown(context.Context) error }, accounted <-chan struct{}, dashboard, meshServer interface{ Close() }, service interface{ Close() error }) {
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = httpServer.Shutdown(shutdown)
+	_ = api.Shutdown(shutdown)
 	cancel()
+	<-accounted
 	dashboard.Close()
 	meshServer.Close()
-	<-accounted
 	if err := service.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "ghostlink-server: engine close: %v\n", err)
 	}
-	fmt.Fprintln(os.Stderr, "ghostlink-server: stopped")
-	os.Exit(exit)
 }
 
 // admin runs a management command against the local server: admin [--state DIR] COMMAND ...

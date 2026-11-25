@@ -47,6 +47,27 @@ export function defaultSpeedChange(text: string, stored: number): number | undef
   return bps === stored ? undefined : bps;
 }
 
+// A client's settings as the form shows them, and whether the form differs from the client as the
+// server has it (the Save button is for that difference only).
+export type ClientForm = { name: string; limit: string; speed: SpeedChoice; exempt: boolean };
+type ClientSettings = { name: string; data_limit_bytes: number; speed_limit_bps?: number; exempt_from_global_rules: boolean };
+
+export function clientForm(user: ClientSettings): ClientForm {
+  return { name: user.name, limit: user.data_limit_bytes ? String(user.data_limit_bytes / 1e9) : '', speed: speedChoice(user.speed_limit_bps), exempt: user.exempt_from_global_rules };
+}
+
+export function sameClientForm(a: ClientForm, b: ClientForm): boolean {
+  return a.name === b.name && a.limit === b.limit && a.exempt === b.exempt && a.speed.mode === b.speed.mode && a.speed.mb === b.speed.mb;
+}
+
+// badInput is the data limit field's validity.badInput (half-typed text such as "2e" reads as empty).
+export function clientFormChanged(form: ClientForm, user: ClientSettings, badInput = false): boolean {
+  if (form.name.trim() !== user.name || form.exempt !== user.exempt_from_global_rules || badInput) return true;
+  const data = dataLimitValue(form.limit);
+  if (data instanceof Error || data !== user.data_limit_bytes) return true;
+  return speedChange(form.speed, user.speed_limit_bps ?? 0) !== undefined;
+}
+
 // A data limit typed in GB, empty for none: the bytes to send, or an error to show. badInput is
 // the field's validity.badInput: a number field reports half-typed text such as "2e" as empty,
 // which would otherwise remove the limit.

@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::Value;
 use std::io::Read;
 
-const MAX_KEY: usize = 64 * 1024;
+pub(crate) const MAX_KEY: usize = 64 * 1024;
 const MAX_JSON: usize = 1024 * 1024;
 
 pub enum AmneziaKey {
@@ -123,6 +123,26 @@ fn config_from_fields(c: &Value) -> Result<String> {
     Ok(conf)
 }
 
+/// Adds `DNS = ...` right after the line that opens the `[Interface]` section. That line is found
+/// as `wireguard::parse` finds it, whatever its case, spacing, comment or line ending: an exact
+/// `"[Interface]\n"` search found nothing in a file with Windows line endings, a lower-case
+/// header or a space after it, and the key's resolvers were dropped without a word. A
+/// configuration without the section is refused.
+fn with_resolvers(config: &str, dns: &[String]) -> Result<String> {
+    let mut text = String::with_capacity(config.len() + 64);
+    let mut added = false;
+    for line in config.lines() {
+        text.push_str(line);
+        text.push('\n');
+        if !added && wireguard::opens_interface(line) {
+            text.push_str(&format!("DNS = {}\n", dns.join(", ")));
+            added = true;
+        }
+    }
+    ensure!(added, "The configuration has no [Interface] section");
+    Ok(text)
+}
+
 pub fn decode(value: &str) -> Result<AmneziaKey> {
     let document = decode_document(value)?;
     ensure!(
@@ -190,11 +210,7 @@ pub fn decode(value: &str) -> Result<AmneziaKey> {
             .filter(|d| d.parse::<std::net::IpAddr>().is_ok())
             .collect();
         if !dns.is_empty() {
-            config = config.replacen(
-                "[Interface]\n",
-                &format!("[Interface]\nDNS = {}\n", dns.join(", ")),
-                1,
-            );
+            config = with_resolvers(&config, &dns)?;
         }
     }
     let parsed = wireguard::parse(&config)?;
@@ -272,5 +288,98 @@ pub(crate) mod tests {
         let mut bytes = (u32::MAX).to_be_bytes().to_vec();
         bytes.extend([0x78, 0x9c, 0x03, 0x00]);
         assert!(decode(&format!("vpn://{}", URL_SAFE_NO_PAD.encode(bytes))).is_err());
+    }
+
+    /// An AmneziaWG configuration text as the app exports it, without a DNS line: `header` opens
+    /// the `[Interface]` section and `newline` ends every line.
+    fn raw_config(header: &str, newline: &str) -> String {
+        [
+            header,
+            &format!("PrivateKey = {PRIVATE}"),
+            "Address = 10.8.1.2/32",
+            "Jc = 4",
+            "Jmin = 10",
+            "Jmax = 50",
+            "S1 = 24",
+            "S2 = 28",
+            "H1 = 100-199",
+            "H2 = 200-299",
+            "H3 = 300-399",
+            "H4 = 400-499",
+            "[Peer]",
+            &format!("PublicKey = {PUBLIC}"),
+            "Endpoint = 203.0.113.5:41820",
+            "AllowedIPs = 0.0.0.0/0",
+            "",
+        ]
+        .join(newline)
+    }
+
+    /// The resolvers (`dns1`, `dns2` of the key: 1.1.1.1 and 1.0.0.1) found in what `decode`
+    /// returns for a key that carries `config` as its configuration text.
+    fn resolvers_of(config: &str) -> Vec<String> {
+        let last = serde_json::json!({ "config": config });
+        let document = serde_json::json!({
+            "containers": [{"container": "amnezia-awg", "awg": {"last_config": last.to_string()}}],
+            "defaultContainer": "amnezia-awg", "description": "Amnezia Test",
+            "dns1": "1.1.1.1", "dns2": "1.0.0.1"
+        });
+        match decode(&encode(&document)).unwrap() {
+            AmneziaKey::WireGuard { config, .. } => wireguard::parse(&config)
+                .unwrap()
+                .dns
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            AmneziaKey::Vless(_) => panic!("expected AmneziaWG"),
+        }
+    }
+
+    /// The key's resolvers were put in with `replacen("[Interface]\n", ..)`, which found nothing,
+    /// and so dropped them without a word, when the file had Windows line endings, a header in
+    /// lower case, or a space after it (code review 2026-11-25, M3).
+    #[test]
+    fn the_keys_resolvers_reach_the_configuration_whatever_its_header_looks_like() {
+        let resolvers = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()];
+        for (header, newline) in [
+            ("[Interface]", "\n"),
+            ("[Interface]", "\r\n"),
+            ("[interface]", "\n"),
+            ("[INTERFACE]", "\r\n"),
+            ("[Interface]  ", "\n"),
+            ("\t[Interface] \t", "\r\n"),
+            ("[Interface] # tunnel", "\n"),
+            ("[Interface] ; tunnel", "\r\n"),
+        ] {
+            assert_eq!(
+                resolvers_of(&raw_config(header, newline)),
+                resolvers,
+                "header {header:?}, line endings {newline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configuration_that_names_its_resolver_keeps_it() {
+        for dns in ["DNS = 9.9.9.9", "dns=9.9.9.9", "  Dns =  9.9.9.9"] {
+            let config = raw_config("[Interface]", "\r\n").replace(
+                "Address = 10.8.1.2/32",
+                &format!("Address = 10.8.1.2/32\r\n{dns}"),
+            );
+            assert_eq!(resolvers_of(&config), vec!["9.9.9.9"], "{dns}");
+        }
+    }
+
+    /// Without an `[Interface]` section there is nowhere to put them; the key is refused, as the
+    /// configuration is by `wireguard::parse`.
+    #[test]
+    fn a_configuration_without_an_interface_section_is_refused() {
+        let config = raw_config("", "\n").replacen("\n", "", 1);
+        let last = serde_json::json!({ "config": config });
+        let document = serde_json::json!({
+            "containers": [{"container": "amnezia-awg", "awg": {"last_config": last.to_string()}}],
+            "defaultContainer": "amnezia-awg", "dns1": "1.1.1.1"
+        });
+        assert!(decode(&encode(&document)).is_err());
     }
 }
