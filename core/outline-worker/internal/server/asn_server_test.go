@@ -6,6 +6,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -47,6 +48,8 @@ type asnSource struct {
 	body   []byte
 	hold   chan struct{}
 	hits   atomic.Int32
+	// abandoned counts the held requests the downloader gave up (it went away before the answer).
+	abandoned atomic.Int32
 }
 
 func serveASN(t *testing.T, body []byte) *asnSource {
@@ -61,6 +64,7 @@ func serveASN(t *testing.T, body []byte) *asnSource {
 			select {
 			case <-hold:
 			case <-r.Context().Done():
+				source.abandoned.Add(1)
 				return
 			}
 		}
@@ -80,6 +84,17 @@ func (s *asnSource) answer(status int, body []byte) {
 	s.mu.Lock()
 	s.status, s.body = status, body
 	s.mu.Unlock()
+}
+
+// holdAnswers keeps every request waiting until the returned function is called (a request whose
+// sender goes away stops waiting).
+func (s *asnSource) holdAnswers() (release func()) {
+	hold := make(chan struct{})
+	s.mu.Lock()
+	s.hold = hold
+	s.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(hold) }) }
 }
 
 func mustTable(t *testing.T) *asn.Table {
@@ -327,6 +342,326 @@ func TestASNTurnedOffDeletesTheListAndStopsADownloadInFlight(t *testing.T) {
 	}
 }
 
+// Turning it off ends a download that is running at once (its connection is dropped), instead of
+// leaving it to run on, up to the five minutes its timeout allows, only to throw the list away.
+func TestASNTurnedOffEndsTheDownloadAtOnce(t *testing.T) {
+	source := serveASN(t, gzipped(t, testASNList))
+	release := source.holdAnswers()
+	defer release()
+	server := newTestServer(t, nil)
+
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	waitFor(t, "the download to begin", func() bool { return source.hits.Load() == 1 })
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": false}, nil)
+
+	waitFor(t, "the download to be given up", func() bool { return source.abandoned.Load() == 1 })
+	waitFor(t, "the download to end", func() bool {
+		server.service.asn.mu.Lock()
+		defer server.service.asn.mu.Unlock()
+		return !server.service.asn.busy
+	})
+	if status := server.asnStatus(t); status.Enabled || status.Error != "" || status.Updating {
+		t.Fatalf("status after turning it off: %+v", status)
+	}
+	// The next time it is turned on is a clean start: a download, not a refusal.
+	release()
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	waitFor(t, "the list", func() bool { return server.asnStatus(t).Ready })
+	if status := server.asnStatus(t); status.Error != "" || status.Updating || source.hits.Load() != 2 {
+		t.Fatalf("status after turning it on again: %+v, %d downloads", status, source.hits.Load())
+	}
+}
+
+// Turned off and on again while the first download is still running, the lookup gets its list: the
+// download of the first time is ended, and one is started for the second. Before, the second was
+// refused because the first still ran, which then failed with "turned off while the list was
+// downloading": the lookup stayed on with no list, and that error, until the next hourly check.
+func TestASNTurnedOffAndOnAgainWhileDownloadingGetsTheList(t *testing.T) {
+	source := serveASN(t, gzipped(t, testASNList))
+	release := source.holdAnswers()
+	defer release()
+	server := newTestServer(t, nil)
+	alice := server.user(t, map[string]any{"name": "Alice"})
+	seenFrom(t, server, alice.ID, "192.0.2.10")
+
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	waitFor(t, "the first download to begin", func() bool { return source.hits.Load() == 1 })
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": false}, nil)
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	release()
+
+	waitFor(t, "the list", func() bool { return server.asnStatus(t).Ready })
+	waitFor(t, "the downloads to end", func() bool { return !server.asnStatus(t).Updating })
+	status := server.asnStatus(t)
+	if !status.Enabled || status.Error != "" || status.Ranges != 3 {
+		t.Fatalf("status: %+v", status)
+	}
+	if byIP, _ := server.clients(t); byIP["192.0.2.10"].ASN != 64496 {
+		t.Fatalf("the list is not in use: %+v", byIP["192.0.2.10"])
+	}
+	if _, err := os.Stat(server.store.Dir() + "/" + ASNFile); err != nil {
+		t.Fatalf("the list was not saved: %v", err)
+	}
+	if _, err := os.Stat(server.store.Dir() + "/" + ASNFile + ".pending"); err == nil {
+		t.Fatal("a download left its temporary file")
+	}
+}
+
+// Closing the service ends a download in flight instead of waiting for it, and none begins after
+// that.
+func TestASNClosingTheServiceEndsTheDownloadAndStartsNoOther(t *testing.T) {
+	source := serveASN(t, gzipped(t, testASNList))
+	source.holdAnswers() // never released
+	server := newTestServer(t, nil)
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	waitFor(t, "the download to begin", func() bool { return source.hits.Load() == 1 })
+	closed := make(chan struct{})
+	go func() {
+		_ = server.service.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("closing the service waited for the download")
+	}
+	if got := source.abandoned.Load(); got != 1 {
+		t.Fatalf("%d held request(s) were given up, want 1", got)
+	}
+	if !server.service.RefreshASN(time.Now()) {
+		t.Fatal("the setting is on, so a refresh is accepted")
+	}
+	server.service.refreshASNIfDue(time.Now())
+	time.Sleep(200 * time.Millisecond)
+	if source.hits.Load() != 1 {
+		t.Fatalf("a download began after the service was closed (%d requests)", source.hits.Load())
+	}
+}
+
+// A download that was ended because the lookup was turned off leaves nothing behind for the next
+// one: no error, and no wait before a new download is due. Before, it recorded its own failure when
+// it ended, which the lookup turned on again then showed, and the retry window it left made the
+// next try wait.
+func TestASNEndedDownloadLeavesNoTraceForTheNextOne(t *testing.T) {
+	manager := newASNManager(t.TempDir())
+	now := time.Now()
+	ctx, generation, ok := manager.begin(t.Context(), now)
+	if !ok {
+		t.Fatal("begin")
+	}
+	manager.Drop() // the lookup is turned off while the download runs
+	if ctx.Err() == nil {
+		t.Fatal("turning the lookup off did not end the download")
+	}
+	// It ends with the error of having been cut off, when the lookup is on again.
+	if counts := manager.finish(generation, ctx.Err()); counts {
+		t.Fatal("a download ended by turning the lookup off counts as the current one")
+	}
+	if status := manager.Status(true); status.Error != "" || status.Updating || status.Ready {
+		t.Fatalf("status after it ended: %+v", status)
+	}
+	if !manager.Due(now.Add(time.Second)) {
+		t.Fatal("a new download is not due, although the one that was ended never counted")
+	}
+	// A download begun after that is the current one, and its failure counts as one.
+	_, next, ok := manager.begin(t.Context(), now.Add(time.Second))
+	if !ok || next == generation {
+		t.Fatalf("the next download: generation %d after %d, begun %v", next, generation, ok)
+	}
+	if !manager.finish(next, os.ErrDeadlineExceeded) || manager.Status(true).Error == "" {
+		t.Fatal("the failure of the current download was not recorded")
+	}
+}
+
+// A download is begun only while the lookup is on, and that is checked where it begins: a refresh
+// that finds the lookup off does nothing, and says so. This is what the hooks of changes that
+// finished in another order than they ran in, and an update asked for as the lookup is turned
+// off, depend on.
+func TestASNRefreshDoesNothingWhileTheLookupIsOff(t *testing.T) {
+	source := serveASN(t, gzipped(t, testASNList))
+	server := newTestServer(t, nil)
+	if server.service.RefreshASN(time.Now()) {
+		t.Fatal("a refresh was accepted with the lookup off")
+	}
+	server.service.refreshASNIfDue(time.Now())
+	// A hook that runs after the setting went off again must not start what the hook of the change
+	// before it asked for.
+	server.service.syncASN(time.Now())
+	time.Sleep(200 * time.Millisecond)
+	if source.hits.Load() != 0 || server.asnStatus(t).Updating {
+		t.Fatalf("a download began with the lookup off: %d request(s)", source.hits.Load())
+	}
+	server.must(t, http.StatusBadRequest, "POST", "/asn/update", nil, nil)
+	if source.hits.Load() != 0 {
+		t.Fatal("an update asked for while the lookup is off began a download")
+	}
+
+	// The same through the setting: on, and the hook of "on" runs while the setting is already off
+	// again (done here by hand, as two requests at once can finish in that order).
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": true}, nil)
+	waitFor(t, "the list", func() bool { return server.asnStatus(t).Ready })
+	server.store.Lock()
+	server.store.State.Monitor.ASNLookup = false
+	server.store.Unlock()
+	server.service.syncASN(time.Now()) // the hook of the change that turned it on, running late
+	if _, found := server.service.asn.Lookup(netip.MustParseAddr("192.0.2.10")); found {
+		t.Fatal("the list is in use after the setting went off")
+	}
+	if _, err := os.Stat(server.store.Dir() + "/" + ASNFile); err == nil {
+		t.Fatal("the list is on disk after the setting went off")
+	}
+}
+
+// Many changes of the setting at once, each running its hook in any order, leave the lookup as the
+// setting last was: no list, no download and no file when it ended off; the list, and no error, when
+// it ended on. Each caller ends with the same setting, so whichever finishes last, that is the last
+// setting; the hooks of the changes before it run in any order, also after the last one.
+func TestASNManyTogglesAtOnceEndWhereTheSettingEnds(t *testing.T) {
+	for _, ends := range []bool{false, true} {
+		name := "ends off"
+		if ends {
+			name = "ends on"
+		}
+		t.Run(name, func(t *testing.T) { toggleAtOnce(t, ends) })
+	}
+}
+
+// The hook of a change that turned the lookup on runs after the change that turned it off again
+// (changes made at once finish in any order): it follows the setting as it is, which is off, so no
+// download begins and nothing is kept. Before, it began a download for a lookup that was off, and the
+// list came into use and was saved.
+func TestASNHookOfAnEarlierChangeRunningLateFollowsTheSettingAsItIs(t *testing.T) {
+	source := serveASN(t, gzipped(t, testASNList))
+	server := newTestServer(t, nil)
+	// The ASN hook is the first the service registers. Hold the hook of the change that turns the
+	// lookup on, at the start, until the change that turns it off has run its own.
+	server.service.hooksMu.Lock()
+	original := server.service.hooks[0]
+	gate := make(chan struct{})
+	var held atomic.Bool
+	server.service.hooks[0] = func(previous, next *State) {
+		if next.Monitor.ASNLookup && held.CompareAndSwap(false, true) {
+			<-gate
+		}
+		original(previous, next)
+	}
+	server.service.hooksMu.Unlock()
+
+	turnedOn := make(chan struct{})
+	go func() {
+		defer close(turnedOn)
+		body, _ := json.Marshal(map[string]any{"asn_lookup": true})
+		request, _ := http.NewRequest("PATCH", server.base+"/server", bytes.NewReader(body))
+		if response, err := http.DefaultClient.Do(request); err != nil {
+			t.Errorf("turn on: %v", err)
+		} else {
+			response.Body.Close()
+		}
+	}()
+	waitFor(t, "the change to be saved", func() bool {
+		saved := false
+		server.service.Read(func(s *State) { saved = s.Monitor.ASNLookup })
+		return saved
+	})
+	server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"asn_lookup": false}, nil)
+	close(gate) // now the hook of the first change runs
+	<-turnedOn
+
+	time.Sleep(300 * time.Millisecond)
+	if source.hits.Load() != 0 {
+		t.Fatalf("a download began for a lookup that is off (%d request(s))", source.hits.Load())
+	}
+	if server.service.asn.table.Load() != nil {
+		t.Fatal("a list is in use although the lookup is off")
+	}
+	if _, err := os.Stat(server.store.Dir() + "/" + ASNFile); err == nil {
+		t.Fatal("a list is on disk although the lookup is off")
+	}
+}
+
+func toggleAtOnce(t *testing.T, ends bool) {
+	t.Helper()
+	serveASN(t, gzipped(t, testASNList))
+	server := newTestServer(t, nil)
+	toggle := func(on bool) {
+		body, _ := json.Marshal(map[string]any{"asn_lookup": on})
+		request, _ := http.NewRequest("PATCH", server.base+"/server", bytes.NewReader(body))
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Errorf("toggle: %v", err)
+			return
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("toggle: status %d", response.StatusCode)
+		}
+	}
+	var wg sync.WaitGroup
+	for caller := 0; caller < 6; caller++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				toggle(i%2 == 1)
+			}
+			toggle(ends)
+		}()
+	}
+	wg.Wait()
+	idle := func() bool {
+		server.service.asn.mu.Lock()
+		defer server.service.asn.mu.Unlock()
+		return !server.service.asn.busy
+	}
+	if ends {
+		waitFor(t, "the list", func() bool { return server.asnStatus(t).Ready })
+		waitFor(t, "the downloads to end", idle)
+		if status := server.asnStatus(t); !status.Enabled || status.Error != "" || status.Ranges != 3 {
+			t.Fatalf("status while on: %+v", status)
+		}
+		return
+	}
+	waitFor(t, "the downloads to end", idle)
+	if server.service.asn.table.Load() != nil {
+		t.Fatal("a list is in use although the lookup ended off")
+	}
+	if _, err := os.Stat(server.store.Dir() + "/" + ASNFile); err == nil {
+		t.Fatal("a list is on disk although the lookup ended off")
+	}
+	if status := server.asnStatus(t); status.Enabled || status.Error != "" {
+		t.Fatalf("status while off: %+v", status)
+	}
+}
+
+// The list saved by an earlier run is read when the server starts, which takes a while for the real
+// one: a lookup turned off meanwhile deleted it, and what was read must not come back into use.
+func TestASNLoadDoesNotBringBackAListThatWasDropped(t *testing.T) {
+	manager := newASNManager(t.TempDir())
+	if err := os.WriteFile(manager.path(), gzipped(t, testASNList), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reading, proceed := make(chan struct{}), make(chan struct{})
+	manager.read = func(string) (*asn.Table, error) {
+		close(reading)
+		<-proceed
+		return mustTable(t), nil
+	}
+	loaded := make(chan error, 1)
+	go func() { loaded <- manager.Load() }()
+	<-reading
+	manager.Drop() // turned off while the list is being read
+	close(proceed)
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	if manager.table.Load() != nil || manager.Status(true).Ready {
+		t.Fatal("a list read before the lookup was turned off came into use after it")
+	}
+	if _, err := os.Stat(manager.path()); err == nil {
+		t.Fatal("the saved list was kept")
+	}
+}
+
 // The saved list is read at start without asking anyone; one that cannot be read is removed so
 // that the next try downloads a new one.
 func TestASNLoadReadsTheSavedList(t *testing.T) {
@@ -373,13 +708,14 @@ func TestASNDue(t *testing.T) {
 	if !manager.Due(now) {
 		t.Fatal("not due with no list")
 	}
-	if _, ok := manager.begin(now); !ok {
+	_, generation, ok := manager.begin(t.Context(), now)
+	if !ok {
 		t.Fatal("begin")
 	}
 	if manager.Due(now.Add(48 * time.Hour)) {
 		t.Fatal("due while a download is running")
 	}
-	manager.finish(os.ErrDeadlineExceeded)
+	manager.finish(generation, os.ErrDeadlineExceeded)
 	if manager.Due(now.Add(time.Hour)) {
 		t.Fatal("due an hour after a failure")
 	}
@@ -431,8 +767,8 @@ func TestASNRefusesARedirectToHTTP(t *testing.T) {
 	t.Cleanup(func() { asnSourceURL, asnHTTPClient = oldURL, oldClient })
 
 	manager := newASNManager(t.TempDir())
-	generation, _ := manager.begin(time.Now())
-	err := manager.download(t.Context(), generation)
+	ctx, generation, _ := manager.begin(t.Context(), time.Now())
+	err := manager.download(ctx, generation)
 	if err == nil || !strings.Contains(err.Error(), "redirected away from HTTPS") {
 		t.Fatalf("download followed a redirect to HTTP: %v", err)
 	}

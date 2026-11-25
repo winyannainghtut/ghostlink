@@ -30,8 +30,11 @@ type report struct {
 	applied uint64
 	err     string
 	peers   map[string]meshproto.PeerStatus // by public key
-	pings   map[string]int64                // RTT in microseconds by mesh address
-	rates   map[string][2]float64           // rx, tx bytes/s by public key
+	// handshakes is when each peer's last handshake happened by the coordinator's clock, by public
+	// key (see handshakeSeen); only peers that have had one are in it.
+	handshakes map[string]time.Time
+	pings      map[string]int64      // RTT in microseconds by mesh address
+	rates      map[string][2]float64 // rx, tx bytes/s by public key
 }
 
 type pairState struct {
@@ -79,9 +82,12 @@ func (l *Live) Record(nodeID string, remote netip.Addr, r *meshproto.SyncRequest
 	defer l.mu.Unlock()
 	previous := l.reports[nodeID]
 	next := &report{at: now, remote: remote, applied: r.Applied, err: r.Error,
-		peers: map[string]meshproto.PeerStatus{}, pings: map[string]int64{}, rates: map[string][2]float64{}}
+		peers: map[string]meshproto.PeerStatus{}, handshakes: map[string]time.Time{}, pings: map[string]int64{}, rates: map[string][2]float64{}}
 	for _, p := range r.Peers {
 		next.peers[p.PublicKey] = p
+		if p.LastHandshake > 0 {
+			next.handshakes[p.PublicKey] = handshakeSeen(previous, p, now)
+		}
 		if previous != nil {
 			if old, ok := previous.peers[p.PublicKey]; ok && now.After(previous.at) {
 				seconds := now.Sub(previous.at).Seconds()
@@ -103,6 +109,39 @@ func (l *Live) Record(nodeID string, remote netip.Addr, r *meshproto.SyncRequest
 	if previous == nil || previous.remote != remote || now.Sub(previous.at) > OnlineFor {
 		l.notifyLocked()
 	}
+}
+
+// handshakeSeen is when, by the coordinator's clock, the handshake a node reports with a peer
+// happened. How old it is is not worked out from the clock of the node: a node whose clock is
+// minutes off (a server that does not keep time) made every handshake look stale, so that working
+// direct links were sent through the relay and did not come back, or look recent, so that a broken
+// one was never sent through it. What the coordinator sees is a change. A handshake that differs
+// from the node's previous report of the same peer is a new one, which happened since that report,
+// so it is dated by this one; one that is the same is still the one seen before. The first time a
+// handshake is seen, nothing says when it happened but the node's clock, which is used, but never
+// as later than now.
+func handshakeSeen(previous *report, p meshproto.PeerStatus, now time.Time) time.Time {
+	if previous != nil {
+		if old, known := previous.peers[p.PublicKey]; known {
+			if old.LastHandshake != p.LastHandshake {
+				return now
+			}
+			if seen, ok := previous.handshakes[p.PublicKey]; ok {
+				return seen
+			}
+		}
+	}
+	if t := time.Unix(p.LastHandshake, 0); t.Before(now) {
+		return t
+	}
+	return now
+}
+
+// Nodes is the number of nodes the live view holds a report of.
+func (l *Live) Nodes() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.reports)
 }
 
 // Forget drops a removed node's live data.
@@ -135,15 +174,14 @@ func (l *Live) ready(id string, now time.Time) bool {
 	return l.online(id, now) && l.reports[id].applied != 0
 }
 
-// handshake is the newest handshake either node reports with the other.
+// handshake is the newest handshake either node reports with the other, by the coordinator's
+// clock (see handshakeSeen).
 func (l *Live) handshake(a, b *Node) time.Time {
 	var newest time.Time
 	for _, pair := range [][2]*Node{{a, b}, {b, a}} {
 		if r := l.reports[pair[0].ID]; r != nil {
-			if p, ok := r.peers[pair[1].PublicKey]; ok && p.LastHandshake > 0 {
-				if t := time.Unix(p.LastHandshake, 0); t.After(newest) {
-					newest = t
-				}
+			if t, ok := r.handshakes[pair[1].PublicKey]; ok && t.After(newest) {
+				newest = t
 			}
 		}
 	}
@@ -155,8 +193,14 @@ func isPublic(a netip.Addr) bool {
 }
 
 // endpoint picks the address viewer should send to for target, or "" when target can only be
-// reached by it connecting out (it is behind NAT).
-func (l *Live) endpoint(viewer, target *Node) string {
+// reached by it connecting out (it is behind NAT). mesh is the mesh's own network.
+//
+// Only an address other machines can send to is a candidate: not a loopback one, which is the
+// node's own machine (a node on the coordinator's host reports one on purpose), and not one inside
+// the mesh, which would send the handshake into the tunnel it is meant to set up. A node is not
+// refused for reporting such an address, so that one report cannot keep the coordinator from building
+// the others' configurations; it is left out here, for the next candidate or for none.
+func (l *Live) endpoint(mesh netip.Prefix, viewer, target *Node) string {
 	var viewerRemote, targetRemote netip.Addr
 	if r := l.reports[viewer.ID]; r != nil {
 		viewerRemote = r.remote
@@ -167,7 +211,7 @@ func (l *Live) endpoint(viewer, target *Node) string {
 	var private, public []string
 	for _, e := range target.Endpoints {
 		ap, err := netip.ParseAddrPort(e)
-		if err != nil {
+		if err != nil || !meshproto.ReachableEndpoint(e) || mesh.Contains(ap.Addr()) {
 			continue
 		}
 		if isPublic(ap.Addr()) {
@@ -183,7 +227,7 @@ func (l *Live) endpoint(viewer, target *Node) string {
 	if len(public) > 0 {
 		return public[0]
 	}
-	if isPublic(targetRemote) {
+	if isPublic(targetRemote) && !mesh.Contains(targetRemote) {
 		return netip.AddrPortFrom(targetRemote, target.ListenPort).String()
 	}
 	// Private networks without a public side (for example nodes all on one LAN).
@@ -216,6 +260,7 @@ func (l *Live) Tick(n *Network, now time.Time) bool {
 	defer l.mu.Unlock()
 	relay := l.relay(n, now)
 	active := activeNodes(n)
+	mesh, _ := netip.ParsePrefix(n.CIDR)
 	changed := false
 	seen := map[[2]string]bool{}
 	for i, a := range active {
@@ -228,7 +273,7 @@ func (l *Live) Tick(n *Network, now time.Time) bool {
 				l.pairs[key] = st
 			}
 			wasRelayed := st.relayed
-			reachable := l.endpoint(a, b) != "" || l.endpoint(b, a) != ""
+			reachable := l.endpoint(mesh, a, b) != "" || l.endpoint(mesh, b, a) != ""
 			switch {
 			case relay == nil || a == relay || b == relay:
 				*st = pairState{since: st.since}
@@ -260,6 +305,12 @@ func (l *Live) Tick(n *Network, now time.Time) bool {
 	for key := range l.pairs {
 		if !seen[key] {
 			delete(l.pairs, key)
+		}
+	}
+	// A report that arrived while its node was being removed would stay for good otherwise.
+	for id := range l.reports {
+		if n.Node(id) == nil {
+			delete(l.reports, id)
 		}
 	}
 	if changed {
@@ -353,6 +404,7 @@ func (l *Live) Topology(n *Network, now time.Time) Topology {
 	t := Topology{ID: n.ID, Name: n.Name, CIDR: n.CIDR, Enabled: n.Enabled, Nodes: []NodeView{}, Links: []LinkView{},
 		RuleCount: len(n.Rules), UpdatedUnix: now.Unix()}
 	relay := l.relay(n, now)
+	mesh, _ := netip.ParsePrefix(n.CIDR)
 	for _, node := range n.Nodes {
 		v := NodeView{
 			ID: node.ID, Name: node.Name, Address: node.Address, Tags: node.Tags, Status: node.Status, Relay: node.Relay,
@@ -377,7 +429,7 @@ func (l *Live) Topology(n *Network, now time.Time) Topology {
 		}
 		for _, other := range n.Nodes {
 			if other != node {
-				if e := l.endpoint(other, node); e != "" {
+				if e := l.endpoint(mesh, other, node); e != "" {
 					v.Endpoint = e
 					break
 				}

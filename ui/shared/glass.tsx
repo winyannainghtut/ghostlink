@@ -13,7 +13,9 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { browserClipboard, copyText } from './clipboard';
 import { speed } from './format';
+import { timeLeft, toastDuration } from './toast';
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(' ');
@@ -47,6 +49,41 @@ export function Card({ className, children, as: Tag = 'section' }: { className?:
 
 export function Inner({ className, children }: { className?: string; children: ReactNode }) {
   return <div className={cx('inset-glass rounded-[24px] p-4', className)}>{children}</div>;
+}
+
+// A placeholder where content is on its way: a view shows its shape instead of a bare "Loading…",
+// or an empty-state message ("No matching clients") that is not true yet.
+export function Skeleton({ className }: { className?: string }) {
+  return <div aria-hidden="true" className={cx('animate-pulse rounded-full bg-fg/10 motion-reduce:animate-none', className)} />;
+}
+
+// The wrapper of a group of placeholders: it tells screen readers what is loading.
+export function Loading({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
+  return (
+    <div role="status" aria-busy="true" className={className}>
+      <span className="sr-only">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+// A card-shaped placeholder: an avatar, a title and a few lines. `className` sets the height the
+// finished card will have, so the page does not jump when the data arrives.
+export function CardSkeleton({ lines = 3, className }: { lines?: number; className?: string }) {
+  return (
+    <Card as="article" className={cx('grid content-start gap-4 sm:p-5!', className)}>
+      <div className="flex items-center gap-3">
+        <Skeleton className="size-11 shrink-0 rounded-[16px]" />
+        <div className="grid min-w-0 flex-1 gap-2">
+          <Skeleton className="h-4 w-1/2" />
+          <Skeleton className="h-3 w-1/3" />
+        </div>
+      </div>
+      {Array.from({ length: lines }, (_, i) => (
+        <Skeleton key={i} className={cx('h-3', i === lines - 1 ? 'w-2/3' : 'w-full')} />
+      ))}
+    </Card>
+  );
 }
 
 export function CardTitle({ title, detail, action }: { title: ReactNode; detail?: ReactNode; action?: ReactNode }) {
@@ -135,6 +172,41 @@ export function Segmented<T extends string>({ value, options, onChange, size = '
         );
       })}
     </div>
+  );
+}
+
+// Page tabs: plain text with an underline under the current one. They look different from the pill
+// Segmented of the navigation bar on purpose: the bar picks the section of the app, the tabs pick
+// a page of the section (the views of one server).
+export function Tabs<T extends string>({ value, options, onChange, label, className }: {
+  value: T;
+  options: SegmentOption<T>[];
+  onChange: (value: T) => void;
+  label: string;
+  className?: string;
+}) {
+  return (
+    <nav aria-label={label} className={cx('flex items-center gap-1 border-b border-line', className)}>
+      {options.map(o => {
+        const active = o.value === value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            aria-current={active ? 'page' : undefined}
+            title={o.title}
+            onClick={() => onChange(o.value)}
+            className={cx(
+              'relative -mb-px inline-flex h-10 items-center gap-1.5 px-3.5 text-[13.5px] font-medium whitespace-nowrap transition',
+              active ? 'text-fg after:absolute after:inset-x-2.5 after:bottom-0 after:h-0.5 after:rounded-full after:bg-fg' : 'text-fg-2 hover:text-fg',
+            )}
+          >
+            {o.icon}
+            {o.label}
+          </button>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -253,7 +325,9 @@ const LayerContext = createContext<(dialog: HTMLDialogElement, open: boolean) =>
 
 // A modal sheet built on <dialog> (focus, Escape and the top layer come from the browser). The
 // field to focus first is marked data-autofocus: React's autoFocus runs while the dialog is still
-// closed, after which the browser would focus the Close button instead.
+// closed, after which the browser would focus the Close button instead. A sheet with nothing to
+// type (a QR code, the About text) focuses its main button, so Enter or Space closes it, not the
+// small cross in its corner.
 export function Sheet({ open, onClose, title, subtitle, size = 'normal', children, footer }: {
   open: boolean;
   onClose: () => void;
@@ -271,7 +345,8 @@ export function Sheet({ open, onClose, title, subtitle, size = 'normal', childre
     if (!dialog) return;
     if (open && !dialog.open) {
       dialog.showModal();
-      dialog.querySelector<HTMLElement>('[data-autofocus]')?.focus();
+      const first = dialog.querySelector<HTMLElement>('[data-autofocus]');
+      (first ?? (dialog.querySelector('input, select, textarea') ? null : dialog.querySelector<HTMLElement>('footer button.bg-cta')))?.focus();
     }
     if (!open && dialog.open) dialog.close();
     if (!open) return;
@@ -320,17 +395,56 @@ export function Sheet({ open, onClose, title, subtitle, size = 'normal', childre
 
 // --- toasts and confirmations ---------------------------------------------------------------
 
-type Toast = { id: number; message: string; tone: 'ok' | 'bad' | 'info' };
+type Toast = { id: number; message: string; tone: 'ok' | 'bad' | 'info'; ms: number };
 type Ask = { title: string; text: string; action: string; danger?: boolean };
 type UI = {
   toast: (message: string, tone?: Toast['tone']) => void;
   confirm: (ask: Ask) => Promise<boolean>;
+  // Copies text and says so (done) or says it could not (a toast in both cases); true when copied.
+  copy: (text: string, done: string, failed?: string) => Promise<boolean>;
 };
 
-const UIContext = createContext<UI>({ toast: () => {}, confirm: async () => false });
+const UIContext = createContext<UI>({ toast: () => {}, confirm: async () => false, copy: async () => false });
 
 export function useUI(): UI {
   return useContext(UIContext);
+}
+
+// One toast. It goes away after the time its length needs (shared/toast.ts), unless the pointer or the
+// keyboard is on it: reading a long notice, or reaching for its button, pauses the clock. The cross
+// closes it at once.
+function ToastCard({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }) {
+  const [paused, setPaused] = useState(false);
+  const left = useRef(toast.ms);
+  const dismissNow = useRef(onDismiss);
+  dismissNow.current = onDismiss;
+  useEffect(() => {
+    if (paused) return;
+    const started = Date.now();
+    const timer = window.setTimeout(() => dismissNow.current(), left.current);
+    return () => {
+      window.clearTimeout(timer);
+      left.current = timeLeft(left.current, Date.now() - started);
+    };
+  }, [paused]);
+  return (
+    <div
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onFocus={() => setPaused(true)}
+      onBlur={() => setPaused(false)}
+      className={cx(
+        'glass-strong pointer-events-auto flex max-w-[min(560px,100%)] items-center gap-2.5 rounded-[22px] py-2.5 pr-2.5 pl-4.5 text-[13px] text-fg',
+        'animate-[sheet-in_0.3s_cubic-bezier(0.2,0.9,0.25,1)]',
+      )}
+    >
+      <span className={cx('size-2 shrink-0 rounded-full', toast.tone === 'ok' ? 'bg-ok' : toast.tone === 'bad' ? 'bg-bad' : 'bg-down')} />
+      <span className="min-w-0 flex-1">{toast.message}</span>
+      <button type="button" aria-label="Dismiss" title="Dismiss" onClick={onDismiss} className="grid size-6 shrink-0 place-items-center rounded-full text-fg-3 transition hover:bg-glass-strong hover:text-fg">
+        <X size={14} />
+      </button>
+    </div>
+  );
 }
 
 export function UIProvider({ children }: { children: ReactNode }) {
@@ -340,9 +454,17 @@ export function UIProvider({ children }: { children: ReactNode }) {
   const next = useRef(1);
   const toast = useCallback((message: string, tone: Toast['tone'] = 'ok') => {
     const id = next.current++;
-    setToasts(list => [...list.slice(-2), { id, message, tone }]);
-    window.setTimeout(() => setToasts(list => list.filter(t => t.id !== id)), tone === 'bad' ? 6000 : 3200);
+    setToasts(list => [...list.slice(-2), { id, message, tone, ms: toastDuration(message, tone) }]);
   }, []);
+  const dismiss = useCallback((id: number) => setToasts(list => list.filter(t => t.id !== id)), []);
+  const copy = useCallback(
+    async (text: string, done: string, failed = 'Could not copy to the clipboard. Select the text and copy it yourself.') => {
+      const ok = await copyText(text, browserClipboard);
+      toast(ok ? done : failed, ok ? 'ok' : 'bad');
+      return ok;
+    },
+    [toast],
+  );
   const confirm = useCallback((question: Ask) => new Promise<boolean>(resolve => setAsk({ ...question, resolve })), []);
   const layer = useCallback((dialog: HTMLDialogElement, open: boolean) => setLayers(list => [...list.filter(d => d !== dialog), ...(open ? [dialog] : [])]), []);
   const answer = (yes: boolean) => {
@@ -353,21 +475,12 @@ export function UIProvider({ children }: { children: ReactNode }) {
   const stack = (
     <div className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex flex-col items-center gap-2 px-4" aria-live="polite">
       {toasts.map(t => (
-        <div
-          key={t.id}
-          className={cx(
-            'glass-strong pointer-events-auto flex max-w-[min(560px,100%)] items-center gap-2.5 rounded-[22px] px-4.5 py-2.5 text-[13px] text-fg',
-            'animate-[sheet-in_0.3s_cubic-bezier(0.2,0.9,0.25,1)]',
-          )}
-        >
-          <span className={cx('size-2 shrink-0 rounded-full', t.tone === 'ok' ? 'bg-ok' : t.tone === 'bad' ? 'bg-bad' : 'bg-down')} />
-          {t.message}
-        </div>
+        <ToastCard key={t.id} toast={t} onDismiss={() => dismiss(t.id)} />
       ))}
     </div>
   );
   return (
-    <UIContext.Provider value={{ toast, confirm }}>
+    <UIContext.Provider value={{ toast, confirm, copy }}>
       <LayerContext.Provider value={layer}>
         {children}
         {createPortal(stack, layers[layers.length - 1] ?? document.body)}
@@ -377,10 +490,11 @@ export function UIProvider({ children }: { children: ReactNode }) {
           title={ask?.title ?? ''}
           footer={
             <>
-              <Button variant="ghost" onClick={() => answer(false)}>
+              {/* The button that cannot do harm has the focus: Cancel when the action is destructive. */}
+              <Button variant="ghost" data-autofocus={ask?.danger ? '' : undefined} onClick={() => answer(false)}>
                 Cancel
               </Button>
-              <Button variant={ask?.danger ? 'danger' : 'cta'} onClick={() => answer(true)}>
+              <Button variant={ask?.danger ? 'danger' : 'cta'} data-autofocus={ask?.danger ? undefined : ''} onClick={() => answer(true)}>
                 {ask?.action}
               </Button>
             </>

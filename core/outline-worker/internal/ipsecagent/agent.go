@@ -51,6 +51,9 @@ type Agent struct {
 	problem    string // why the last settings were not applied
 	listing    string // why sessions could not be listed
 	limitFault string // why the speed limit rules could not be applied (shown in the status)
+	// fwFault is why the firewall could not be put back after something on the host removed it
+	// (shown in the status; see keepFirewall).
+	fwFault    string
 	stamp      string // modification time and size of the settings last read
 	failedAt   time.Time
 	events     chan vici.Event
@@ -64,6 +67,8 @@ type Agent struct {
 	desired ipsecproto.Desired
 	sas     []ipsecproto.SA
 	limits  string
+	// list replaces the query for the connected sessions (a test's, which has no charon).
+	list func(context.Context) ([]ipsecproto.SA, error)
 }
 
 func (a *Agent) swanctlDir() string { return filepath.Join(a.Run, "swanctl") }
@@ -117,22 +122,37 @@ func (a *Agent) Serve(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	a.stamp = "unread"
+	return a.loop(ctx, ticker.C, a.cycle)
+}
+
+// fullEvery is how many ticks of the clock there are between two full cycles (sessions listed,
+// firewall checked, status written).
+const fullEvery = 5
+
+// loop runs cycle at the start and after every tick of the clock, the full one every fullEvery
+// ticks, until ctx ends or charon stops. Events from charon are recorded as they come but do not
+// run a cycle or count as a tick: the full cycle would otherwise run after every fifth event, and
+// a burst of them (many clients reconnecting) would list the sessions and write the status
+// over and over, instead of every 5 seconds.
+func (a *Agent) loop(ctx context.Context, tick <-chan time.Time, cycle func(context.Context, bool)) error {
 	for ticks := 0; ; ticks++ {
-		a.cycle(ctx, ticks%5 == 0)
-		select {
-		case <-ctx.Done():
-			return nil
-		case err := <-a.charonDone:
-			a.charonDone = nil
-			return fmt.Errorf("charon stopped: %v", err)
-		case event, ok := <-a.events:
-			if !ok {
-				a.events = nil
-				continue
+		cycle(ctx, ticks%fullEvery == 0)
+		for waiting := true; waiting; {
+			select {
+			case <-ctx.Done():
+				return nil
+			case err := <-a.charonDone:
+				a.charonDone = nil
+				return fmt.Errorf("charon stopped: %v", err)
+			case event, ok := <-a.events:
+				if !ok {
+					a.events = nil
+					continue
+				}
+				a.recordClosed(event)
+			case <-tick:
+				waiting = false
 			}
-			a.recordClosed(event)
-			continue
-		case <-ticker.C:
 		}
 	}
 }
@@ -287,7 +307,7 @@ func (a *Agent) apply(ctx context.Context, d ipsecproto.Desired) error {
 	if err := a.FW.Apply(ctx, d, a.sas); err != nil {
 		return err
 	}
-	a.desired, a.limits, a.limitFault = d, strings.Join(limitRules(d, a.sas), "\n"), ""
+	a.desired, a.limits, a.limitFault, a.fwFault = d, strings.Join(limitRules(d, a.sas), "\n"), "", ""
 	cmd := exec.CommandContext(ctx, a.Swanctl, "--load-all", "--clear", "--noprompt")
 	cmd.Env = a.env()
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -306,6 +326,9 @@ func lastLines(text string, n int) string {
 }
 
 func (a *Agent) listSAs(ctx context.Context) ([]ipsecproto.SA, error) {
+	if a.list != nil {
+		return a.list(ctx)
+	}
 	var events []*vici.Message
 	for m, err := range a.session.CallStreaming(ctx, "list-sas", "list-sa", nil) {
 		if err != nil {
@@ -380,10 +403,8 @@ func (a *Agent) cycle(ctx context.Context, full bool) {
 		return
 	}
 	if a.applied != 0 && time.Since(a.lastJumps) > 30*time.Second {
-		if err := a.FW.EnsureJumps(ctx); err != nil {
-			a.Log.Printf("could not restore firewall jumps: %v", err)
-		}
 		a.lastJumps = time.Now()
+		a.keepFirewall(ctx)
 	}
 	a.listing = ""
 	sas := a.enforce(ctx)
@@ -403,12 +424,36 @@ func (a *Agent) cycle(ctx context.Context, full bool) {
 		}
 	}
 	problems := []string{}
-	for _, p := range []string{a.problem, a.listing, a.limitFault} {
+	for _, p := range []string{a.problem, a.listing, a.limitFault, a.fwFault} {
 		if p != "" {
 			problems = append(problems, p)
 		}
 	}
 	a.writeStatusWith(true, strings.Join(problems, "; "), sas)
+}
+
+// keepFirewall puts the firewall back when something on the host took it away: a firewall reload
+// (firewalld, ufw), netfilter-persistent, or iptables -F. Those remove the agent's jumps, and with
+// them the rules of its chains or the chains themselves, so putting the jumps back is not enough
+// (they would send packets through empty chains: no isolation, no NAT, no DNS redirect). When
+// anything is missing it applies the whole rule set again, as for new settings. A failure shows in
+// the status until a later check finds the firewall whole. An intact firewall is left alone.
+func (a *Agent) keepFirewall(ctx context.Context) {
+	missing := a.FW.Missing(ctx)
+	if len(missing) == 0 {
+		a.fwFault = ""
+		return
+	}
+	a.Log.Printf("the IPsec firewall rules are missing on this machine (%s; a firewall reload?); restoring them", strings.Join(missing, ", "))
+	if err := a.FW.Apply(ctx, a.desired, a.sas); err != nil {
+		a.fwFault = "the firewall rules were removed from this machine and could not be restored: " + err.Error()
+		a.Log.Printf("%s", a.fwFault)
+		return
+	}
+	// The rules in force are those of the sessions the agent last knew; the check of the speed
+	// limits that follows brings them up to date.
+	a.limits, a.limitFault, a.fwFault = strings.Join(limitRules(a.desired, a.sas), "\n"), "", ""
+	a.Log.Printf("restored the IPsec firewall rules")
 }
 
 // recordClosed keeps the final counters of CHILD_SAs that ended, keeping the larger counters

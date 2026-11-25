@@ -9,6 +9,13 @@ use crate::{
 };
 use anyhow::{ensure, Result};
 
+/// The most text a credential may be: a WireGuard/AmneziaWG configuration
+/// ([`wireguard::MAX_CONFIG`]) or an Amnezia `vpn://` key is the longest kind; `ss://`,
+/// `ssconf://` and `vless://` keys are far shorter. A client that reads a credential from a file
+/// or a pipe (the CLI; the desktop app's file picker has the same limit) reads up to this much and
+/// leaves the verdict to the parsers, so it never refuses what they would take.
+pub const MAX_CREDENTIAL: usize = 64 * 1024;
+
 pub enum Outbound {
     Shadowsocks(AccessKey),
     Vless(VlessKey),
@@ -142,4 +149,18 @@ pub async fn resolve(source: &str) -> Result<Resolved> {
         outbound: Outbound::WireGuard(wireguard::parse(source)?),
         label: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client that reads a credential from a file or a pipe may refuse nothing a parser would
+    /// take: the CLI used to stop at 16 KiB, below what the WireGuard and Amnezia parsers (and
+    /// the desktop app's file picker) accept.
+    #[test]
+    fn the_credential_limit_covers_every_parser() {
+        const { assert!(MAX_CREDENTIAL >= wireguard::MAX_CONFIG) };
+        const { assert!(MAX_CREDENTIAL >= crate::amnezia::MAX_KEY) };
+    }
 }

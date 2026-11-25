@@ -210,10 +210,6 @@ func operatorOf(description string) string {
 		case unicode.IsSpace(r):
 			space = true
 		default:
-			if count == maxOperator {
-				// One more character than fits: keep room for the ellipsis.
-				return strings.TrimSpace(string([]rune(b.String())[:maxOperator-1])) + "…"
-			}
 			if space && b.Len() > 0 {
 				b.WriteByte(' ')
 				count++
@@ -221,6 +217,13 @@ func operatorOf(description string) string {
 			space = false
 			b.WriteRune(r)
 			count++
+			if count > maxOperator {
+				// One more character than fits: keep room for the ellipsis. The count is checked
+				// after the character is added, and for "more than", not "exactly": a space and the
+				// character after it advance the count by two, so a check for the one value
+				// maxOperator before adding could step over it, and the name would not be cut.
+				return strings.TrimSpace(string([]rune(b.String())[:maxOperator-1])) + "…"
+			}
 		}
 	}
 	return b.String()

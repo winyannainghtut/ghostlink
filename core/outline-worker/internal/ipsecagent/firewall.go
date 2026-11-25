@@ -161,6 +161,8 @@ func Rules(d ipsecproto.Desired, sas []ipsecproto.SA) map[string]string {
 // Firewall applies Rules with the host's iptables backend (see internal/hostfw).
 type Firewall struct {
 	Backend string // "nft" or "legacy"
+	// Exec runs the iptables commands; nil means the real ones. A test gives it a fake host.
+	Exec hostfw.Exec
 }
 
 var chains = map[string][]string{
@@ -184,7 +186,7 @@ func run(ctx context.Context, stdin string, name string, args ...string) (string
 // DetectBackend picks the iptables backend the host uses.
 func DetectBackend(ctx context.Context) string { return hostfw.Detect(ctx) }
 
-func (f *Firewall) host() *hostfw.Firewall { return &hostfw.Firewall{Backend: f.Backend} }
+func (f *Firewall) host() *hostfw.Firewall { return &hostfw.Firewall{Backend: f.Backend, Exec: f.Exec} }
 
 // Apply replaces the agent's chains and makes sure each is jumped to from its built-in chain.
 func (f *Firewall) Apply(ctx context.Context, d ipsecproto.Desired, sas []ipsecproto.SA) error {
@@ -194,9 +196,17 @@ func (f *Firewall) Apply(ctx context.Context, d ipsecproto.Desired, sas []ipsecp
 	return f.EnsureJumps(ctx)
 }
 
-// EnsureJumps puts back a jump someone removed (for example a firewall reload).
+// EnsureJumps puts back a jump someone removed. It does not put back the rules of the chains:
+// after a firewall reload that is Apply's work (see Missing).
 func (f *Firewall) EnsureJumps(ctx context.Context) error {
 	return f.host().EnsureJumps(ctx, hostJumps())
+}
+
+// Missing lists the jumps and chains of the agent that are gone from the host (a firewall reload,
+// netfilter-persistent, iptables -F). Anything in the list means the rules need Apply again: a jump
+// put back into a chain that was flushed would send packets through nothing.
+func (f *Firewall) Missing(ctx context.Context) []string {
+	return f.host().Missing(ctx, hostJumps(), chains)
 }
 
 // Remove deletes the jumps and the agent's chains, leaving the host as it was.

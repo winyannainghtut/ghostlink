@@ -75,6 +75,55 @@ func TestNamesKeysEndpointsAndRoutes(t *testing.T) {
 	}
 }
 
+// An endpoint is where other nodes send to: not an address nothing can be reached at (unspecified,
+// link-local, where cloud metadata services live, multicast, reserved, broadcast). Loopback is
+// accepted, because `join-here` on a machine whose host name is 127.0.0.1 passes one and an old
+// node may have reported one, but it is not reachable by other machines.
+func TestEndpointsMustBeAddressesNodesCanBeReachedAt(t *testing.T) {
+	// 240.0.0.0/4 is reserved, but Linux takes addresses there and some private networks use them.
+	for _, ok := range []string{"198.51.100.7:51820", "10.0.0.1:1", "192.168.1.20:51820", "100.96.0.9:51820", "100.64.0.1:51820", "127.0.0.1:51820", "127.0.1.1:51820", "240.0.0.1:51820"} {
+		if err := ValidEndpoint(ok); err != nil {
+			t.Errorf("refused endpoint %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"0.0.0.0:51820", "0.1.2.3:51820", "169.254.169.254:80", "169.254.0.1:51820", "224.0.0.1:51820", "239.255.255.250:1900",
+		"255.255.255.255:51820", "[::ffff:169.254.169.254]:51820",
+	} {
+		if ValidEndpoint(bad) == nil {
+			t.Errorf("accepted endpoint %q", bad)
+		}
+	}
+	for text, want := range map[string]bool{
+		"198.51.100.7:51820": true, "192.168.1.20:51820": true, "100.64.0.1:51820": true,
+		"127.0.0.1:51820": false, "127.0.1.1:51820": false, "169.254.169.254:80": false, "0.0.0.0:1": false, "198.51.100.7": false, "": false,
+	} {
+		if got := ReachableEndpoint(text); got != want {
+			t.Errorf("ReachableEndpoint(%q) = %v, want %v", text, got, want)
+		}
+	}
+	// The same rule applies where the coordinator takes a node's report, and where an agent takes a
+	// peer's endpoint from its configuration.
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	join := JoinRequest{Protocol: Version, Token: "t", Name: "web", PublicKey: key, ListenPort: DefaultPort, Endpoints: []string{"198.51.100.7:51820", "169.254.169.254:51820"}}
+	if join.Check() == nil {
+		t.Error("a join that offers a link-local endpoint was accepted")
+	}
+	sync := SyncRequest{Protocol: Version, ListenPort: DefaultPort, Endpoints: []string{"0.0.0.0:51820"}}
+	if sync.Check() == nil {
+		t.Error("a sync that offers the unspecified address was accepted")
+	}
+	c := Config{Name: "web", MeshCIDR: "100.96.0.0/16", Address: "100.96.0.5/16", ListenPort: DefaultPort,
+		Peers: []Peer{{Name: "db", PublicKey: key, Endpoint: "169.254.169.254:51820", AllowedIPs: []string{"100.96.0.6/32"}}}}
+	if c.Validate() == nil {
+		t.Error("a configuration with a link-local peer endpoint was accepted")
+	}
+	c.Peers[0].Endpoint = "203.0.113.7:51820"
+	if err := c.Validate(); err != nil {
+		t.Errorf("a configuration with a public peer endpoint was refused: %v", err)
+	}
+}
+
 func TestRequestsAreChecked(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	join := JoinRequest{Protocol: Version, Token: "t", Name: "web", PublicKey: key, ListenPort: DefaultPort,

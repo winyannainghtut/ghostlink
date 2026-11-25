@@ -220,7 +220,7 @@ export function Overview({ onNewClient }: { onNewClient: () => void }) {
         <Card>
           <CardTitle title="Today by client" detail="Last 24 hours" />
           {users.length ? (
-            <Bars items={(day?.users ?? []).filter(u => u.up + u.down > 0).map(u => ({ label: u.name, bytes: u.up + u.down }))} empty="No traffic in the last 24 hours." />
+            <Bars items={day ? (day.users ?? []).filter(u => u.up + u.down > 0).map(u => ({ label: u.name, bytes: u.up + u.down })) : undefined} empty="No traffic in the last 24 hours." />
           ) : (
             <div className="grid place-items-center gap-3 py-6 text-center">
               <p className="text-[13px] text-fg-3">No clients yet.</p>

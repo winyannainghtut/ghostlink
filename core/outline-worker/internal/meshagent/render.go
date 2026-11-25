@@ -210,6 +210,24 @@ func RenderHosts(existing string, entries []meshproto.Host) string {
 	return out + "\n"
 }
 
+// usablePeers is the peers of c as the agent applies them: a peer whose endpoint no other machine
+// can be reached at keeps no endpoint (it can still connect to this node, or be reached through
+// the relay). That is an address on loopback, or one inside the mesh network, where WireGuard
+// would send its packets into its own tunnel. The coordinator does not offer such an endpoint
+// unless a node reported it (a modified agent, or an old one that was told one with --endpoint).
+// The names of the peers that were changed come second; c itself is not changed.
+func usablePeers(c *meshproto.Config) (peers []meshproto.Peer, changed []string) {
+	mesh, _ := netip.ParsePrefix(c.MeshCIDR)
+	for _, p := range c.Peers {
+		if ap, err := netip.ParseAddrPort(p.Endpoint); err == nil && (ap.Addr().IsLoopback() || mesh.Contains(ap.Addr())) {
+			p.Endpoint = ""
+			changed = append(changed, p.Name)
+		}
+		peers = append(peers, p)
+	}
+	return peers, changed
+}
+
 // PeerChanges turns the wanted peers into a WireGuard update that keeps existing sessions:
 // current peers are updated in place, missing ones added, others removed. An endpoint is only
 // set when the coordinator's suggestion changed, so WireGuard can keep following a peer that

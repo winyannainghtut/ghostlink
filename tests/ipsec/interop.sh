@@ -324,6 +324,48 @@ swan --terminate --ike ikev2-eap --timeout 15 >/dev/null
 api PATCH "/users/$user" '{"speed_limit_bps":0}' >/dev/null
 wait_applied
 
+step "Firewall reload: the agent puts its rules back, and a client still connects"
+# A firewall reload (firewalld, ufw, netfilter-persistent, iptables -F) takes the agent's jumps out of the
+# built-in chains and empties its chains. The agent checks every 30 s and then applies its whole rule set
+# again, and it must not do that while nothing is missing. Only the agent's own jumps and chains are
+# touched here, never Docker's. -w 5 waits for the xtables lock, which the agent takes too.
+ipt() { iptables -w 5 "$@"; }
+restores() { docker logs ghostlink-ipsec 2>&1 | grep -c 'restoring them' || true; }
+agent_rules_in_place() {
+    ipt -C FORWARD -j GHOSTLINK-IPSEC-FWD 2>/dev/null &&
+        ipt -C INPUT -j GHOSTLINK-IPSEC-IN 2>/dev/null &&
+        ipt -t nat -C PREROUTING -j GHOSTLINK-IPSEC-PRE 2>/dev/null &&
+        ipt -t nat -C POSTROUTING -j GHOSTLINK-IPSEC-POST 2>/dev/null &&
+        ipt -t mangle -C FORWARD -j GHOSTLINK-IPSEC-MSS 2>/dev/null &&
+        [[ "$(ipt -S GHOSTLINK-IPSEC-OUT 2>/dev/null)" == *"-A GHOSTLINK-IPSEC-OUT -j ACCEPT"* ]] &&
+        [[ "$(ipt -t nat -S GHOSTLINK-IPSEC-POST 2>/dev/null)" == *MASQUERADE* ]]
+}
+agent_rules_in_place || fail "the agent's firewall rules are not in place before the reload"
+before=$(restores)
+ipt -D FORWARD -j GHOSTLINK-IPSEC-FWD
+ipt -D INPUT -j GHOSTLINK-IPSEC-IN
+ipt -t nat -D PREROUTING -j GHOSTLINK-IPSEC-PRE
+ipt -t nat -D POSTROUTING -j GHOSTLINK-IPSEC-POST
+ipt -t mangle -D FORWARD -j GHOSTLINK-IPSEC-MSS
+ipt -F GHOSTLINK-IPSEC-OUT
+ipt -t nat -F GHOSTLINK-IPSEC-POST
+if agent_rules_in_place; then fail "the simulated reload left the agent's rules in place"; fi
+for i in $(seq 1 50); do agent_rules_in_place && break; sleep 1; done
+agent_rules_in_place || fail "the agent did not put its firewall rules back within 50 s"
+restored=$(restores)
+[ "$restored" -gt "$before" ] || fail "the agent put its rules back without saying so in its log"
+# The rules are as they were: a client connects, reaches the internet through the NAT, is refused what
+# the rules refuse, and its DNS goes to the server's.
+connect ikev2-eap
+check_tunnel ikev2-eap 10.79.0.1
+swan --terminate --ike ikev2-eap --timeout 15 >/dev/null
+# In steady state the next checks (every 30 s) find nothing missing and leave the firewall alone.
+sleep 40
+[ "$(restores)" = "$restored" ] || fail "the agent keeps restoring its firewall rules although nothing took them away again"
+if jq -e '(.error // "") | test("firewall")' "$state/ipsec/status.json" >/dev/null; then
+    fail "the agent still reports a firewall fault: $(jq -r .error "$state/ipsec/status.json")"
+fi
+
 step "Usage is counted and the data limit cuts the user off"
 connect ipsec-cert
 in_client curl -s --max-time 10 -o /dev/null http://198.51.100.10:8080/

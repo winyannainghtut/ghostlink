@@ -232,13 +232,48 @@ func ValidRoute(text string) error {
 	return nil
 }
 
-// ValidEndpoint accepts "IPv4:port".
+// noEndpoint are the IPv4 ranges no node can be reached at: "this network" (0.0.0.0/8, the
+// unspecified address included), link-local (169.254.0.0/16, where cloud metadata services live),
+// multicast (224.0.0.0/4) and broadcast. The reserved range 240.0.0.0/4 is not among them: Linux
+// accepts addresses there on an interface, and some private networks use them.
+var noEndpoint = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("255.255.255.255/32"),
+}
+
+// ValidEndpoint accepts "IPv4:port" for a unicast address: not unspecified, link-local, multicast
+// or broadcast, which no other node can be reached at, and where a node that told its peers to
+// send there would only have them send to something else on their network.
+//
+// A loopback address is still accepted, because it was before and because it is used on purpose:
+// a coordinator on a test machine whose host name is 127.0.0.1 joins its own agent (mesh
+// join-here) with --endpoint 127.0.0.1:PORT, and a node that reported one must not be turned away
+// by a newer coordinator. Agents do not offer one to other nodes (see ReachableEndpoint). Nor can
+// this function say that an endpoint lies inside the mesh network, which it does not know: an
+// agent leaves such a peer endpoint out when it applies a configuration.
 func ValidEndpoint(text string) error {
 	ap, err := netip.ParseAddrPort(text)
 	if err != nil || !ap.Addr().Is4() || ap.Port() == 0 {
 		return fmt.Errorf("%q is not an IPv4 address and port", text)
 	}
+	for _, p := range noEndpoint {
+		if p.Contains(ap.Addr()) {
+			return fmt.Errorf("%s is not an address other nodes can send to (unspecified, link-local, multicast or broadcast)", text)
+		}
+	}
 	return nil
+}
+
+// ReachableEndpoint reports whether other machines can send to an endpoint: it is valid, and not
+// a loopback address, which only the machine itself can reach.
+func ReachableEndpoint(text string) bool {
+	if ValidEndpoint(text) != nil {
+		return false
+	}
+	ap, _ := netip.ParseAddrPort(text)
+	return !ap.Addr().IsLoopback()
 }
 
 func validPorts(ports []string) error {

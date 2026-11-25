@@ -127,6 +127,39 @@ func TestOperatorNamesAreCleaned(t *testing.T) {
 	}
 }
 
+// A name is cut to maxOperator characters wherever the whitespace that collapses falls. A space and
+// the character after it advance the count by two, so with the space in column 59 (counting from 1)
+// the count went from 59 to 61 and was never exactly 60, which is what the cut waited for: the name
+// was kept whole, up to the length of the line.
+func TestOperatorCapHoldsWhenWhitespaceCollapsesAtTheLimit(t *testing.T) {
+	for column := 1; column <= 70; column++ {
+		// column letters, a run of spaces (which collapse into one), then a long tail.
+		for _, tail := range []string{"b", "bb", strings.Repeat("b", 500), strings.Repeat("b ", 300), strings.Repeat("é ", 40)} {
+			got := operatorOf("H - " + strings.Repeat("a", column) + "   \t " + tail)
+			if n := len([]rune(got)); n > maxOperator {
+				t.Fatalf("a space after %d characters and a tail of %d: the name has %d characters: %q", column, len(tail), n, got)
+			}
+		}
+	}
+	long := strings.Repeat("a", 59) + " " + strings.Repeat("b", 300)
+	if got, want := operatorOf("H - "+long), strings.Repeat("a", 59)+"…"; got != want {
+		t.Errorf("space at column 59, a long tail: %q, want %q", got, want)
+	}
+	// Exactly one more than fits, the extra character being the one after the space.
+	if got, want := operatorOf("H - "+strings.Repeat("a", 59)+" b"), strings.Repeat("a", 59)+"…"; got != want {
+		t.Errorf("61 characters: %q, want %q", got, want)
+	}
+	// A name that fits is kept whole, the space included: 58 letters, a space and a letter are 60.
+	whole := strings.Repeat("a", 58) + " b"
+	if got := operatorOf("H - " + whole); got != whole {
+		t.Errorf("60 characters: %q, want %q", got, whole)
+	}
+	// The cut that falls on a space leaves no space before the ellipsis.
+	if got, want := operatorOf("H - "+strings.Repeat("a", 58)+" bcd"), strings.Repeat("a", 58)+"…"; got != want {
+		t.Errorf("cut at a space: %q, want %q", got, want)
+	}
+}
+
 func TestParseRefusesWhatIsNotIP2ASN(t *testing.T) {
 	for name, text := range map[string]string{
 		"empty":     "",

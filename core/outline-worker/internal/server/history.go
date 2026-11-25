@@ -266,10 +266,17 @@ func (h *History) encode(now time.Time, settings MonitorSettings, maxBytes int) 
 // --- Monitor persistence ---
 
 // Flush moves the traffic counted since the last flush into the history.
+//
+// The history is locked first and stays locked to the end; the counters (m.mu) are locked inside
+// it, only to read them. Forget takes the two in the same order, so it cannot remove a user between
+// the reading and the writing here: before, it could, and what was written then brought the
+// deleted user's history back.
 func (m *Monitor) Flush(now time.Time) {
 	type delta struct{ up, down uint64 }
 	traffic := map[string]delta{}
 	details := map[detailKey]uint64{}
+	m.historyMu.Lock()
+	defer m.historyMu.Unlock()
 	m.mu.Lock()
 	for tag, u := range m.users {
 		up, down := u.up.Load(), u.down.Load()
@@ -285,8 +292,9 @@ func (m *Monitor) Flush(now time.Time) {
 	m.clients = map[string]map[string]clientSeen{}
 	m.mu.Unlock()
 
-	m.historyMu.Lock()
-	defer m.historyMu.Unlock()
+	if m.afterFlushRead != nil {
+		m.afterFlushRead()
+	}
 	for tag, d := range traffic {
 		m.history.addTraffic(tag, now, d.up, d.down)
 	}
@@ -344,8 +352,12 @@ func (m *Monitor) SaveHistory(path string, now time.Time, settings MonitorSettin
 }
 
 // Forget removes a deleted user: the counters and connecting addresses not yet flushed (the
-// next Flush would write them back into the history), and the recorded traffic.
+// next Flush would write them back into the history), and the recorded traffic. The history is
+// locked first, and the counters inside it, as Flush does (see there): a flush is wholly before or
+// wholly after this.
 func (m *Monitor) Forget(tag string) {
+	m.historyMu.Lock()
+	defer m.historyMu.Unlock()
 	m.mu.Lock()
 	for _, values := range []map[string]int64{m.lastUp, m.lastDown, m.flushedUp, m.flushedDn} {
 		delete(values, tag)
@@ -362,9 +374,7 @@ func (m *Monitor) Forget(tag string) {
 		}
 	}
 	m.mu.Unlock()
-	m.historyMu.Lock()
 	m.history.forget(tag)
-	m.historyMu.Unlock()
 }
 
 // readHistory runs fn with the history locked.

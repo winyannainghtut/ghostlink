@@ -34,7 +34,7 @@ This is a layer-3 network in the style of ZeroTier, Tailscale or Nebula. It is n
     - If a firewall reload removes the chains, the agent puts them back within about 30 seconds, and a connection opened from the mesh in the meantime that the rules don't allow ends then.
   - It reports handshakes, traffic and ping latency to the coordinator. The node's WireGuard private key **never leaves the node**.
 - **Paths: direct first, then the relay.** Every pair of nodes connects directly when at least one of them can be reached. The coordinator decides every 5 seconds:
-  - A pair with no handshake 90 seconds after both nodes are up goes **through the relay**. So does an established direct pair whose newest handshake is more than 3 minutes old.
+  - A pair with no handshake 90 seconds after both nodes are up goes **through the relay**. So does an established direct pair whose newest handshake is more than 3 minutes old. The coordinator dates each handshake by its own clock, when a report first shows it, so a node whose clock is wrong does not change these decisions (a node whose clock is more than 3 minutes behind may spend up to about 2 minutes on the relay after the coordinator restarts).
   - A pair where neither node has an address for the other goes through the relay at once.
   - While a pair uses the relay, its two nodes keep trying each other directly. The pair goes back to direct as soon as that works.
   - Two nodes behind NAT are first tried at the public address each is seen from. That works only through 1:1 or port-preserving NAT; otherwise they use the relay. There is no deliberate NAT hole punching.
@@ -42,7 +42,7 @@ This is a layer-3 network in the style of ZeroTier, Tailscale or Nebula. It is n
 - **Addresses the coordinator gives out:**
   - a node's own report of its addresses;
   - the address the coordinator sees it connect from, with its WireGuard port. That covers 1:1 NAT such as AWS EC2 and Lightsail public IPs.
-  - Nodes behind the same public address (the same VPC, LAN or NAT) use each other's private addresses.
+  - Nodes behind the same public address (the same VPC, LAN or NAT) use each other's private addresses: never a loopback or a mesh address, and not those of a container bridge (Docker, podman, LXD, Incus, Calico, Cilium).
 
 ## Set up
 
@@ -176,7 +176,7 @@ A node can make a private network behind it reachable from the mesh, for example
 
 The other nodes then route that subnet through this node, under the access rules. By default the node **masquerades** traffic into the subnet, so its hosts need no route back; `mesh node NAME --masquerade off` turns that off. A subnet that overlaps the mesh network or another node's subnet is refused.
 
-A node never routes a shared subnet into the mesh where that would cut it off from a network it is on, replace a route it already has for that subnet, or send its own traffic to a peer around in a loop. Its status and the map name the subnets it leaves out.
+A node never routes a shared subnet into the mesh where that would cut it off from a network it is on or from the coordinator, replace a route it already has for that subnet, or send its own traffic to a peer around in a loop. Its status and the map name the subnets it leaves out.
 
 A node only forwards traffic if its own operator allowed it, at join time with `--relay` or `--advertise-routes`. Without that, its agent installs no forwarding rules, even where IPv4 forwarding is already on (Docker hosts, for example). Making a node a relay or a subnet router later from the app therefore also needs, on that node:
 
@@ -261,6 +261,7 @@ See also the [security model](../security/model.md).
 | Symptom | What to check |
 |---|---|
 | `coordinator unreachable` in `ghostlink-mesh status` | The coordinator's mesh TCP port must be open in its firewall or security group. Existing links keep working meanwhile. |
+| `join-here` prints a note that its endpoint is a loopback address | The server's host name resolves to 127.x on this machine, so the relay offers no endpoint to other nodes (it is never published). Join with `--endpoint PUBLIC_IP:51820`. |
 | A link stays `down` or goes through the relay | Open UDP 51820 on at least one of the two nodes. With `--endpoint IP:51820`, a node can state its public address when the coordinator sees a different one. |
 | `this kernel has no WireGuard support` | Use a KVM VPS or dedicated server with Linux 5.6+. |
 | A relay or subnet does not work and the status asks for forwarding | Run `sudo ghostlink-mesh allow-forwarding && sudo systemctl restart ghostlink-mesh` on that node. |

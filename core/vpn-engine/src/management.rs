@@ -1,8 +1,9 @@
-use crate::{profile::ValidatedProfile, storage};
+use crate::{netstate::Footprint, profile::ValidatedProfile, storage};
 use anyhow::{ensure, Result};
 use ghostlink_contracts::{ConnectionState, Status, Stream};
 use rand::{rngs::OsRng, RngCore};
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -20,6 +21,67 @@ pub struct Snapshot {
     pub status: Status,
     pub connected_since: Option<Instant>,
     pub counter_at: Option<Instant>,
+    /// What the last session may have left in the operating system, set when it ended with a
+    /// cleanup barrier (see [`is_cleanup_barrier`]) and the engine's footprint was known. The
+    /// service checks it again before it lifts the barrier; None means it cannot be checked.
+    pub footprint: Option<Footprint>,
+}
+
+/// The `last_error` values that mean the engine ended without confirming that it removed the
+/// routes, DNS settings and filters it had set up: the next connection waits until the service
+/// has verified that nothing of it is left.
+pub fn is_cleanup_barrier(error: &str) -> bool {
+    matches!(
+        error,
+        "forced_stop_network_cleanup_unverified" | "network_cleanup_unverified"
+    )
+}
+
+/// How far OpenVPN got in changing the network, from the `>STATE:` lines it reports.
+#[derive(Default)]
+struct BringUp {
+    /// It reported that it assigned its interface an address, added routes, or connected: from
+    /// then on it may have changed routes and DNS settings, which only it can undo.
+    touched: bool,
+    /// The addresses it assigned.
+    addresses: Vec<IpAddr>,
+}
+
+impl BringUp {
+    fn observe(&mut self, line: &str) {
+        let Some(data) = line.strip_prefix(">STATE:") else {
+            return;
+        };
+        let fields: Vec<_> = data.split(',').collect();
+        if !matches!(
+            fields.get(1).copied(),
+            Some("ASSIGN_IP" | "ADD_ROUTES" | "CONNECTED")
+        ) {
+            return;
+        }
+        self.touched = true;
+        // The local IPv4 address, then the local IPv6 address.
+        for field in [fields.get(3), fields.get(8)].into_iter().flatten() {
+            if let Ok(ip) = field.trim().parse::<IpAddr>() {
+                if !self.addresses.contains(&ip) {
+                    self.addresses.push(ip);
+                }
+            }
+        }
+    }
+    fn footprint(&self) -> Option<Footprint> {
+        (!self.addresses.is_empty()).then(|| Footprint {
+            interface: None,
+            addresses: self.addresses.clone(),
+        })
+    }
+    /// Whether an OpenVPN process that ended on its own, without being asked to, may have left
+    /// routes and DNS settings behind: it ended with an error (a crash, a kill) after it began to
+    /// change the network, like a forced stop. One that ended cleanly (exit code 0: OpenVPN
+    /// removes what it set up on its way out), or before it changed anything, did not.
+    fn needs_inspection(&self, exited_ok: bool) -> bool {
+        self.touched && !exited_ok
+    }
 }
 impl Snapshot {
     pub fn status(&self) -> Status {
@@ -233,6 +295,8 @@ pub async fn start(
         let mut requested_stop = false;
         // Set once the hold is released: from then on the engine may have changed routes/DNS.
         let mut initialized = false;
+        // How far OpenVPN got in changing the network, for an exit nobody asked for.
+        let mut up = BringUp::default();
         let stream = tokio::select! {
             _ = stop_rx.recv() => { requested_stop = true; None }
             _ = child.wait() => { reason = Some("engine_exited_before_management"); None }
@@ -264,6 +328,7 @@ pub async fn start(
                             // release that never comes, so turn the hold off for those.
                             if reader.get_mut().write_all(b"state on\nbytecount 1\nhold off\nhold release\n").await.is_err() { reason = Some("management_connection_failed"); }
                         } else if initialized {
+                            up.observe(&line);
                             let event = apply_event(&line, &mut *shared.write().await, connected_once);
                             if let Some(event) = event {
                                 let _ = events.try_send(event);
@@ -287,16 +352,23 @@ pub async fn start(
             }
         }
         // A lost reverse management channel also tells OpenVPN to terminate gracefully.
-        if !requested_stop
-            && tokio::time::timeout(Duration::from_secs(10), child.wait())
-                .await
-                .is_err()
-        {
-            let _ = child.kill().await;
-            // Same rule as an explicit stop: a forced kill after hold release may leave
-            // routes/DNS behind, so block further connects until someone inspects them.
-            if initialized {
-                reason = Some("forced_stop_network_cleanup_unverified");
+        if !requested_stop {
+            match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+                // It ended without being asked to, whatever was noticed first, the process or the
+                // closing of its channel. Its exit status says whether it undid what it set up.
+                Ok(status) => {
+                    if up.needs_inspection(status.is_ok_and(|s| s.success())) {
+                        reason = Some("network_cleanup_unverified");
+                    }
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    // Same rule as an explicit stop: a forced kill after hold release may leave
+                    // routes/DNS behind, so block further connects until someone inspects them.
+                    if initialized {
+                        reason = Some("forced_stop_network_cleanup_unverified");
+                    }
+                }
             }
         }
         if requested_stop {
@@ -310,6 +382,10 @@ pub async fn start(
             ConnectionState::Disconnected
         };
         snapshot.status.last_error = reason.map(String::from);
+        // What to look for when the service verifies that nothing is left (see `is_cleanup_barrier`).
+        snapshot.footprint = reason
+            .filter(|reason| is_cleanup_barrier(reason))
+            .and_then(|_| up.footprint());
         snapshot.status.vpn_ip = None;
         snapshot.connected_since = None;
         snapshot.status.receive_bytes_per_second = 0;
@@ -432,6 +508,57 @@ mod tests {
             Some("credentials_required")
         );
     }
+    /// OpenVPN that ends on its own, with an error, after it began to change the network, may
+    /// have left routes and DNS settings behind: the next connection waits for a check, as after
+    /// a forced stop. Before that point, or after a clean exit, nothing is in doubt.
+    #[test]
+    fn an_exit_after_the_network_was_touched_needs_an_inspection() {
+        let mut up = BringUp::default();
+        assert!(!up.needs_inspection(false));
+        for before in [
+            ">STATE:1700000000,CONNECTING,,,,,,",
+            ">STATE:1700000001,WAIT,,,,,,",
+            ">STATE:1700000002,AUTH,,,,,,",
+            ">STATE:1700000003,GET_CONFIG,,,,,,",
+            ">BYTECOUNT:1,2",
+            "Initialization Sequence Completed",
+        ] {
+            up.observe(before);
+        }
+        assert!(!up.touched);
+        assert!(!up.needs_inspection(false));
+        assert!(up.footprint().is_none());
+        up.observe(">STATE:1700000004,ASSIGN_IP,,203.0.113.77,,,,");
+        assert!(up.touched);
+        assert!(up.needs_inspection(false));
+        assert!(!up.needs_inspection(true), "a clean exit");
+        // The address it assigned is what is looked for afterwards, once, whatever else follows.
+        up.observe(">STATE:1700000005,ADD_ROUTES,,,,,,");
+        up.observe(">STATE:1700000006,CONNECTED,SUCCESS,203.0.113.77,198.51.100.9,1194,,");
+        up.observe(">STATE:1700000007,ASSIGN_IP,,,,,,,fd00:db8::2");
+        assert_eq!(
+            up.footprint().unwrap().addresses,
+            [
+                "203.0.113.77".parse::<IpAddr>().unwrap(),
+                "fd00:db8::2".parse().unwrap()
+            ]
+        );
+        assert!(up.footprint().unwrap().interface.is_none());
+        for barrier in [
+            "network_cleanup_unverified",
+            "forced_stop_network_cleanup_unverified",
+        ] {
+            assert!(is_cleanup_barrier(barrier));
+        }
+        for other in [
+            "engine_exited",
+            "connection_timeout",
+            "authentication_failed",
+        ] {
+            assert!(!is_cleanup_barrier(other));
+        }
+    }
+
     #[test]
     fn counters_cannot_underflow() {
         let mut snapshot = Snapshot::default();

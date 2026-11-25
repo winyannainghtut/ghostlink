@@ -18,11 +18,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"ghostlink.local/outline-worker/internal/meshproto"
@@ -106,6 +109,23 @@ func (n *Node) Save(dir string) error {
 	return writeAtomic(filepath.Join(dir, nodeFile), data, 0o600)
 }
 
+// left reports that this machine's identity was deleted, as `ghostlink-mesh leave` does (the
+// running agent then stops, and must not do anything more on the host).
+func left(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, nodeFile))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// saveIfJoined is Save for a running agent: it rewrites the identity only while the identity is
+// still there. `ghostlink-mesh leave` deletes it, and a running agent that saved it again would
+// bring the node back to life on a machine that left the mesh.
+func (n *Node) saveIfJoined(dir string) error {
+	if left(dir) {
+		return os.ErrNotExist
+	}
+	return n.Save(dir)
+}
+
 // Forget deletes the identity and status.
 func Forget(dir string) {
 	_ = os.Remove(filepath.Join(dir, nodeFile))
@@ -119,14 +139,47 @@ var ErrRemoved = errors.New("this node was removed from the mesh")
 type Client struct {
 	url  string
 	http *http.Client
+	// remote is the address the last connection to the coordinator went to (a netip.Addr).
+	remote atomic.Value
 }
 
-// NewClient returns a client for the coordinator at url with certificate fingerprint pin.
-func NewClient(url, pin string) *Client {
+// Addresses are the IPv4 addresses the coordinator is reached at: the one in its URL when the URL
+// has an address, and the one the last connection went to (the URL may name a host instead). No
+// route into the mesh may carry them, or the agent would cut itself off from the coordinator.
+func (c *Client) Addresses() []netip.Addr {
+	if c == nil {
+		return nil
+	}
+	var out []netip.Addr
+	if u, err := url.Parse(c.url); err == nil {
+		if ip, err := netip.ParseAddr(u.Hostname()); err == nil && ip.Unmap().Is4() {
+			out = append(out, ip.Unmap())
+		}
+	}
+	if ip, ok := c.remote.Load().(netip.Addr); ok && ip.Is4() && !slices.Contains(out, ip) {
+		out = append(out, ip)
+	}
+	return out
+}
+
+// NewClient returns a client for the coordinator at coordinator with certificate fingerprint pin.
+func NewClient(coordinator, pin string) *Client {
+	c := &Client{url: strings.TrimRight(coordinator, "/")}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:               nil,
 		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err == nil {
+				if tcp, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+					if ip, ok := netip.AddrFromSlice(tcp.IP); ok {
+						c.remote.Store(ip.Unmap())
+					}
+				}
+			}
+			return conn, err
+		},
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true, // replaced by the pin check below
@@ -142,8 +195,9 @@ func NewClient(url, pin string) *Client {
 			},
 		},
 	}
-	return &Client{url: strings.TrimRight(url, "/"), http: &http.Client{Transport: transport, Timeout: 40 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	c.http = &http.Client{Transport: transport, Timeout: 40 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return c
 }
 
 func (c *Client) post(ctx context.Context, path, secret string, body, out any) error {
@@ -201,23 +255,17 @@ func (c *Client) Leave(secret string) error {
 }
 
 // LocalEndpoints lists addresses other nodes may reach this machine at: the configured public
-// endpoint first, then the machine's own IPv4 addresses (container and VPN interfaces excluded).
+// endpoint first (unless it is one only this machine can reach, such as a loopback address), then
+// the machine's own IPv4 addresses (container, VM and VPN interfaces excluded).
 func LocalEndpoints(configured string, port uint16, meshInterface string) []string {
 	out := []string{}
-	if configured != "" {
+	if configured != "" && meshproto.ReachableEndpoint(configured) {
 		out = append(out, configured)
 	}
 	interfaces, _ := net.Interfaces()
 	for _, iface := range interfaces {
 		name := iface.Name
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || name == meshInterface {
-			continue
-		}
-		skip := false
-		for _, prefix := range []string{"docker", "br-", "veth", "virbr", "cni", "flannel", "kube", "lxc", "tun", "wg", "tailscale", "zt", "glmesh", "glipsec"} {
-			skip = skip || strings.HasPrefix(name, prefix)
-		}
-		if skip {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || name == meshInterface || virtualInterface(name) {
 			continue
 		}
 		addrs, _ := iface.Addrs()
@@ -227,7 +275,8 @@ func LocalEndpoints(configured string, port uint16, meshInterface string) []stri
 				continue
 			}
 			e := net.JoinHostPort(ipnet.IP.String(), fmt.Sprint(port))
-			if len(out) < 16 && e != configured {
+			// Only what the coordinator accepts: it refuses a whole request for one endpoint.
+			if len(out) < 16 && e != configured && meshproto.ValidEndpoint(e) == nil {
 				out = append(out, e)
 			}
 		}
@@ -235,18 +284,44 @@ func LocalEndpoints(configured string, port uint16, meshInterface string) []stri
 	return out
 }
 
-// forwardingUsers names the software that may rely on IPv4 forwarding, judged by the interfaces
-// it creates. Docker, libvirt, LXD and the like turn forwarding on only when they start, so
-// turning it off under them cuts off their containers and VMs.
-func forwardingUsers(interfaces []string) []string {
-	known := []struct{ prefix, name string }{
-		{"docker", "Docker"}, {"br-", "Docker"}, {"podman", "Podman"}, {"cni", "Kubernetes"}, {"flannel", "Kubernetes"},
-		{"cali", "Kubernetes"}, {"cilium", "Kubernetes"}, {"kube", "Kubernetes"}, {"virbr", "libvirt"}, {"lxdbr", "LXD"},
-		{"lxcbr", "LXC"}, {"incusbr", "Incus"}, {"wg", "WireGuard"}, {"tun", "a VPN"}, {"glipsec", "IKEv2/IPsec"},
+// forwarders are the software that makes interfaces of its own and may rely on IPv4 forwarding,
+// by the name prefix of those interfaces. Docker, libvirt, LXD and the like turn forwarding on
+// only when they start, so turning it off under them cuts off their containers and VMs.
+var forwarders = []struct{ prefix, name string }{
+	{"docker", "Docker"}, {"br-", "Docker"}, {"podman", "Podman"}, {"cni", "Kubernetes"}, {"flannel", "Kubernetes"},
+	{"cali", "Kubernetes"}, {"cilium", "Kubernetes"}, {"kube", "Kubernetes"}, {"virbr", "libvirt"}, {"lxdbr", "LXD"},
+	{"lxcbr", "LXC"}, {"incusbr", "Incus"}, {"wg", "WireGuard"}, {"tun", "a VPN"}, {"glipsec", "IKEv2/IPsec"},
+}
+
+// otherVirtual are name prefixes of more interfaces of containers and VPNs, which do not use
+// forwarding themselves: container veth pairs, Cilium's lxc endpoints, Tailscale, ZeroTier and
+// this agent's own interface.
+var otherVirtual = []string{"veth", "lxc", "tailscale", "zt", "glmesh"}
+
+// virtualInterface reports an interface that belongs to a container, a VM or a VPN, by its name.
+// Its addresses are private to that network, not addresses other nodes can reach this machine at.
+// Every forwarder is in it: the two lists are not told apart, so a bridge cannot be one and not
+// the other (podman, lxdbr, incusbr, cali and cilium once were only in the list of forwarders).
+func virtualInterface(name string) bool {
+	for _, prefix := range otherVirtual {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
 	}
+	for _, k := range forwarders {
+		if strings.HasPrefix(name, k.prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardingUsers names the software that may rely on IPv4 forwarding, judged by the interfaces
+// it creates (see forwarders).
+func forwardingUsers(interfaces []string) []string {
 	var out []string
 	for _, name := range interfaces {
-		for _, k := range known {
+		for _, k := range forwarders {
 			if strings.HasPrefix(name, k.prefix) && !slices.Contains(out, k.name) {
 				out = append(out, k.name)
 			}

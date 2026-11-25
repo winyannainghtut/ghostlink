@@ -4,14 +4,15 @@ import { useEffect, useRef, useState } from 'react';
 import { BarChart, fillBuckets } from '@shared/BarChart';
 import { Bars } from '@shared/Bars';
 import { ago, bytes, dateTime, plural, speed } from '@shared/format';
-import { Button, Check, Field, Inner, Note, Segmented, Sheet, StatusDot, useUI } from '@shared/glass';
+import { Button, Check, Field, Inner, Loading, Note, Segmented, Sheet, Skeleton, StatusDot, Switch, useUI } from '@shared/glass';
+import { useBusy } from '@shared/hooks';
 import { AUTH, KEY_PROTOCOLS, PROTOCOLS, PROTOCOL_HINTS, protocolName, type Client, type Key, type ProtocolId, type Stats, type User } from '../api';
 import { hasConf, isApple, tunnelAddress, useKeyTools } from '../keys';
-import { dataLimitValue } from '../limits';
+import { clientForm, clientFormChanged, dataLimitValue, sameClientForm } from '../limits';
 import { firstKeyProtocol } from '../protocols';
 import { providerText } from '../provider';
 import { RulesEditor } from '../RulesEditor';
-import { SpeedLimitField, speedChange, speedChoice } from '../SpeedLimit';
+import { SpeedLimitField, speedChange } from '../SpeedLimit';
 import { clientStatus, statusLabel, useApi, useStore } from '../store';
 
 type Tab = 'keys' | 'usage' | 'rules' | 'settings';
@@ -71,6 +72,8 @@ function KeysTab({ user }: { user: User }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => void load(), [user.id, user.keys.length]);
 
+  // Which Apple profiles are downloaded so that the VPN connects by itself (per key, until the sheet closes).
+  const [onDemand, setOnDemand] = useState<Record<string, boolean>>({});
   const available = KEY_PROTOCOLS.filter(p => server.protocols[p]?.enabled);
   // New keys start on Shadowsocks, the one protocol a new server has on. While the protocol picked
   // is off, the form uses Shadowsocks, or else the first protocol that is on.
@@ -85,28 +88,44 @@ function KeysTab({ user }: { user: User }) {
     if (apple) setAuth(AUTH[protocol as 'ikev2' | 'ipsec'][0][0]);
   }, [protocol, apple]);
 
-  const create = async () => {
-    const request: Record<string, string> = { protocol };
-    if (apple) {
-      request.auth = auth;
-      if (address.trim()) request.server_address = address.trim();
-      if (localId.trim()) request.local_identifier = localId.trim();
-      if (remoteId.trim() && protocol === 'ikev2') request.remote_identifier = remoteId.trim();
-    }
-    try {
-      const key = await api<Key>('POST', `/users/${user.id}/keys`, request);
-      toast(key.warning || `${protocolName(protocol)} key created.`, key.warning ? 'info' : 'ok');
-      await load();
-      await reloadUsers();
-    } catch (error) {
-      toast((error as Error).message, 'bad');
-    }
-  };
+  // A double click on Create key made two keys: one request at a time.
+  const { busy, run } = useBusy();
+  const create = () =>
+    run(async () => {
+      const request: Record<string, string> = { protocol };
+      if (apple) {
+        request.auth = auth;
+        if (address.trim()) request.server_address = address.trim();
+        if (localId.trim()) request.local_identifier = localId.trim();
+        if (remoteId.trim() && protocol === 'ikev2') request.remote_identifier = remoteId.trim();
+      }
+      try {
+        const key = await api<Key>('POST', `/users/${user.id}/keys`, request);
+        toast(key.warning || `${protocolName(protocol)} key created.`, key.warning ? 'info' : 'ok');
+        await load();
+        await reloadUsers();
+      } catch (error) {
+        toast((error as Error).message, 'bad');
+      }
+    });
 
   return (
     <div className="grid gap-4">
       {keys === null ? (
-        <Note>Loading keys…</Note>
+        <Loading label="Loading keys" className="grid grid-cols-1 gap-2.5">
+          {[0, 1].map(i => (
+            <div key={i} className="inset-glass grid gap-3 rounded-[24px] px-4 py-3">
+              <div className="flex items-center gap-3">
+                <Skeleton className="size-9 shrink-0" />
+                <div className="grid flex-1 gap-2">
+                  <Skeleton className="h-3.5 w-1/3" />
+                  <Skeleton className="h-3 w-2/3" />
+                </div>
+              </div>
+              <Skeleton className="ml-auto h-8 w-3/5" />
+            </div>
+          ))}
+        </Loading>
       ) : !keys.length ? (
         <Inner>
           <Note>No keys yet. Create one below; Ghostlink generates it on the server.</Note>
@@ -139,11 +158,15 @@ function KeysTab({ user }: { user: User }) {
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   {isApple(key.protocol) ? (
                     <>
-                      <Button size="sm" icon={<FileDown size={14} />} onClick={() => tools.downloadProfile(user, key.id)}>
+                      <label className="mr-auto flex items-center gap-2 text-[12.5px] text-fg-2" title="The VPN turns itself on whenever the device is online. Remove the profile, or turn off Connect On Demand in the VPN settings of the device, to stop it.">
+                        <Switch checked={!!onDemand[key.id]} onChange={on => setOnDemand(all => ({ ...all, [key.id]: on }))} label="Connect automatically (On-Demand)" />
+                        Connect automatically
+                      </label>
+                      <Button size="sm" icon={<FileDown size={14} />} onClick={() => tools.downloadProfile(user, key.id, { onDemand: !!onDemand[key.id] })}>
                         Profile
                       </Button>
                       {key.auth === 'certificate' && (
-                        <Button size="sm" variant="ghost" onClick={() => tools.downloadProfile(user, key.id, true)}>
+                        <Button size="sm" variant="ghost" onClick={() => tools.downloadProfile(user, key.id, { askPassword: true, onDemand: !!onDemand[key.id] })}>
                           Without password
                         </Button>
                       )}
@@ -230,8 +253,8 @@ function KeysTab({ user }: { user: User }) {
           <Button variant="ghost" icon={<FileDown size={14} />} onClick={() => tools.downloadKit(user)}>
             Connection kit
           </Button>
-          <Button variant="cta" icon={<KeyRound size={14} />} onClick={create} disabled={!available.includes(protocol)}>
-            Create key
+          <Button variant="cta" icon={<KeyRound size={14} />} onClick={create} disabled={busy || !available.includes(protocol)}>
+            {busy ? 'Creating…' : 'Create key'}
           </Button>
         </div>
       </Inner>
@@ -245,17 +268,22 @@ function UsageTab({ user }: { user: User }) {
   const [range, setRange] = useState<'24h' | '7d' | '30d' | '90d'>('7d');
   const [stats, setStats] = useState<Stats | null>(null);
   const [clients, setClients] = useState<Client[]>([]);
+  // The numbers could not be fetched (the server stopped answering): say so instead of showing
+  // placeholders for ever.
+  const [failed, setFailed] = useState('');
   useEffect(() => {
     let current = true;
+    setFailed('');
     Promise.all([api<Stats>('GET', `/stats?range=${range}&user=${user.id}`), api<{ clients: Client[] }>('GET', `/clients?user=${user.id}`)])
-      .then(([s, c]) => current && (setStats(s), setClients(c.clients)))
-      .catch(() => {});
+      .then(([s, c]) => current && (setStats(s), setClients(c.clients ?? [])))
+      .catch(e => current && setFailed((e as Error).message));
     return () => {
       current = false;
     };
   }, [api, range, user.id]);
   return (
     <div className="grid grid-cols-1 gap-5">
+      {failed && <Note tone="bad">The usage could not be loaded: {failed}</Note>}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <Segmented
           size="sm"
@@ -299,7 +327,9 @@ function UsageTab({ user }: { user: User }) {
                   {providerText(c) && <span className="ml-2 text-[12px] text-fg-3">{providerText(c)}</span>}
                 </span>
                 <span className="shrink-0 text-fg-3">{protocolName(c.protocol)}</span>
-                <span className="num shrink-0 text-fg-2">{ago(c.last_unix)}</span>
+                <span className="num shrink-0 text-fg-2" title={c.first_unix ? `First seen ${dateTime(c.first_unix)}, last seen ${dateTime(c.last_unix)}` : undefined}>
+                  {ago(c.last_unix)}
+                </span>
               </li>
             ))}
           </ul>
@@ -332,57 +362,83 @@ function SettingsTab({ user, onRemoved }: { user: User; onRemoved: () => void })
   const { server, reloadUsers } = useStore();
   const { toast, confirm } = useUI();
   const { api } = useApi();
-  const [name, setName] = useState(user.name);
-  const [limit, setLimit] = useState(user.data_limit_bytes ? String(user.data_limit_bytes / 1e9) : '');
-  const [speedLimit, setSpeedLimit] = useState(speedChoice(user.speed_limit_bps));
-  const [exempt, setExempt] = useState(user.exempt_from_global_rules);
+  // The form holds what is typed. It follows the client as the server has it (the 15 s refresh, a
+  // save, another admin) while there is nothing typed, and keeps the edits when there is.
+  const saved = clientForm(user);
+  const [form, setForm] = useState(saved);
+  const synced = useRef(saved);
+  const savedText = JSON.stringify(saved);
+  useEffect(() => {
+    const before = synced.current;
+    synced.current = saved;
+    setForm(current => (sameClientForm(current, before) ? saved : current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedText]);
+  const { name, limit, speed: speedLimit, exempt } = form;
+  const edit = (change: Partial<typeof form>) => setForm(current => ({ ...current, ...change }));
   const limitField = useRef<HTMLInputElement>(null);
-  const save = async () => {
-    // Sent only when changed: servers before 0.8.0 refuse fields they don't know.
-    const bps = speedChange(speedLimit, user.speed_limit_bps ?? 0);
-    if (bps instanceof Error) {
-      toast(bps.message, 'bad');
-      return;
-    }
-    const dataLimit = dataLimitValue(limit, limitField.current?.validity.badInput);
-    if (dataLimit instanceof Error) {
-      toast(dataLimit.message, 'bad');
-      return;
-    }
-    const body: Record<string, unknown> = { name: name.trim(), data_limit_bytes: dataLimit, exempt_from_global_rules: exempt };
-    if (bps !== undefined) body.speed_limit_bps = bps;
-    try {
-      await api('PATCH', `/users/${user.id}`, body);
-      toast('Client saved.');
-      await reloadUsers();
-    } catch (error) {
-      toast((error as Error).message, 'bad');
-    }
-  };
+  const changed = clientFormChanged(form, user, limitField.current?.validity.badInput);
+  const { busy, run } = useBusy();
+  const save = () =>
+    run(async () => {
+      // Sent only when changed: servers before 0.8.0 refuse fields they don't know.
+      const bps = speedChange(speedLimit, user.speed_limit_bps ?? 0);
+      if (bps instanceof Error) {
+        toast(bps.message, 'bad');
+        return;
+      }
+      const dataLimit = dataLimitValue(limit, limitField.current?.validity.badInput);
+      if (dataLimit instanceof Error) {
+        toast(dataLimit.message, 'bad');
+        return;
+      }
+      const body: Record<string, unknown> = { name: name.trim(), data_limit_bytes: dataLimit, exempt_from_global_rules: exempt };
+      if (bps !== undefined) body.speed_limit_bps = bps;
+      try {
+        await api('PATCH', `/users/${user.id}`, body);
+        toast('Client saved.');
+        await reloadUsers();
+      } catch (error) {
+        toast((error as Error).message, 'bad');
+      }
+    });
   // Only the usage: edits not yet saved stay as they are, and cannot block the reset.
-  const resetUsage = async () => {
-    if (!(await confirm({ title: `Reset ${user.name}'s usage?`, text: `Data used goes back to zero${user.data_limit_bytes ? ', and a client stopped at its data limit can connect again' : ''}. This cannot be undone.`, action: 'Reset usage' }))) return;
-    try {
-      await api('PATCH', `/users/${user.id}`, { reset_usage: true });
-      toast('Usage reset to zero.');
-      await reloadUsers();
-    } catch (error) {
-      toast((error as Error).message, 'bad');
-    }
-  };
+  const resetUsage = () =>
+    run(async () => {
+      if (!(await confirm({ title: `Reset ${user.name}'s usage?`, text: `Data used goes back to zero${user.data_limit_bytes ? ', and a client stopped at its data limit can connect again' : ''}. This cannot be undone.`, action: 'Reset usage' }))) return;
+      try {
+        await api('PATCH', `/users/${user.id}`, { reset_usage: true });
+        toast('Usage reset to zero.');
+        await reloadUsers();
+      } catch (error) {
+        toast((error as Error).message, 'bad');
+      }
+    });
+  const remove = () =>
+    run(async () => {
+      if (!(await confirm({ title: `Remove ${user.name}?`, text: 'All their keys stop working immediately. This cannot be undone.', action: 'Remove client', danger: true }))) return;
+      try {
+        await api('DELETE', `/users/${user.id}`);
+        toast(`${user.name} removed.`);
+        onRemoved();
+        await reloadUsers();
+      } catch (error) {
+        toast((error as Error).message, 'bad');
+      }
+    });
   const address = tunnelAddress(user);
   return (
     <div className="grid gap-5">
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Name">
-          <input className="field" value={name} maxLength={64} onChange={e => setName(e.target.value)} />
+          <input className="field" value={name} maxLength={64} onChange={e => edit({ name: e.target.value })} />
         </Field>
         <Field label="Data limit" hint="GB, empty for no limit">
-          <input ref={limitField} className="field num" type="number" min="0" step="any" inputMode="decimal" value={limit} onChange={e => setLimit(e.target.value)} />
+          <input ref={limitField} className="field num" type="number" min="0" step="any" inputMode="decimal" value={limit} onChange={e => edit({ limit: e.target.value })} />
         </Field>
       </div>
-      <SpeedLimitField value={speedLimit} onChange={setSpeedLimit} defaultBps={server.default_speed_limit_bps ?? 0} />
-      <Check checked={exempt} onChange={setExempt}>
+      <SpeedLimitField value={speedLimit} onChange={next => edit({ speed: next })} defaultBps={server.default_speed_limit_bps ?? 0} />
+      <Check checked={exempt} onChange={on => edit({ exempt: on })}>
         Not affected by the rules for everyone
       </Check>
       <Inner className="grid gap-2 text-[13px]">
@@ -405,29 +461,15 @@ function SettingsTab({ user, onRemoved }: { user: User; onRemoved: () => void })
       </Inner>
       <div className="flex flex-wrap justify-between gap-2">
         <div className="flex gap-2">
-          <Button
-            variant="danger"
-            icon={<Trash2 size={14} />}
-            onClick={async () => {
-              if (!(await confirm({ title: `Remove ${user.name}?`, text: 'All their keys stop working immediately. This cannot be undone.', action: 'Remove client', danger: true }))) return;
-              try {
-                await api('DELETE', `/users/${user.id}`);
-                toast(`${user.name} removed.`);
-                onRemoved();
-                await reloadUsers();
-              } catch (error) {
-                toast((error as Error).message, 'bad');
-              }
-            }}
-          >
+          <Button variant="danger" icon={<Trash2 size={14} />} disabled={busy} onClick={remove}>
             Remove client
           </Button>
-          <Button variant="ghost" onClick={resetUsage}>
+          <Button variant="ghost" disabled={busy} onClick={resetUsage}>
             Reset usage
           </Button>
         </div>
-        <Button variant="cta" onClick={() => save()}>
-          Save
+        <Button variant="cta" disabled={busy || !changed} onClick={save}>
+          {busy ? 'Saving…' : 'Save'}
         </Button>
       </div>
     </div>

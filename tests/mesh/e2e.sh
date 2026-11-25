@@ -246,6 +246,21 @@ admin mesh remove nata
 wait_for 20 "a removed node's agent cleans up and stops" bash -c "! ip netns exec nata ip link show glmesh0 >/dev/null 2>&1 && [ ! -e '$work/nata/node.json' ]"
 wait_for 20 "peers drop the removed node" bash -c "! ip netns exec pub wg show glmesh0 allowed-ips | grep -q 100.96.0.3/32"
 
+step "A killed agent leaves its interface; the next agent of a disabled node takes it away"
+# kill -9 gives the agent no chance to clean up. The node is disabled before the next agent starts,
+# so that agent has nothing to apply, and must still remove what the one before it left behind.
+kill -9 "${agent[natb]}"
+wait_for 15 "the killed agent is gone" bash -c "! kill -0 ${agent[natb]} 2>/dev/null"
+in_ns natb ip link show glmesh0 >/dev/null 2>&1 || fail "glmesh0 should still be there after its agent was killed"
+admin mesh node natb --disable
+ip netns exec natb "$bin/ghostlink-mesh" serve --state "$work/natb" >"$work/natb-restarted.log" 2>&1 &
+pids+=($!)
+agent[natb]=$!
+natb_swept() { ! in_ns natb ip link show glmesh0 >/dev/null 2>&1 && ! in_ns natb iptables-save | grep GHOSTLINK-MESH >/dev/null; }
+wait_for 40 "the new agent of the disabled node removes the interface and the chains the killed one left" natb_swept
+admin mesh node natb --enable
+wait_for 60 "natb is back and reachable once it is enabled again" reaches pub "$(address natb)"
+
 step "An interface deleted under its agent comes back"
 in_ns pub ip link del glmesh0
 wait_for 45 "pub's agent creates its interface again" reaches relay "$(address pub)"
@@ -263,4 +278,13 @@ wait_for 15 "the stopped agent exits" bash -c "! kill -0 ${agent[pub]} 2>/dev/nu
 in_ns pub ip link show glmesh0 >/dev/null 2>&1 && fail "glmesh0 left behind"
 in_ns pub iptables-save | grep -q GHOSTLINK-MESH && fail "firewall chains left behind"
 grep -q "mesh" "/etc/netns/pub/hosts" && fail "/etc/hosts block left behind"
+
+step "Leaving while the agent runs stops the agent and leaves nothing behind"
+in_ns natb "$bin/ghostlink-mesh" leave --state "$work/natb"
+wait_for 30 "natb's agent exits once the node has left" bash -c "! kill -0 ${agent[natb]} 2>/dev/null"
+in_ns natb ip link show glmesh0 >/dev/null 2>&1 && fail "glmesh0 left behind after leave"
+in_ns natb iptables-save | grep GHOSTLINK-MESH >/dev/null && fail "firewall chains left behind after leave"
+[ ! -e "$work/natb/node.json" ] || fail "node.json left behind after leave"
+[ ! -e "$work/natb/status.json" ] || fail "status.json left behind after leave"
+grep -q "mesh" "/etc/netns/natb/hosts" && fail "/etc/hosts block left behind after leave"
 step "Mesh end-to-end passed"

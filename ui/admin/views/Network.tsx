@@ -2,7 +2,7 @@
 // everyone and the mesh of Linux servers.
 import { Pencil } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { Button, Card, CardTitle, Meter, Note, Switch, useUI } from '@shared/glass';
+import { Button, Card, CardTitle, Loading, Meter, Note, Skeleton, Switch, useUI } from '@shared/glass';
 import { APPLE, PROTOCOLS, PROTOCOL_HINTS, protocolName, type ProtocolId, type Rules, type Server } from '../api';
 import { turnedOn } from '../protocols';
 import { RulesEditor } from '../RulesEditor';
@@ -17,8 +17,11 @@ export function Network() {
   const { toast, confirm } = useUI();
   const { api } = useApi();
   const [rules, setRules] = useState<Rules | null>(null);
+  const [rulesError, setRulesError] = useState('');
   useEffect(() => {
-    api<Rules>('GET', '/rules').then(setRules).catch(() => {});
+    api<Rules>('GET', '/rules')
+      .then(setRules)
+      .catch(e => setRulesError((e as Error).message));
   }, []);
 
   // The message can depend on the server after the change (the port of a protocol turned on).
@@ -91,8 +94,20 @@ export function Network() {
                 toast('Rules for everyone saved.');
               }}
             />
+          ) : rulesError ? (
+            <Note tone="bad">The rules could not be loaded: {rulesError}</Note>
           ) : (
-            <Note>Loading…</Note>
+            <Loading label="Loading the rules" className="grid gap-4">
+              <div className="grid gap-4 md:grid-cols-3">
+                {[0, 1, 2].map(i => (
+                  <div key={i} className="grid gap-2">
+                    <Skeleton className="h-3.5 w-1/2" />
+                    <Skeleton className="h-[120px] w-full rounded-[18px]" />
+                  </div>
+                ))}
+              </div>
+              <Skeleton className="ml-auto h-10 w-32" />
+            </Loading>
           )}
         </Card>
       </div>

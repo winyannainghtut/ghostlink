@@ -9,7 +9,11 @@ import { useApi, useStore } from './store';
 
 const ORDER: ProtocolId[] = ['amneziawg', 'wireguard', 'vless', 'shadowsocks', 'ikev2', 'ipsec'];
 
-export function Island() {
+// tone: the dashboard's navigation bar shows it as the black capsule; a page header (the server's
+// workspace in the desktop app, which already sits under a bar with a black capsule of its own)
+// shows it frosted, in the text colours of the page, so the two are not twins.
+export function Island({ tone = 'solid' }: { tone?: 'solid' | 'glass' }) {
+  const glass = tone === 'glass';
   const { server, live, stale, setServer } = useStore();
   const { toast, confirm } = useUI();
   const { api } = useApi();
@@ -74,14 +78,17 @@ export function Island() {
   };
 
   return (
-    <div ref={box} className="relative">
+    <div ref={box} className="relative min-w-0">
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="flex h-10 items-center gap-2.5 rounded-full bg-black px-4 text-[12.5px] text-white shadow-[0_10px_30px_-12px_rgb(0_0_0/0.8),inset_0_1px_0_rgb(255_255_255/0.12)] transition-all duration-500 hover:px-5"
+        className={cx(
+          'flex h-10 min-w-0 max-w-full items-center gap-2.5 rounded-full px-4 text-[12.5px] transition-all duration-500 hover:px-5',
+          glass ? 'inset-glass text-fg hover:bg-glass-strong' : 'bg-black text-white shadow-[0_10px_30px_-12px_rgb(0_0_0/0.8),inset_0_1px_0_rgb(255_255_255/0.12)]',
+        )}
       >
-        <span className={cx('relative inline-flex size-2', stale || engineError ? 'text-[#ff6961]' : active ? 'text-[#30d158]' : 'text-white/40')}>
+        <span className={cx('relative inline-flex size-2 shrink-0', stale || engineError ? (glass ? 'text-bad' : 'text-[#ff6961]') : active ? (glass ? 'text-ok' : 'text-[#30d158]') : glass ? 'text-fg-3' : 'text-white/40')}>
           {active && !stale && !engineError && <span className="absolute inset-0 animate-ping rounded-full bg-current opacity-50 motion-reduce:animate-none" />}
           <span className="relative size-2 rounded-full bg-current" />
         </span>
@@ -92,9 +99,10 @@ export function Island() {
         ) : (
           <>
             <span className="font-medium">{active ? 'Live' : 'Paused'}</span>
-            <span className="text-white/45">·</span>
-            <span className="num text-white/80">{live ? `${live.online_users} online` : '—'}</span>
-            <LiveRates down={live?.down_bps ?? 0} up={live?.up_bps ?? 0} className="hidden text-white/55 sm:inline-flex" />
+            <span className={glass ? 'text-fg-3' : 'text-white/45'}>·</span>
+            <span className={cx('num truncate', glass ? 'text-fg-2' : 'text-white/80')}>{live ? `${live.online_users} online` : '—'}</span>
+            {/* The speeds show when the bar or header around the capsule has room for them. */}
+            <LiveRates down={live?.down_bps ?? 0} up={live?.up_bps ?? 0} className={cx('hidden @min-[820px]:inline-flex', glass ? 'text-fg-2' : 'text-white/55')} />
           </>
         )}
       </button>

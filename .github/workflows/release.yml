@@ -20,11 +20,11 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.11'
           cache-dependency-path: core/outline-worker/go.sum
@@ -49,10 +49,18 @@ jobs:
       - name: Installer and portable archive
         shell: pwsh
         run: ./scripts/build-windows.ps1 -Version '${{ steps.version.outputs.version }}'
+      # Windows Installer takes no pre-release in its version (candle: CNDL0108). The installer is
+      # built once more, from the same binaries, as for a pre-release tag, and what that made is
+      # deleted again: only the files of the release are uploaded.
+      - name: The installer also builds for a pre-release tag
+        shell: pwsh
+        run: |
+          ./scripts/build-windows.ps1 -SkipCompile -Version '0.0.1-rc.1'
+          Remove-Item -Path 'artifacts/windows-x64/*0.0.1-rc.1*' -Force
       - name: Worker corresponding source (GPL)
         shell: pwsh
         run: ./scripts/package-worker-source.ps1 -Version '${{ steps.version.outputs.version }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x64
           if-no-files-found: error
@@ -77,28 +85,35 @@ jobs:
       arch: arm64
 
   # The checks every push runs (Go tests and vet, the process suite, clippy and formatting, and
-  # the committed web UI builds), so a draft is only made from a commit that passes them.
+  # the committed web UI builds), and those of the mesh and of IKEv2/IPsec (which only run on
+  # a push that touches their files), so a draft is only made from a commit that passes them.
   desktop:
     uses: ./.github/workflows/desktop.yml
 
   ui:
     uses: ./.github/workflows/ui.yml
 
+  mesh:
+    uses: ./.github/workflows/mesh.yml
+
+  ipsec:
+    uses: ./.github/workflows/ipsec.yml
+
   publish:
     name: Draft GitHub release
     # Only a pushed tag makes or updates the draft; a manual run is a dry run, even on a tag.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [windows, linux-x64, desktop, ui]
+    needs: [windows, linux-x64, desktop, ui, mesh, ipsec]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-x64
           path: downloaded/windows-x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-x64
           path: downloaded/linux-x64
@@ -140,7 +155,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-arm64
           path: arm64

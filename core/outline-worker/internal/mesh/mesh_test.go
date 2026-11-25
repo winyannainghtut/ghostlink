@@ -212,7 +212,7 @@ func TestDirectAndRelayedPaths(t *testing.T) {
 	}
 	// Nodes behind the same public address use their private addresses.
 	f.sync(natB, "198.51.100.50")
-	if e := f.l.endpoint(natA, natB); e != "192.168.7.20:51820" {
+	if e := f.l.endpoint(netip.MustParsePrefix(f.n.CIDR), natA, natB); e != "192.168.7.20:51820" {
 		t.Fatalf("same-site endpoint: %s", e)
 	}
 }
@@ -251,6 +251,263 @@ func TestReturningNodeKeepsDirectLinks(t *testing.T) {
 	}
 	if p := peerNamed(f.config(a), "beta"); p == nil || !slices.Equal(p.AllowedIPs, []string{b.Address + "/32"}) {
 		t.Fatalf("alpha's peer beta: %+v", p)
+	}
+}
+
+// skewedReport records a sync from node whose own clock is off by skew (negative: behind the
+// coordinator's): the handshake times it reports are in that clock. handshakes are given as they
+// happened, by the coordinator's clock.
+func (f *fixture) skewedReport(node *Node, remote string, skew time.Duration, handshakes map[*Node]time.Time) {
+	f.t.Helper()
+	shifted := map[*Node]time.Time{}
+	for peer, at := range handshakes {
+		shifted[peer] = at.Add(skew)
+	}
+	f.report(node, remote, 1, shifted)
+}
+
+// skewFixture is a relay and two public nodes, alpha and beta, who can connect directly, with
+// reports every 5 seconds from all three. Alpha and beta's clocks are off by skew; the relay's is
+// right. Each handshake happens every 100 seconds while the link works.
+type skewFixture struct {
+	*fixture
+	relay, a, b *Node
+	skew        time.Duration
+	last        time.Time // the last handshake of the pair, by the coordinator's clock
+}
+
+func newSkewFixture(t *testing.T, skew time.Duration) *skewFixture {
+	f := newFixture(t)
+	s := &skewFixture{fixture: f, skew: skew, last: f.now}
+	s.relay = f.join("relay", InviteOptions{Relay: true}, "203.0.113.1:51820")
+	s.a = f.join("alpha", InviteOptions{}, "198.51.100.7:51820")
+	s.b = f.join("beta", InviteOptions{}, "198.51.100.8:51820")
+	return s
+}
+
+// step moves the clock on 5 seconds and has every node report. With working, the pair of nodes
+// handshakes every 100 seconds; without, it does not, and keeps reporting its last handshake.
+func (s *skewFixture) step(working bool) {
+	s.now = s.now.Add(5 * time.Second)
+	if working && s.now.Sub(s.last) >= 100*time.Second {
+		s.last = s.now
+	}
+	s.skewedReport(s.relay, "203.0.113.1", 0, map[*Node]time.Time{s.a: s.now.Add(-20 * time.Second), s.b: s.now.Add(-20 * time.Second)})
+	s.skewedReport(s.a, "198.51.100.7", s.skew, map[*Node]time.Time{s.relay: s.now.Add(-20 * time.Second), s.b: s.last})
+	s.skewedReport(s.b, "198.51.100.8", s.skew, map[*Node]time.Time{s.relay: s.now.Add(-20 * time.Second), s.a: s.last})
+	s.l.Tick(s.n, s.now)
+}
+
+// An address no other node can send to is not offered as a node's endpoint: not a loopback one, which
+// is the node's own machine, and not one inside the mesh, which would send the handshake into the
+// tunnel it is meant to set up. The next candidate is offered instead, or none. The node that
+// reported such an address is not refused for it, and the configurations of the other nodes are
+// built all the same.
+func TestEndpointsOtherNodesCannotSendToAreNotOffered(t *testing.T) {
+	mesh := netip.MustParsePrefix("100.96.0.0/16")
+	f := newFixture(t)
+	viewer := f.join("viewer", InviteOptions{}, "192.168.1.10:51820")
+	loopbackFirst := f.join("loopback-first", InviteOptions{}, "127.0.0.1:51820", "100.96.0.9:51820", "192.168.7.20:51820")
+	onlyUnusable := f.join("only-unusable", InviteOptions{}, "127.0.0.1:51820", "100.96.0.9:51820")
+	publicToo := f.join("public-too", InviteOptions{}, "127.0.0.1:51820", "100.96.0.10:51820", "203.0.113.40:51820")
+	// All behind one public address, so that private addresses are what is offered.
+	for _, node := range []*Node{viewer, loopbackFirst, onlyUnusable, publicToo} {
+		f.sync(node, "198.51.100.50")
+	}
+	for name, c := range map[string]struct {
+		target *Node
+		want   string
+	}{
+		"the next candidate after a loopback and an in-mesh address": {loopbackFirst, "192.168.7.20:51820"},
+		"the address the coordinator sees when none is left":         {onlyUnusable, "198.51.100.50:51820"},
+		"a public address after a loopback and an in-mesh one":       {publicToo, "203.0.113.40:51820"},
+	} {
+		if got := f.l.endpoint(mesh, viewer, c.target); got != c.want {
+			t.Errorf("%s: offered %q, want %q", name, got, c.want)
+		}
+	}
+
+	// Nodes on one private network, with no public address to share: the same.
+	lan := newFixture(t)
+	a := lan.join("a", InviteOptions{}, "10.0.0.5:51820")
+	b := lan.join("b", InviteOptions{}, "127.0.0.1:51820", "10.0.0.6:51820")
+	c := lan.join("c", InviteOptions{}, "127.0.0.1:51820", "100.96.0.9:51820")
+	for i, node := range []*Node{a, b, c} {
+		lan.sync(node, "10.0.0."+string(rune('5'+i)))
+	}
+	if got := lan.l.endpoint(mesh, a, b); got != "10.0.0.6:51820" {
+		t.Errorf("on one LAN, a loopback address first: offered %q, want 10.0.0.6:51820", got)
+	}
+	if got := lan.l.endpoint(mesh, a, c); got != "" {
+		t.Errorf("on one LAN, only addresses nobody can send to: offered %q, want none", got)
+	}
+
+	// The address the coordinator sees a node at is not offered either when it is inside the mesh.
+	seen := f.join("seen", InviteOptions{})
+	f.sync(seen, "198.51.100.200")
+	if got := f.l.endpoint(netip.MustParsePrefix("198.51.100.0/24"), viewer, seen); got != "" {
+		t.Errorf("an address inside the mesh network, seen by the coordinator: offered %q, want none", got)
+	}
+	if got := f.l.endpoint(mesh, viewer, seen); got != "198.51.100.200:51820" {
+		t.Errorf("the address the coordinator sees the node at: offered %q", got)
+	}
+
+	// A configuration is built for every node, whatever a node reported, and offers its peers the
+	// addresses that can be sent to.
+	config := f.config(viewer)
+	for name, want := range map[string]string{"loopback-first": "192.168.7.20:51820", "only-unusable": "198.51.100.50:51820", "public-too": "203.0.113.40:51820", "seen": "198.51.100.200:51820"} {
+		peer := peerNamed(config, name)
+		if peer == nil || peer.Endpoint != want {
+			t.Errorf("viewer's configuration, peer %s: %+v, want endpoint %q", name, peer, want)
+		}
+	}
+	if err := config.Validate(); err != nil {
+		t.Errorf("the configuration is refused: %v", err)
+	}
+	if config := f.config(onlyUnusable); len(config.Peers) != 4 {
+		t.Errorf("the node that reported addresses nobody can send to gets %d peers, want 4", len(config.Peers))
+	}
+	// On one private network, a peer that has nothing to offer has no endpoint, and its configuration
+	// is still built.
+	if config := lan.config(a); peerNamed(config, "c") == nil || peerNamed(config, "c").Endpoint != "" || peerNamed(config, "b").Endpoint != "10.0.0.6:51820" {
+		t.Errorf("LAN configuration of a: %+v", config.Peers)
+	}
+}
+
+// A node whose clock is minutes behind the coordinator's keeps its direct links: how old a handshake
+// is was worked out from the node's clock, so with a clock more than 3 minutes behind every
+// handshake looked stale, and the pair was sent through the relay for good.
+func TestDirectLinkSurvivesAClockThatIsBehind(t *testing.T) {
+	for _, skew := range []time.Duration{-10 * time.Minute, -4 * time.Minute, -time.Hour} {
+		s := newSkewFixture(t, skew)
+		// The first reports of a node whose clock is off cannot say how old its handshakes are; the
+		// pair may be sent through the relay until the first new handshake shows that it works.
+		for i := 0; i < 4*12; i++ {
+			s.step(true)
+		}
+		for i := 0; i < 20*12; i++ {
+			s.step(true)
+			if s.l.relayed(s.a, s.b) {
+				t.Fatalf("clock %v off: the pair was relayed %v after it started, although it handshakes every 100 s", skew, s.now.Sub(time.Unix(1_800_000_000, 0)))
+			}
+		}
+	}
+}
+
+// A direct link that stops working is sent through the relay when the clock of the nodes is minutes
+// ahead too: a handshake time in the future was taken to be new for as long as the clock was ahead,
+// so a broken link was never sent through the relay.
+func TestBrokenDirectLinkIsRelayedWhateverTheClock(t *testing.T) {
+	for _, skew := range []time.Duration{0, 10 * time.Minute, 5 * time.Hour, -10 * time.Minute} {
+		s := newSkewFixture(t, skew)
+		for i := 0; i < 6*12; i++ {
+			s.step(true)
+		}
+		for s.now != s.last { // on until a handshake has just happened
+			s.step(true)
+		}
+		if s.l.relayed(s.a, s.b) {
+			t.Fatalf("clock %v off: relayed while it worked", skew)
+		}
+		// The link breaks. For nearly 3 minutes more, the last handshake is recent enough.
+		broke := s.now
+		for s.now.Sub(broke) < 2*time.Minute {
+			s.step(false)
+		}
+		if s.l.relayed(s.a, s.b) {
+			t.Fatalf("clock %v off: relayed %v after the last handshake, before it can be known to be broken", skew, s.now.Sub(s.last))
+		}
+		for s.now.Sub(broke) < 6*time.Minute {
+			s.step(false)
+		}
+		if !s.l.relayed(s.a, s.b) {
+			t.Fatalf("clock %v off: still direct %v after the last handshake", skew, s.now.Sub(s.last))
+		}
+	}
+}
+
+// A pair on the relay goes back to direct when a handshake happens on the probe peers, whatever the
+// clock of the nodes says: with a clock behind, no handshake was ever later than the time the pair
+// went to the relay, and it never came back.
+func TestRelayedPairComesBackWhateverTheClock(t *testing.T) {
+	for _, skew := range []time.Duration{-10 * time.Minute, 10 * time.Minute, 0} {
+		s := newSkewFixture(t, skew)
+		for i := 0; i < 4*12; i++ {
+			s.step(true)
+		}
+		for i := 0; i < 8*12; i++ { // broken for long enough to be relayed
+			s.step(false)
+		}
+		if !s.l.relayed(s.a, s.b) {
+			t.Fatalf("clock %v off: the broken pair was not relayed", skew)
+		}
+		// Still broken: it stays on the relay.
+		for i := 0; i < 5*12; i++ {
+			s.step(false)
+			if !s.l.relayed(s.a, s.b) {
+				t.Fatalf("clock %v off: the pair left the relay without a new handshake", skew)
+			}
+		}
+		// The link works again: a handshake every 100 s, and the pair comes back within a few of them.
+		back := s.now
+		for i := 0; i < 5*12 && s.l.relayed(s.a, s.b); i++ {
+			s.step(true)
+		}
+		if s.l.relayed(s.a, s.b) {
+			t.Fatalf("clock %v off: the pair did not come back %v after the link worked again", skew, s.now.Sub(back))
+		}
+	}
+}
+
+// A handshake is dated by the coordinator's clock: a new one by the report that shows it, a known one
+// by the date it already had, and one seen for the first time by the node's clock, never as later
+// than now.
+func TestHandshakeSeenIsDatedByTheCoordinatorsClock(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	peer := func(handshake time.Time) meshproto.PeerStatus {
+		return meshproto.PeerStatus{PublicKey: "peer", LastHandshake: handshake.Unix()}
+	}
+	reportOf := func(p meshproto.PeerStatus, seen time.Time) *report {
+		return &report{peers: map[string]meshproto.PeerStatus{p.PublicKey: p}, handshakes: map[string]time.Time{p.PublicKey: seen}}
+	}
+	for name, c := range map[string]struct {
+		previous *report
+		reported time.Time // what the node says, by its own clock
+		want     time.Time
+	}{
+		"first time, a plausible time":     {nil, now.Add(-30 * time.Second), now.Add(-30 * time.Second)},
+		"first time, in the future":        {nil, now.Add(10 * time.Minute), now},
+		"first time, long ago":             {nil, now.Add(-10 * time.Minute), now.Add(-10 * time.Minute)},
+		"the peer was not in the report":   {&report{peers: map[string]meshproto.PeerStatus{}, handshakes: map[string]time.Time{}}, now.Add(-time.Minute), now.Add(-time.Minute)},
+		"the same handshake again":         {reportOf(peer(now.Add(-time.Hour)), now.Add(-90*time.Second)), now.Add(-time.Hour), now.Add(-90 * time.Second)},
+		"a new one, the clock far behind":  {reportOf(peer(now.Add(-time.Hour)), now.Add(-90*time.Second)), now.Add(-time.Hour + 100*time.Second), now},
+		"a new one, the clock far ahead":   {reportOf(peer(now.Add(time.Hour)), now.Add(-90*time.Second)), now.Add(time.Hour + 100*time.Second), now},
+		"one that went back (a new clock)": {reportOf(peer(now.Add(time.Hour)), now.Add(-90*time.Second)), now.Add(-time.Hour), now},
+		"the first one after none":         {&report{peers: map[string]meshproto.PeerStatus{"peer": {PublicKey: "peer"}}, handshakes: map[string]time.Time{}}, now.Add(-5 * time.Minute), now},
+	} {
+		if got := handshakeSeen(c.previous, peer(c.reported), now); !got.Equal(c.want) {
+			t.Errorf("%s: dated %v, want %v", name, got.Sub(now), c.want.Sub(now))
+		}
+	}
+}
+
+// A report of a node that is not in the network any more is not kept: one that arrived while the
+// node was removed would stay in memory for good.
+func TestReportOfARemovedNodeIsNotKept(t *testing.T) {
+	f := newFixture(t)
+	a := f.join("alpha", InviteOptions{})
+	b := f.join("beta", InviteOptions{})
+	f.sync(a, "203.0.113.1")
+	f.sync(b, "203.0.113.2")
+	if got := f.l.Nodes(); got != 2 {
+		t.Fatalf("%d nodes with a report, want 2", got)
+	}
+	f.n.Remove(b.ID)
+	f.sync(b, "203.0.113.2") // a sync that was being answered when the node was removed
+	f.now = f.now.Add(5 * time.Second)
+	f.l.Tick(f.n, f.now)
+	if got := f.l.Nodes(); got != 1 {
+		t.Fatalf("%d nodes with a report after the removal of one, want 1", got)
 	}
 }
 

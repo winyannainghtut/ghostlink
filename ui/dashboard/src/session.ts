@@ -42,8 +42,9 @@ export function loginToken(): string | null {
   return new URLSearchParams(location.hash.slice(1)).get('t');
 }
 
-export async function signIn(): Promise<{ server: Server | null; error: string }> {
-  const token = loginToken();
+// token: the one pasted into the sign-in card; without it the address's #t= is used.
+export async function signIn(pasted?: string | null): Promise<{ server: Server | null; error: string }> {
+  const token = pasted || loginToken();
   if (token) {
     history.replaceState(null, '', location.pathname);
     let response: Response;

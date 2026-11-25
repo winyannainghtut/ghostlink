@@ -131,7 +131,7 @@ sudo ghostlink-server rotate-key
 
 The old key stops working at once, and the new one is printed (and by `show-key`). Only the secret in the address changes: the certificate, and so the pin, stay the same. Users, keys and rules are untouched, and connected clients are not disconnected, because the VPN engine is not restarted.
 
-Then update every place the old key was saved. In the Ghostlink app, forget the server under **Servers I run** (on its card, or **Forget this server** on its page) and add it again with the new key; or run `ghostlink server add --name NAME --key-file FILE --replace`. The dashboard login link is a separate secret (`sudo ghostlink-server dashboard --reset-token`). Through the API, `POST /server/rotate-key` with the old key answers with the new one.
+Then update every place the old key was saved. In the Ghostlink app, the server's card says *Not answering* once the old key stops working: choose **Update key** on the card (or on the server's page), paste the new key, and the server keeps its name; or run `ghostlink server add --name NAME --key-file FILE --replace`. The dashboard login link is a separate secret (`sudo ghostlink-server dashboard --reset-token`). Through the API, `POST /server/rotate-key` with the old key answers with the new one.
 
 Where the management port can be closed to everyone but your own address in the firewall, do that too: the key is only useful to someone who can reach the port.
 
@@ -252,6 +252,7 @@ The profile is **unsigned**, so iOS shows it as "Unverified". That is expected: 
   - writes strongSwan's configuration and its own iptables chains (`GHOSTLINK-IPSEC-*`), with one jump from each built-in chain; speed limits are rules in `GHOSTLINK-IPSEC-LIM`, rendered again whenever a capped user's session starts or ends;
   - creates a dummy interface `glipsec0` for the pool gateways;
   - reports sessions in `status.json`.
+- **After a firewall reload:** a reload (`firewall-cmd --reload`, `ufw reload`, netfilter-persistent) or `iptables -F` removes the component's jumps and usually the rules in its chains. Every 30 s the component checks that its jumps and chains are there; if anything is missing it applies the whole rule set again, so isolation, NAT and the DNS redirect are back within about 35 s. A repair that fails shows as an error in `ipsec status`. A chain flushed on purpose while its jump stays is not noticed.
 - **Stopping and pools:** stopping it (`ipsec disable`, an upgrade or removal) removes its chains and interface. Address pools are `10.79.0.0/20` (IKEv2) and `10.80.0.0/20` (IPsec).
 - **What `ipsec enable` changes on the host:**
   - writes `/etc/sysctl.d/90-ghostlink-ipsec.conf` (`net.ipv4.ip_forward = 1`), which `disable` and package removal delete;
@@ -316,7 +317,7 @@ sudo ghostlink-server asn update    # download it again now
 sudo ghostlink-server asn off       # off, and the list is deleted
 ```
 
-In the app and the dashboard it is a checkbox under **Server settings → Monitoring**. In the Windows CLI: `ghostlink server set --server NAME --asn-lookup on|off` and `ghostlink server asn-update --server NAME`.
+In the app and the dashboard it is a checkbox under **Server settings → Monitoring**, where **Update the list now** downloads it again and the screen follows the download. In the Windows CLI: `ghostlink server set --server NAME --asn-lookup on|off` and `ghostlink server asn-update --server NAME`.
 
 - **What is downloaded:** the combined IPv4 and IPv6 list of [iptoasn.com](https://iptoasn.com) (about 11 MB, 579,000 address ranges when this was written), which its maker releases to the public domain (PDDL 1.0). It comes from that one address over HTTPS, is checked before it is used (a list that is cut off, too large or not in the format is refused and the old one kept), and is downloaded again every 30 days. If a download fails, the server tries again after 6 hours and keeps using the list it has.
 - **What is sent:** only the download request. iptoasn.com sees that your server fetched the list, like any website sees a visitor. No address of a client, and nothing about a client, is sent to anyone: the lookup is a search in memory (about 17 MB, and about 40 MB at most for the half second the list takes to load).
@@ -385,7 +386,7 @@ Open the ports of the services you use in the host firewall and any cloud securi
 ## Upgrade and remove
 
 - **Upgrade:** install the newer package. It loads the new images and recreates the containers, including the IPsec component if it was enabled. Users, keys, rules, the management key and which protocols are on are kept: an existing server that has all four on keeps them on (to match a new server, turn off what you do not use with `sudo ghostlink-server set --disable amneziawg --disable wireguard --disable vless`; keys for a protocol that is off stop working).
-- **Remove:** `sudo apt remove ghostlink-server` stops and removes the container and image, and keeps `/var/lib/ghostlink-server`.
+- **Remove:** `sudo apt remove ghostlink-server` stops and removes the container and image, and keeps `/var/lib/ghostlink-server`. If Docker is stopped it is started first (through systemd, waiting up to 30 s), because a container left behind would restart with Docker after its state and account are gone; that also starts the other containers on the host that Docker restarts on its own. If Docker cannot be started, the command says which containers remain and how to remove them.
 - **Purge:** `sudo apt purge ghostlink-server` also deletes the state and the system account. On RPM systems, removal keeps the state; delete `/var/lib/ghostlink-server` yourself if you want it gone.
 
 ## How it is built
@@ -442,7 +443,7 @@ All paths are under the secret prefix from the management key, over TLS 1.3. Req
 | `GET /dashboard` | Dashboard port, mode and login token |
 | `POST /server/rotate-key` | Replace the management key; the answer is `{"management_key": {"apiUrl": …, "certSha256": …}}`, and the key used for the request stops working |
 | `POST /asn/update` | Download the provider list again (the lookup must be on); answers `202` with the lookup's state, which shows `updating` until it is done |
-| `GET` / `PATCH /mesh` | Mesh settings (`enabled`, `cidr` before the first node, `name`, `ping`), counts and open invites |
+| `GET` / `PATCH /mesh` | Mesh settings (`enabled`, `cidr` before the first node, `name`, `ping`), counts and open invites. `cidr` on its own chooses the network and leaves a mesh that does not exist yet turned off; only `enabled: true` turns it on |
 | `POST` / `GET /mesh/invites`, `DELETE /mesh/invites/{id}` | Invites: `tags`, `uses`, `expires_hours`, `relay`, `approval`, `note`; creating one returns `invite` and the join `command` once |
 | `PATCH` / `DELETE /mesh/nodes/{id}` | A node: `name`, `tags`, `status` (`active`/`disabled`), `relay`, `approved_routes`, `masquerade`; or remove it |
 | `GET` / `PUT /mesh/rules` | Access rules: `{"rules":[{"from":"tag:web","to":"tag:db","protocol":"tcp","ports":["5432"]}]}` |

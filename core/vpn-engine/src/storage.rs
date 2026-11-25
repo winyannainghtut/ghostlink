@@ -1,9 +1,6 @@
 use anyhow::{ensure, Context, Result};
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::Path,
-};
+use ghostlink_contracts::private;
+use std::{fs, io::Write, path::Path};
 
 /// Remove temporary plaintext configuration on startup errors, cancellation and normal exit.
 pub struct PrivateConfig(std::path::PathBuf);
@@ -36,27 +33,45 @@ pub fn effective_uid() -> u32 {
 /// identity (another user on Unix; anyone but this user, SYSTEM or Administrators on Windows),
 /// or if its permissions (mode 0700) or private ACL cannot be set.
 pub fn private_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        ensure!(
-            !fs::symlink_metadata(path)?.file_type().is_symlink(),
-            "State directory must not be a symlink"
-        );
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            ensure!(
-                fs::symlink_metadata(path)?.file_attributes() & 0x400 == 0,
-                "State directory must not be a reparse point"
-            );
-            check_owner(path)?;
+    // `symlink_metadata`, not `exists`: `exists` follows a link, so a link whose target is missing
+    // looked like nothing at all and skipped every check below.
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Born private (mode 0700, or a protected ACL), not restricted a moment later. If
+            // another process made the name first, whatever it made is checked below like any
+            // directory that was already there.
+            match private::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Err(error) => return Err(error.into()),
     }
-    fs::create_dir_all(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        !meta.file_type().is_symlink(),
+        "State directory must not be a symlink"
+    );
+    ensure!(meta.is_dir(), "State directory is not a directory");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            meta.file_attributes() & 0x400 == 0,
+            "State directory must not be a reparse point"
+        );
+        check_owner(path)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         ensure!(
-            fs::metadata(path)?.uid() == effective_uid(),
+            meta.uid() == effective_uid(),
             "State directory has a different owner"
         );
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -120,20 +135,13 @@ fn check_owner(path: &Path) -> Result<()> {
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("pending");
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    // A stale temporary file never causes following a link or overwriting another file.
-    let mut file = options.open(&temporary).context(
+    // A stale temporary file never causes following a link or overwriting another file. The file
+    // is private from the moment it exists (mode 0600, or a protected ACL on Windows), not made
+    // private after the folder's inherited permissions applied to it.
+    let mut file = private::create_file(&temporary).context(
         "Cannot create private transaction file; inspect stale .pending files after a crash",
     )?;
     let result = (|| {
-        #[cfg(windows)]
-        restrict_acl(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -278,8 +286,9 @@ fn dpapi(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
     };
     // SAFETY: `input` points at `bytes`, which outlives the call; DPAPI only reads it (the
     // `*mut` is the C struct's type). On success DPAPI sets `output` to a LocalAlloc'd buffer of
-    // `cbData` bytes, which is copied out while allocated and then freed once; on failure it
-    // allocates nothing and the function returns before reading it.
+    // `cbData` bytes, which is copied out while allocated (a null or empty buffer is not turned
+    // into a slice at all) and then freed once; on failure it allocates nothing and the function
+    // returns before reading it.
     unsafe {
         let ok = if encrypt {
             CryptProtectData(
@@ -306,8 +315,16 @@ fn dpapi(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
             ok != 0,
             "Windows DPAPI failed; state must be read by the identity that created it"
         );
-        let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
-        LocalFree(output.pbData.cast());
+        // An empty result (unsealing empty content) may come with a null pointer, which a slice
+        // must never be made from, not even an empty one.
+        let result = if output.pbData.is_null() || output.cbData == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+        };
+        if !output.pbData.is_null() {
+            LocalFree(output.pbData.cast());
+        }
         Ok(result)
     }
 }
@@ -328,5 +345,86 @@ mod tests {
         );
         atomic_write(&path, b"replacement").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    }
+
+    /// Unsealing empty content gives empty content back (DPAPI may answer it with a null buffer,
+    /// which must not become a slice).
+    #[test]
+    fn empty_content_round_trips() {
+        assert_eq!(unseal(&seal(b"").unwrap()).unwrap(), b"");
+    }
+
+    /// A transaction file left by a crash is never followed or overwritten, and is not removed.
+    #[test]
+    fn a_stale_transaction_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(path.with_extension("pending"), b"stale").unwrap();
+        assert!(atomic_write(&path, b"new").is_err());
+        assert_eq!(fs::read(path.with_extension("pending")).unwrap(), b"stale");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_new_directory_is_made_with_its_parents_and_a_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("state");
+        private_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+        // Again, as at every start of the service.
+        private_dir(&nested).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(private_dir(&file).is_err());
+    }
+
+    /// A link whose target is missing does not "exist" to `Path::exists`, which used to skip every
+    /// check: it is a link all the same, and the state directory is never one.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_not_a_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        let link = dir.path().join("state");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = private_dir(&link).unwrap_err().to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!target.exists(), "the link was followed");
+    }
+
+    /// The same on Windows with a junction, which `cmd` can make without extra rights.
+    #[cfg(windows)]
+    #[test]
+    fn a_dangling_junction_is_not_a_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        let link = dir.path().join("state");
+        fs::create_dir(&target).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+        fs::remove_dir(&target).unwrap();
+        assert!(!link.exists(), "the junction should dangle");
+        // Rust calls a junction a symlink, or the reparse check refuses it: either is a refusal
+        // of the link as such, not the "already exists" that making a directory there gives.
+        let error = private_dir(&link).unwrap_err().to_string();
+        assert!(
+            error.contains("symlink") || error.contains("reparse point"),
+            "{error}"
+        );
+        assert!(!target.exists(), "the junction was followed");
+        fs::remove_dir(&link).unwrap();
     }
 }

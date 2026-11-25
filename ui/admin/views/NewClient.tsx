@@ -3,7 +3,9 @@
 // sheet shows the QR code, the .conf and the share options.
 import { Check as CheckIcon, Copy, FileDown, KeyRound, MonitorDown } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { Button, Field, Inner, Note, Sheet, cx, useUI } from '@shared/glass';
+import { Button, Check, Field, Inner, Note, Sheet, cx, useUI } from '@shared/glass';
+import { useBusy } from '@shared/hooks';
+import { step, type Done } from '@shared/steps';
 import { AUTH, KEY_PROTOCOLS, PROTOCOLS, PROTOCOL_HINTS, type Key, type ProtocolId, type User } from '../api';
 import { hasConf, isApple, qrFor, saveConf, saveKit, saveProfile } from '../keys';
 import { dataLimitValue } from '../limits';
@@ -15,7 +17,7 @@ type Created = { user: User; key: Key; qr?: string };
 
 export function NewClient({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { server, reloadUsers, reloadServer } = useStore();
-  const { toast } = useUI();
+  const { toast, copy } = useUI();
   // The server this sheet was opened for: both requests of a new client go to it (code review
   // 2026-11-09, F2), whatever the user opens meanwhile.
   const remote = useApi();
@@ -29,18 +31,28 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
   const [auth, setAuth] = useState('eap');
   const [limit, setLimit] = useState('');
   const [speedLimit, setSpeedLimit] = useState<SpeedChoice>({ mode: 'default', mb: '' });
-  const [busy, setBusy] = useState(false);
+  const { busy, run: exclusive } = useBusy();
   const [error, setError] = useState('');
   const [created, setCreated] = useState<Created | null>(null);
+  // An Apple profile that makes the VPN connect by itself.
+  const [onDemand, setOnDemand] = useState(false);
+  // The client and the key are two requests. When the key fails, the client exists: the steps that
+  // worked are kept, and the next try makes only the key (a second POST /users would fail, the
+  // name is taken). `partial` is that client, for the form to show.
+  const done = useRef<Done>(new Map());
+  const [partial, setPartial] = useState<User | null>(null);
   const limitField = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!open) return;
+    done.current = new Map();
+    setPartial(null);
     setName('');
     setLimit('');
     setSpeedLimit({ mode: 'default', mb: '' });
     setError('');
     setCreated(null);
+    setOnDemand(false);
     setPicked('shadowsocks');
     reloadServer().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -59,38 +71,51 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
   };
 
   // Enter in the form and the Create button follow the same rules.
-  const ready = !busy && !!name.trim() && available.includes(protocol);
+  const ready = !busy && (!!partial || !!name.trim()) && available.includes(protocol);
   const create = async () => {
     if (!ready) return;
-    const bps = speedValue(speedLimit);
-    if (bps instanceof Error) {
-      setError(bps.message);
-      return;
-    }
-    const dataLimit = dataLimitValue(limit, limitField.current?.validity.badInput);
-    if (dataLimit instanceof Error) {
-      setError(dataLimit.message);
-      return;
-    }
-    setBusy(true);
-    setError('');
-    let user: User | null = null;
-    try {
-      const body: Record<string, unknown> = { name: name.trim() };
+    // What the client is made with; once it exists these fields are locked and not read again.
+    let body: Record<string, unknown> = {};
+    if (!done.current.has('user')) {
+      const bps = speedValue(speedLimit);
+      if (bps instanceof Error) {
+        setError(bps.message);
+        return;
+      }
+      const dataLimit = dataLimitValue(limit, limitField.current?.validity.badInput);
+      if (dataLimit instanceof Error) {
+        setError(dataLimit.message);
+        return;
+      }
+      body = { name: name.trim() };
       if (dataLimit) body.data_limit_bytes = dataLimit;
       if (bps) body.speed_limit_bps = bps;
-      user = await api<User>('POST', '/users', body);
-      const key = await api<Key>('POST', `/users/${user.id}/keys`, isApple(protocol) ? { protocol, auth } : { protocol });
+    }
+    await exclusive(() => make(body));
+  };
+  const make = async (body: Record<string, unknown>) => {
+    setError('');
+    try {
+      const user = await step(done.current, 'user', () => api<User>('POST', '/users', body));
+      setPartial(user);
+      const key = await step(done.current, 'key', () => api<Key>('POST', `/users/${user.id}/keys`, isApple(protocol) ? { protocol, auth } : { protocol }));
+      // The key exists now: a QR code that cannot be drawn must not make the sheet say it does not.
       let qr: string | undefined;
-      if (!isApple(protocol)) qr = await qrFor(remote, user, key, key.config ? 'conf' : 'key');
+      if (!isApple(protocol)) {
+        try {
+          qr = await qrFor(remote, user, key, key.config ? 'conf' : 'key');
+        } catch (e) {
+          toast(`The QR code could not be made: ${(e as Error).message}`, 'info');
+        }
+      }
       setCreated({ user, key, qr });
       if (key.warning) toast(key.warning, 'info');
-      await Promise.all([reloadUsers(), reloadServer()]);
+      // The lists catch up with their next poll if this fails; the client and its key are made.
+      await Promise.all([reloadUsers(), reloadServer()]).catch(() => {});
     } catch (e) {
-      setError(user ? `${user.name} was created, but the key was not: ${(e as Error).message}` : (e as Error).message);
-      if (user) await reloadUsers();
-    } finally {
-      setBusy(false);
+      const user = done.current.get('user') as User | undefined;
+      setError(user ? `${user.name} was created, but its key was not: ${(e as Error).message} Fix that, or pick another protocol, and try again: the client is not created a second time.` : (e as Error).message);
+      if (user) reloadUsers().catch(() => {});
     }
   };
 
@@ -112,7 +137,9 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
           {created.qr ? (
             <img src={created.qr} alt={`QR code for ${user.name}`} className="w-full rounded-[24px] bg-white p-4" />
           ) : (
-            <Inner className="grid aspect-square place-items-center text-center text-[13px] text-fg-3">The iPhone, iPad or Mac installs this VPN from a profile instead of a QR code.</Inner>
+            <Inner className="grid aspect-square place-items-center text-center text-[13px] text-fg-3">
+              {isApple(key.protocol) ? 'The iPhone, iPad or Mac installs this VPN from a profile instead of a QR code.' : 'The QR code could not be made. Copy the key or download the file instead; the client and its key are saved.'}
+            </Inner>
           )}
           <div className="grid gap-3">
             {key.config && (
@@ -124,6 +151,11 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
             <p className="text-[13px] text-fg-2">
               {key.config ? 'Scan the code with the WireGuard or AmneziaWG app, or send the .conf file.' : isApple(key.protocol) ? 'Download the profile and send it privately (AirDrop, Mail or Files).' : 'Scan the code with the app, or copy the key.'}
             </p>
+            {isApple(key.protocol) && (
+              <Check checked={onDemand} onChange={setOnDemand}>
+                Connect automatically whenever the device is online
+              </Check>
+            )}
             <div className="flex flex-wrap gap-2">
               {hasConf(key.protocol) && key.config && (
                 <Button icon={<FileDown size={14} />} onClick={() => run(() => saveConf(remote, user, key))}>
@@ -134,12 +166,12 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
                 <Button
                   variant="cta"
                   icon={<FileDown size={14} />}
-                  onClick={() => run(() => saveProfile(remote, user, key))}
+                  onClick={() => run(() => saveProfile(remote, user, key, { onDemand }))}
                 >
                   Download profile
                 </Button>
               ) : (
-                <Button icon={<Copy size={14} />} onClick={() => navigator.clipboard.writeText(key.access_key).then(() => toast('Key copied.'))}>
+                <Button icon={<Copy size={14} />} onClick={() => copy(key.access_key, 'Key copied.')}>
                   Copy key
                 </Button>
               )}
@@ -164,14 +196,14 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
       open={open}
       onClose={onClose}
       title="New client"
-      subtitle="A person or device. Ghostlink issues its key, address and QR code."
+      subtitle={partial ? `${partial.name} is created. Only its key is missing.` : 'A person or device. Ghostlink issues its key, address and QR code.'}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
-            Cancel
+            {partial ? 'Close' : 'Cancel'}
           </Button>
           <Button variant="cta" icon={<KeyRound size={15} />} disabled={!ready} onClick={create}>
-            {busy ? 'Creating…' : 'Create client'}
+            {busy ? 'Creating…' : partial ? 'Create the key' : 'Create client'}
           </Button>
         </>
       }
@@ -183,9 +215,14 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
           create();
         }}
       >
+        {/* At the top: the form is taller than a small window, and a message below it is not seen. */}
+        {error && <Note tone="bad">{error}</Note>}
+        {/* The client exists after the first step: its name and limits are no longer the form's to change. */}
+        <fieldset disabled={!!partial} className="m-0 grid min-w-0 gap-5 border-0 p-0">
         <Field label="Name">
           <input className="field" data-autofocus maxLength={64} value={name} onChange={e => setName(e.target.value)} placeholder="For example Maya's phone" />
         </Field>
+        </fieldset>
         <div className="grid gap-2">
           <span className="text-[12.5px] font-medium text-fg-2">Protocol</span>
           <div className="grid gap-2 sm:grid-cols-2">
@@ -224,6 +261,7 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
             </select>
           </Field>
         )}
+        <fieldset disabled={!!partial} className="m-0 grid min-w-0 gap-5 border-0 p-0">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Data limit" hint="GB, optional">
             <input ref={limitField} className="field num" type="number" min="0" step="any" inputMode="decimal" value={limit} onChange={e => setLimit(e.target.value)} placeholder="No limit" />
@@ -238,10 +276,10 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
           </Inner>
         </div>
         <SpeedLimitField value={speedLimit} onChange={setSpeedLimit} defaultBps={server.default_speed_limit_bps ?? 0} />
+        </fieldset>
         <Note>
           {pool ? 'The next free address is assigned automatically and a new Curve25519 key pair is generated on the server.' : 'The key is generated on the server.'} You can add more keys for other protocols later.
         </Note>
-        {error && <Note tone="bad">{error}</Note>}
         <button type="submit" hidden />
       </form>
     </Sheet>

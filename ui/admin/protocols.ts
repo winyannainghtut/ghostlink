@@ -20,3 +20,13 @@ export function turnedOn(name: string, protocol: string, port: number): string {
   const transport = TRANSPORTS[protocol];
   return transport && port ? `${name} is on. Allow ${transport} ${port} ${allow}` : `${name} is on.`;
 }
+
+// An Apple profile (.mobileconfig) of an IKEv2/IPsec key: askPassword leaves the certificate's
+// password out (the device asks for it while installing); onDemand makes the VPN connect by itself
+// whenever the device is online.
+export type ProfileOptions = { askPassword?: boolean; onDemand?: boolean };
+
+export function profilePath(user: { id: string }, key: { id: string }, { askPassword, onDemand }: ProfileOptions = {}): string {
+  const query = [askPassword && 'prompt_password=1', onDemand && 'on_demand=1'].filter(Boolean).join('&');
+  return `/users/${user.id}/keys/${key.id}/profile${query ? '?' + query : ''}`;
+}

@@ -36,6 +36,12 @@ type API struct {
 	version string
 	mux     *http.ServeMux
 	limiter *failureLimiter
+	// rotation lets one rotation of the management key at a time through, from saving the new
+	// secret to having it in use and in the key file (see rotateKey).
+	rotation sync.Mutex
+	// afterRotationSave is set by tests: it runs between a rotation saving its secret and putting
+	// it in use.
+	afterRotationSave func()
 }
 
 var errNotFound = errors.New("not found")
@@ -260,6 +266,11 @@ func (a *API) secretNow() string {
 // is the new key, shown once more by `show-key`. The certificate is not touched, and nothing in
 // the engine changes, so connected clients are not disconnected.
 func (a *API) rotateKey(*http.Request) (int, any, error) {
+	// One rotation at a time, from saving the new secret to putting it in use. Two at once could
+	// save in one order and put in use in the other: the key that works would be the older one,
+	// while the state, the key file and the answer to the later caller hold the newer.
+	a.rotation.Lock()
+	defer a.rotation.Unlock()
 	var key ManagementKey
 	secret := base64.RawURLEncoding.EncodeToString(random(16))
 	err := a.service.Change(func(s *State) error {
@@ -273,6 +284,9 @@ func (a *API) rotateKey(*http.Request) (int, any, error) {
 	})
 	if err != nil {
 		return 0, nil, err
+	}
+	if a.afterRotationSave != nil {
+		a.afterRotationSave()
 	}
 	a.setSecret(secret)
 	a.service.store.Lock()
@@ -957,12 +971,11 @@ func (a *API) clients(r *http.Request) (int, any, error) {
 // asnUpdate downloads the provider list again, in the background: the answer is the state of the
 // lookup, which shows "updating" until the download is done.
 func (a *API) asnUpdate(*http.Request) (int, any, error) {
-	enabled := false
-	a.service.Read(func(s *State) { enabled = s.Monitor.ASNLookup })
-	if !enabled {
+	// The lookup being on is checked where the download begins, not before: it could be turned off
+	// in between.
+	if !a.service.RefreshASN(time.Now()) {
 		return 0, nil, InputError{errors.New("the provider lookup is off; turn it on first (sudo ghostlink-server asn on)")}
 	}
-	a.service.RefreshASN(time.Now())
 	status := a.service.asn.Status(true)
 	status.Updating = true
 	return http.StatusAccepted, status, nil

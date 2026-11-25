@@ -8,6 +8,7 @@ set -euo pipefail
 REPO=winyannainghtut/GHOSTLINK
 STATE=/var/lib/ghostlink-server
 work=""
+swap_partial="" # the swap file while it is being made, which cleanup takes away if the run ends first
 
 usage() {
     cat <<EOF
@@ -56,7 +57,13 @@ if [ -t 1 ]; then bold=$'\033[1m' red=$'\033[31m' yellow=$'\033[33m' reset=$'\03
 say() { printf '%s==> %s%s\n' "$bold" "$*" "$reset"; }
 warn() { printf '%swarning:%s %s\n' "$yellow" "$reset" "$*" >&2; }
 die() { printf '%serror:%s %s\n' "$red" "$reset" "$*" >&2; exit 1; }
-cleanup() { [ -z "$work" ] || rm -rf -- "$work"; }
+cleanup() {
+    [ -z "$work" ] || rm -rf -- "$work"
+    if [ -n "$swap_partial" ]; then
+        swapoff "$swap_partial" >/dev/null 2>&1 || true
+        rm -f -- "$swap_partial"
+    fi
+}
 trap cleanup EXIT
 
 main() {
@@ -155,6 +162,10 @@ main() {
     command -v jq >/dev/null 2>&1 || missing+=(jq)
     command -v sha256sum >/dev/null 2>&1 || missing+=(coreutils)
     [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] || missing+=(ca-certificates)
+    # The mesh check below makes a WireGuard link with ip; a minimal image may not have it.
+    if [ "$mesh" = 1 ] && ! command -v ip >/dev/null 2>&1; then
+        if [ "$family" = deb ]; then missing+=(iproute2); else missing+=(iproute); fi
+    fi
     if [ ${#missing[@]} -gt 0 ]; then
         say "Installing ${missing[*]}"
         pkg_install "$family" "${missing[@]}"
@@ -214,7 +225,7 @@ main() {
         installed=$(ghostlink-server version 2>/dev/null || true)
     fi
     # Finish an installation that was interrupted (for example killed for lack of memory).
-    if [ "$family" = deb ] && dpkg-query -W -f='${Status}' ghostlink-server 2>/dev/null | grep -qv 'install ok installed'; then
+    if [ "$family" = deb ] && package_interrupted; then
         say "Finishing an interrupted installation"
         dpkg --configure -a
     fi
@@ -251,7 +262,7 @@ main() {
 
     # --- running, with the requested address ---
     local current="" running
-    [ -f "$STATE/state.json" ] && current=$(jq -r '.hostname // empty' "$STATE/state.json" 2>/dev/null || true)
+    current=$(state_json | jq -r '.hostname // empty' 2>/dev/null || true)
     running=$(docker inspect --format '{{.State.Running}}' ghostlink-server 2>/dev/null || true)
     if [ "$running" != true ] || { [ -n "$hostname" ] && [ "$hostname" != "$current" ]; }; then
         say "Running setup${hostname:+ for $hostname}"
@@ -389,16 +400,40 @@ EOF
 EOF
 }
 
+# add_swap_file makes /swapfile, turns it on and keeps it across reboots. The file is created
+# here (exclusively, so it is never a symlink or somebody else's file), and a failure or an
+# interrupt anywhere before it is on takes it away again (cleanup), instead of leaving a half-made
+# file that the next run would refuse.
 add_swap_file() {
-    [ ! -e /swapfile ] || die "/swapfile already exists but is not enough; turn it on (swapon /swapfile) or make it larger, then run this again"
-    say "Adding a 1 GB swap file (/swapfile)"
-    if ! fallocate -l 1G /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+    if [ -e /swapfile ] || [ -L /swapfile ]; then
+        die "/swapfile already exists but is not enough; turn it on (swapon /swapfile) or make it larger, then run this again"
     fi
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    say "Adding a 1 GB swap file (/swapfile)"
+    (umask 077 && set -C && : > /swapfile) 2>/dev/null || die "could not create /swapfile"
+    swap_partial=/swapfile
+    # Btrfs wants copy-on-write off for a swap file, set while the file is still empty.
+    if [ "$(stat -f -c %T / 2>/dev/null || true)" = btrfs ]; then chattr +C /swapfile || true; fi
+    if ! fallocate -l 1G /swapfile 2>/dev/null; then
+        dd if=/dev/zero of=/swapfile bs=1M count=1024 2>/dev/null || die "could not write 1 GB to /swapfile (is the disk full?)"
+    fi
+    chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile || die "could not turn the swap file on"
+    swap_partial=""
+    if ! grep -q '^/swapfile ' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab || warn "the swap file is on but could not be added to /etc/fstab, so it is gone after a reboot"
+    fi
+}
+
+# state_json prints the server's state file. The container account owns it, so root opens it
+# without following a symlink in its place (dd opens with O_NOFOLLOW; a check before a read could not).
+state_json() { dd if="$STATE/state.json" iflag=nofollow,nonblock bs=65536 2>/dev/null; }
+
+# package_interrupted: dpkg left ghostlink-server unpacked or half configured (killed for lack of
+# memory, say). A package that was removed (config files kept) is not one.
+package_interrupted() {
+    case "$(dpkg-query -W -f='${Status}' ghostlink-server 2>/dev/null || true)" in
+        "install ok unpacked" | "install ok half-installed" | "install ok half-configured" | "install ok triggers-awaited" | "install ok triggers-pending") return 0 ;;
+    esac
+    return 1
 }
 
 download_verified() { # VERSION FILE: download a release file into $work and check it against SHA256SUMS.txt
@@ -452,11 +487,11 @@ newest_release() { # newest published (non-draft) release, pre-releases included
 }
 
 protocols_off() { # the protocols a new server leaves off (amneziawg, wireguard, vless) that are off here
-    jq -r '["amneziawg", "wireguard", "vless"][] as $p | select(.[$p].enabled | not) | $p' "$STATE/state.json"
+    state_json | jq -r '["amneziawg", "wireguard", "vless"][] as $p | select(.[$p].enabled | not) | $p'
 }
 
 server_ports() { # "PORT/PROTO  service" for everything clients connect to
-    jq -r '
+    state_json | jq -r '
         ["\(.api.port)/tcp  management API (Ghostlink app)"]
         + (if .shadowsocks.enabled then ["\(.shadowsocks.port)/tcp  Shadowsocks (Outline)", "\(.shadowsocks.port)/udp  Shadowsocks (Outline)"] else [] end)
         + (if .shadowsocks.enabled then [.users[]?.keys[]? | select(.protocol == "shadowsocks" and (.port // 0) > 0) | .port] | unique
@@ -467,21 +502,44 @@ server_ports() { # "PORT/PROTO  service" for everything clients connect to
         + (if (.dashboard.public // false) and ((.dashboard.port // 0) > 0) then ["\(.dashboard.port)/tcp  web dashboard (public)"] else [] end)
         + (if (.ipsec.ikev2_enabled // false) or (.ipsec.ipsec_enabled // false) then ["500/udp  IKEv2/IPsec", "4500/udp  IKEv2/IPsec"] else [] end)
         + (if (.mesh.enabled // false) and ((.mesh.port // 0) > 0) then ["\(.mesh.port)/tcp  mesh coordinator (for mesh agents)"] else [] end)
-        | .[]' "$STATE/state.json"
+        | .[]'
 }
 
+# open_ports allows the ports in an active ufw or firewalld. A firewall command that fails is a
+# warning with the command to run by hand, not the end of the installation: the server is installed
+# by now. firewalld gets each setting twice, permanent and live, and no reload: a reload would
+# flush the iptables rules that the mesh agent and the IPsec component put in just before. When
+# this server is a mesh node, its interface goes into firewalld's trusted zone, as install-mesh.sh
+# does (firewalld would otherwise refuse the mesh traffic that the agent's own chains accept).
 open_ports() { # "PORT/PROTO  service"...
-    local entry
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    local entry port iface
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
         say "Allowing the ports in ufw"
-        for entry in "$@"; do ufw allow "${entry%% *}" comment 'Ghostlink server' >/dev/null; done
+        for entry in "$@"; do
+            port=${entry%% *}
+            ufw allow "$port" comment 'Ghostlink server' >/dev/null || warn "could not allow $port in ufw; run: sudo ufw allow $port"
+        done
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         say "Allowing the ports in firewalld"
-        for entry in "$@"; do firewall-cmd --permanent --add-port="${entry%% *}" >/dev/null; done
-        firewall-cmd --reload >/dev/null
+        for entry in "$@"; do
+            port=${entry%% *}
+            if ! { firewall-cmd --permanent --add-port="$port" >/dev/null && firewall-cmd --add-port="$port" >/dev/null; }; then
+                warn "could not allow $port in firewalld; run: sudo firewall-cmd --permanent --add-port=$port && sudo firewall-cmd --add-port=$port"
+            fi
+        done
+        if [ -f /var/lib/ghostlink-mesh/node.json ]; then
+            iface=$(jq -r '.interface // "glmesh0"' /var/lib/ghostlink-mesh/node.json 2>/dev/null || echo glmesh0)
+            [[ "$iface" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || iface=glmesh0
+            if firewall-cmd --permanent --zone=trusted --change-interface="$iface" >/dev/null && firewall-cmd --zone=trusted --change-interface="$iface" >/dev/null; then
+                say "Put the mesh interface $iface in firewalld's trusted zone"
+            else
+                warn "could not put $iface in firewalld's trusted zone, which firewalld needs to pass mesh traffic; run: sudo firewall-cmd --permanent --zone=trusted --change-interface=$iface && sudo firewall-cmd --zone=trusted --change-interface=$iface"
+            fi
+        fi
     else
         say "No active ufw or firewalld here, so nothing to open on this server (check your cloud security group)"
     fi
 }
 
-main "$@"
+# Run the installer, unless the file is sourced to call one of its functions (the tests do).
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then main "$@"; fi

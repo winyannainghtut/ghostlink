@@ -2,9 +2,10 @@
 // the same views as the server dashboard) and Settings, under the glass navigation bar.
 import { KeyRound, Maximize2, Minimize2, Plus, Power } from 'lucide-react';
 import { useRef, useState } from 'react';
+import { AppBar } from '@shared/AppBar';
 import { Popover } from '@shared/Popover';
 import { WaveBackground } from '@shared/WaveBackground';
-import { FinishPicker, Mark, MotionButton, useAppearance } from '@shared/appearance';
+import { useAppearance } from '@shared/appearance';
 import { Button, IconButton, LiveRates, Segmented, StatusDot, UIProvider, cx } from '@shared/glass';
 import { useStoredState } from '@shared/hooks';
 import { useFullscreen } from './fullscreen';
@@ -37,59 +38,58 @@ function Shell() {
   const [view, setView] = useStoredState<View>('ghostlink-desktop-view', 'servers', VIEWS);
   const [addKey, setAddKey] = useState(0);
   const [addServer, setAddServer] = useState(0);
+  // A server's workspace has its own header with its own main action (New client): while one is
+  // open the bar does not offer Add server as a second one.
+  const [inWorkspace, setInWorkspace] = useState(false);
   const fullscreen = useFullscreen();
   return (
     <>
-      <header className="sticky top-0 z-30 px-3 pt-3 sm:px-5 sm:pt-4 2xl:px-8">
-        <nav className="glass mx-auto flex max-w-[2400px] flex-wrap items-center gap-x-4 gap-y-3 rounded-[28px] px-4 py-3 lg:flex-nowrap">
-          {/* The side slots are equal, so the middle stays centred, and as wide as the right-hand
-              buttons need (about 362 px), so they never reach into the middle. */}
-          <div className="flex min-w-0 items-center gap-3 lg:w-[368px]">
-            <Mark className="size-9 shrink-0" />
-            <div className="min-w-0 leading-tight">
-              <div className="text-[15px] font-semibold tracking-[-0.02em]">GHOSTLINK</div>
-              <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-fg-3">
-                <span className={cx('size-1.5 shrink-0 rounded-full', available ? 'bg-ok' : 'bg-bad')} />
-                <span className="truncate">{available ? `Local service · v${info?.version ?? VERSION}` : 'Service unavailable'}</span>
-              </div>
-            </div>
+      <AppBar
+        appearance={appearance}
+        subtitle={
+          <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-fg-3">
+            <span className={cx('size-1.5 shrink-0 rounded-full', available ? 'bg-ok' : 'bg-bad')} />
+            <span className="truncate">{available ? `Local service · v${info?.version ?? VERSION}` : 'Service unavailable'}</span>
           </div>
-          <div className="order-3 flex w-full flex-wrap items-center justify-center gap-3 lg:order-none lg:w-auto lg:flex-1">
-            <Segmented
-              label="Section"
-              value={view}
-              onChange={setView}
-              options={[
-                { value: 'servers', label: 'My servers' },
-                { value: 'manage', label: 'Servers I run' },
-                { value: 'settings', label: 'Settings' },
-              ]}
-            />
-            <ConnectionIsland />
-          </div>
-          <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5 lg:w-[368px] lg:flex-nowrap">
-            <MotionButton motion={appearance.motion} onChange={appearance.setMotion} />
-            <FinishPicker value={appearance.finish} onChange={appearance.setFinish} />
+        }
+        switcher={
+          <Segmented
+            label="Section"
+            value={view}
+            onChange={setView}
+            className="shrink-0"
+            options={[
+              { value: 'servers', label: 'My servers' },
+              { value: 'manage', label: 'Servers I run' },
+              { value: 'settings', label: 'Settings' },
+            ]}
+          />
+        }
+        status={<ConnectionIsland />}
+        actions={
+          <>
             {fullscreen.available && (
               <IconButton label={fullscreen.full ? 'Leave full screen (F11)' : 'Full screen (F11)'} onClick={fullscreen.toggle}>
                 {fullscreen.full ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
               </IconButton>
             )}
             {view === 'manage' ? (
-              <Button variant="cta" className="ml-1" icon={<Plus size={16} strokeWidth={2.4} />} onClick={() => setAddServer(n => n + 1)}>
-                Add server
-              </Button>
+              !inWorkspace && (
+                <Button variant="cta" className="ml-1" icon={<Plus size={16} strokeWidth={2.4} />} onClick={() => setAddServer(n => n + 1)}>
+                  Add server
+                </Button>
+              )
             ) : (
               <Button variant="cta" className="ml-1" icon={<KeyRound size={15} />} onClick={() => (setView('servers'), setAddKey(n => n + 1))}>
                 Add key
               </Button>
             )}
-          </div>
-        </nav>
-      </header>
+          </>
+        }
+      />
       <main className="mx-auto max-w-[2400px] px-3 pt-5 pb-24 sm:px-5 2xl:px-8">
         {view === 'servers' && <MyServers addKeySignal={addKey} onAddKeyShown={() => setAddKey(0)} />}
-        {view === 'manage' && <ServersIRun addServerSignal={addServer} onAddServerShown={() => setAddServer(0)} />}
+        {view === 'manage' && <ServersIRun addServerSignal={addServer} onAddServerShown={() => setAddServer(0)} onWorkspace={setInWorkspace} />}
         {view === 'settings' && <Settings appearance={appearance} />}
       </main>
     </>
@@ -121,18 +121,19 @@ function ConnectionIsland() {
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="flex h-10 items-center gap-2.5 rounded-full bg-black px-4 text-[12.5px] text-white shadow-[0_10px_30px_-12px_rgb(0_0_0/0.8),inset_0_1px_0_rgb(255_255_255/0.12)] transition-all duration-500 hover:px-5"
+        className="flex h-10 min-w-0 max-w-full items-center gap-2.5 rounded-full bg-black px-4 text-[12.5px] text-white shadow-[0_10px_30px_-12px_rgb(0_0_0/0.8),inset_0_1px_0_rgb(255_255_255/0.12)] transition-all duration-500 hover:px-5"
       >
-        <span className="relative inline-flex size-2">
+        <span className="relative inline-flex size-2 shrink-0">
           {c?.status === 'connected' && <span className="absolute inset-0 animate-ping rounded-full bg-[#30d158] opacity-50 motion-reduce:animate-none" />}
           <span className={cx('relative size-2 rounded-full', dot)} />
         </span>
         <span className="font-medium">{!available ? 'Service off' : c ? stateLabel[c.status] : '…'}</span>
         {c?.status === 'connected' && (
           <>
-            <span className="max-w-[140px] truncate text-white/70">{current?.display_name || current?.name}</span>
-            <span className="num text-white/80">{clock(c.connected_duration_seconds)}</span>
-            <LiveRates down={c.receive_bytes_per_second} up={c.send_bytes_per_second} className="hidden text-white/55 sm:inline-flex" />
+            {/* The name is what gives way when the bar is short of room; the speeds show only when it has plenty. */}
+            <span className="min-w-0 max-w-[140px] truncate text-white/70">{current?.display_name || current?.name}</span>
+            <span className="num shrink-0 text-white/80">{clock(c.connected_duration_seconds)}</span>
+            <LiveRates down={c.receive_bytes_per_second} up={c.send_bytes_per_second} className="hidden shrink-0 text-white/55 @min-[820px]:inline-flex" />
           </>
         )}
       </button>

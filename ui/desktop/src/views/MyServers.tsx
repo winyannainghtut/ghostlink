@@ -1,13 +1,15 @@
 // My servers: the connection, and the servers saved on this device (from access keys or
 // WireGuard/AmneziaWG files).
-import { Eye, EyeOff, FileUp, Info as InfoIcon, KeyRound, MoreHorizontal, Pencil, Power, Route, Search, Star, Trash2 } from 'lucide-react';
+import { Info as InfoIcon, KeyRound, MoreHorizontal, Pencil, Power, RefreshCw, Route, Search, Star, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { MenuItem, Popover } from '@shared/Popover';
 import { bytes, speed } from '@shared/format';
-import { Button, Card, Empty, Facts, Field, IconButton, Note, Sheet, StatusDot, cx, useUI } from '@shared/glass';
+import { initials } from '@shared/text';
+import { Button, Card, Empty, Facts, Field, IconButton, Sheet, StatusDot, cx, useUI } from '@shared/glass';
 import { failureText } from '../failures';
-import { KEY_PREFIXES, KINDS, KIND_DETAIL, isActive, request, slug, stateLabel, uniqueName, type ConnectionState, type Profile } from '../ipc';
+import { KINDS, KIND_DETAIL, isActive, stateLabel, type ConnectionState, type Profile } from '../ipc';
 import { useService } from '../service';
+import { AddKeySheet } from './AddKeySheet';
 import { SplitSheet } from './SplitSheet';
 
 function clock(seconds: number): string {
@@ -20,6 +22,7 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
   const { info, profiles, available, error, act, busy } = useService();
   const [query, setQuery] = useState('');
   const [adding, setAdding] = useState(false);
+  const [replacing, setReplacing] = useState<Profile | null>(null);
   const [details, setDetails] = useState<Profile | null>(null);
   const [renaming, setRenaming] = useState<Profile | null>(null);
   const [split, setSplit] = useState<Profile | null | undefined>(undefined);
@@ -65,12 +68,16 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
             <h1 className="text-[30px] leading-tight tracking-[-0.03em]">{headline}</h1>
             <p className="mt-1.5 max-w-xl text-[13.5px] text-fg-2">{caption}</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Stat label="Duration" value={c?.status === 'connected' ? clock(c.connected_duration_seconds) : '—'} />
-            <Stat label="Downloaded" value={c?.status === 'connected' ? bytes(c.bytes_received) : '—'} />
-            <Stat label="Uploaded" value={c?.status === 'connected' ? bytes(c.bytes_sent) : '—'} />
-            <Stat label="Live" value={c?.status === 'connected' ? `↓ ${speed(c.receive_bytes_per_second)}` : '—'} sub={c?.status === 'connected' ? `↑ ${speed(c.send_bytes_per_second)}` : undefined} />
-          </div>
+          {c?.status === 'connected' ? (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat label="Duration" value={clock(c.connected_duration_seconds)} />
+              <Stat label="Downloaded" value={bytes(c.bytes_received)} />
+              <Stat label="Uploaded" value={bytes(c.bytes_sent)} />
+              <Stat label="Live" value={`↓ ${speed(c.receive_bytes_per_second)}`} sub={`↑ ${speed(c.send_bytes_per_second)}`} />
+            </div>
+          ) : (
+            target && available && <TargetPill profile={target} />
+          )}
         </div>
         <button
           type="button"
@@ -90,13 +97,15 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
         </button>
       </Card>
 
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="inset-glass flex h-10 min-w-[220px] flex-1 items-center gap-2 rounded-full px-4 sm:max-w-sm">
-          <Search size={16} className="text-fg-3" />
-          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search servers" className="w-full bg-transparent text-[13.5px] outline-none placeholder:text-fg-3" aria-label="Search servers" />
-        </label>
-        <span className="num text-[12.5px] text-fg-3">{profiles.length} on this device</span>
-      </div>
+      {profiles.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="inset-glass flex h-10 min-w-[220px] flex-1 items-center gap-2 rounded-full px-4 sm:max-w-sm">
+            <Search size={16} className="text-fg-3" />
+            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search servers" className="w-full bg-transparent text-[13.5px] outline-none placeholder:text-fg-3" aria-label="Search servers" />
+          </label>
+          <span className="num text-[12.5px] text-fg-3">{query && shown.length !== profiles.length ? `${shown.length} of ${profiles.length}` : profiles.length} on this device</span>
+        </div>
+      )}
 
       {!profiles.length ? (
         <Card>
@@ -104,6 +113,15 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
             <p>Paste an access key from your server administrator: Outline, VLESS or Amnezia. Or import a WireGuard or AmneziaWG .conf file.</p>
             <Button variant="cta" className="mt-4" icon={<KeyRound size={15} />} onClick={() => setAdding(true)}>
               Add access key
+            </Button>
+          </Empty>
+        </Card>
+      ) : !shown.length ? (
+        <Card>
+          <Empty icon={<Search size={20} />} title="No matching servers">
+            <p>No server on this device matches “{query.trim()}”.</p>
+            <Button className="mt-4" onClick={() => setQuery('')}>
+              Clear search
             </Button>
           </Empty>
         </Card>
@@ -118,6 +136,7 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
               onToggle={() => toggle(p)}
               onDetails={() => setDetails(p)}
               onRename={() => setRenaming(p)}
+              onReplace={p.kind !== 'openvpn' ? () => setReplacing(p) : undefined}
               onDefault={() => act({ type: 'profile_default', name: p.name }, `${p.display_name || p.name} is the default server.`)}
               onSplit={p.kind !== 'openvpn' ? () => setSplit(p) : undefined}
               onRemove={async () => {
@@ -128,7 +147,14 @@ export function MyServers({ addKeySignal, onAddKeyShown }: { addKeySignal: numbe
         </div>
       )}
 
-      <AddKeySheet open={adding} onClose={() => setAdding(false)} />
+      <AddKeySheet
+        open={adding || replacing !== null}
+        replacing={replacing}
+        onClose={() => {
+          setAdding(false);
+          setReplacing(null);
+        }}
+      />
       <Sheet open={details !== null} onClose={() => setDetails(null)} title={details?.display_name || details?.name || ''} subtitle="Connection details" footer={<Button variant="cta" onClick={() => setDetails(null)}>Done</Button>}>
         {details && (
           <Facts
@@ -159,13 +185,34 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   );
 }
 
-function ServerCard({ profile, status, disabled, onToggle, onDetails, onRename, onDefault, onSplit, onRemove }: {
+// The server the big button connects to when nothing is connected: its name, kind, address and
+// whether it carries everything or only some traffic.
+function TargetPill({ profile }: { profile: Profile }) {
+  const remote = profile.remotes[0];
+  return (
+    <div className="inset-glass flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[20px] px-4 py-3">
+      <div className="grid size-9 shrink-0 place-items-center rounded-[12px] bg-glass-strong text-[12px] font-semibold text-fg-2">{initials(profile.display_name || profile.name)}</div>
+      <div className="min-w-0 flex-1 basis-40">
+        <div className="flex min-w-0 items-center gap-1.5 text-[14px] font-medium">
+          <span className="truncate">{profile.display_name || profile.name}</span>
+          {profile.is_default && <Star size={12} className="shrink-0 fill-current text-idle" aria-label="Default server" />}
+        </div>
+        <div className="mono truncate text-[12px] text-fg-3">{remote ? `${remote.host}:${remote.port}` : 'Fetched when connecting'}</div>
+      </div>
+      <span className="inset-glass rounded-full px-2.5 py-1 text-[11.5px] text-fg-2">{KINDS[profile.kind] ?? profile.kind}</span>
+      {profile.tunnel_mode === 'split' && <span className="inset-glass rounded-full px-2.5 py-1 text-[11.5px] text-fg-2">Split tunnel</span>}
+    </div>
+  );
+}
+
+function ServerCard({ profile, status, disabled, onToggle, onDetails, onRename, onReplace, onDefault, onSplit, onRemove }: {
   profile: Profile;
   status: ConnectionState;
   disabled: boolean;
   onToggle: () => void;
   onDetails: () => void;
   onRename: () => void;
+  onReplace?: () => void;
   onDefault: () => void;
   onSplit?: () => void;
   onRemove: () => void;
@@ -179,25 +226,33 @@ function ServerCard({ profile, status, disabled, onToggle, onDetails, onRename, 
   return (
     <Card as="article" className={cx('flex flex-col gap-4 sm:p-5!', status === 'connected' && 'border-ok/40')}>
       <div className="flex items-start gap-3">
-        <div className="grid size-11 shrink-0 place-items-center rounded-[16px] bg-glass-strong text-[13px] font-semibold text-fg-2">{title.slice(0, 2).toUpperCase()}</div>
-        <div className="min-w-0 flex-1">
+        {/* The avatar and the name open the connection details. */}
+        <button type="button" onClick={onDetails} aria-label={`Connection details of ${title}`} className="grid size-11 shrink-0 place-items-center rounded-[16px] bg-glass-strong text-[13px] font-semibold text-fg-2 transition hover:text-fg">
+          {initials(title)}
+        </button>
+        <button type="button" onClick={onDetails} aria-label={`Connection details of ${title}`} className="min-w-0 flex-1 text-left">
           {/* truncate works on a block, not on a flex container: the title is its own span. */}
           <h3 className="flex min-w-0 items-center gap-1.5 text-[16px]">
             <span className="truncate">{title}</span>
             {profile.is_default && <Star size={13} className="shrink-0 fill-current text-idle" aria-label="Default server" />}
           </h3>
           <div className="mono mt-0.5 truncate text-[12px] text-fg-3">{remote ? `${remote.host}:${remote.port}` : 'Fetched when connecting'}</div>
-        </div>
+        </button>
         <IconButton ref={anchor} label={`Options for ${title}`} aria-expanded={menu} onClick={() => setMenu(!menu)}>
           <MoreHorizontal size={18} />
         </IconButton>
-        <Popover anchor={anchor} open={menu} onClose={() => setMenu(false)} width={210}>
+        <Popover anchor={anchor} open={menu} onClose={() => setMenu(false)} width={210} role="menu" label={`Options for ${title}`}>
           <MenuItem icon={<InfoIcon size={15} />} onClick={pick(onDetails)}>
             Connection details
           </MenuItem>
           <MenuItem icon={<Pencil size={15} />} onClick={pick(onRename)}>
             Rename
           </MenuItem>
+          {onReplace && (
+            <MenuItem icon={<RefreshCw size={15} />} onClick={pick(onReplace)}>
+              Replace key
+            </MenuItem>
+          )}
           {!profile.is_default && (
             <MenuItem icon={<Star size={15} />} onClick={pick(onDefault)}>
               Make default
@@ -218,6 +273,7 @@ function ServerCard({ profile, status, disabled, onToggle, onDetails, onRename, 
           <StatusDot status={status === 'connected' ? 'online' : status === 'failed' ? 'limit' : on ? 'pending' : 'offline'} />
           {stateLabel[status]}
           <span className="inset-glass rounded-full px-2 py-0.5 text-[11px] text-fg-3">{KINDS[profile.kind] ?? profile.kind}</span>
+          {profile.tunnel_mode === 'split' && <span className="inset-glass rounded-full px-2 py-0.5 text-[11px] text-fg-3">Split</span>}
         </span>
         <Button size="sm" variant={on ? 'danger' : 'cta'} icon={<Power size={13} />} disabled={disabled || status === 'disconnecting'} onClick={onToggle}>
           {on ? 'Disconnect' : 'Connect'}
@@ -227,122 +283,8 @@ function ServerCard({ profile, status, disabled, onToggle, onDetails, onRename, 
   );
 }
 
-function AddKeySheet({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { profiles, refresh } = useService();
-  const { toast } = useUI();
-  const [name, setName] = useState('');
-  const [key, setKey] = useState('');
-  const [reveal, setReveal] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const file = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (!open) {
-      setKey('');
-      setReveal(false);
-    } else {
-      setName('');
-      setError('');
-    }
-  }, [open]);
-  const taken = profiles.map(p => p.name);
-  const finish = async (id: string, displayName: string) => {
-    if (displayName) await request({ type: 'profile_rename', name: id, display_name: displayName.slice(0, 80) });
-    await refresh();
-    toast(`${displayName || id} added.`);
-    onClose();
-  };
-  const add = async () => {
-    const source = key.trim();
-    if (!KEY_PREFIXES.some(p => source.startsWith(p))) {
-      setError('Paste a key beginning with ss://, ssconf://, vless:// or vpn://, or import a WireGuard file.');
-      return;
-    }
-    setBusy(true);
-    setError('');
-    const id = uniqueName(slug(name.trim() || 'server'), taken);
-    try {
-      await request({ type: 'access_key_import', name: id, access_key: source });
-      setKey('');
-      await finish(id, name.trim());
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  // WireGuard/AmneziaWG files are read here and sent straight to the service.
-  const importFile = async (f: File) => {
-    setError('');
-    if (f.size > 65536) {
-      setError('That file is too large to be a WireGuard configuration.');
-      return;
-    }
-    const displayName = name.trim() || f.name.replace(/\.(conf|txt)$/i, '');
-    const id = uniqueName(slug(displayName), taken);
-    try {
-      await request({ type: 'profile_import', name: id, content: await f.text() });
-      await finish(id, displayName);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
-  return (
-    <Sheet
-      open={open}
-      onClose={onClose}
-      title="Add access key"
-      subtitle="Paste the key shared by your server administrator: Outline, VLESS or Amnezia."
-      footer={
-        <>
-          <Button variant="ghost" icon={<FileUp size={15} />} onClick={() => file.current?.click()}>
-            Import a .conf file
-          </Button>
-          <Button variant="cta" disabled={busy || !key.trim()} onClick={add}>
-            {busy ? 'Adding…' : 'Add server'}
-          </Button>
-        </>
-      }
-    >
-      <form
-        className="grid gap-4"
-        onSubmit={e => {
-          e.preventDefault();
-          add();
-        }}
-      >
-        <Field label="Name on this device">
-          <input className="field" maxLength={80} value={name} onChange={e => setName(e.target.value)} placeholder="For example Singapore" autoComplete="off" data-autofocus />
-        </Field>
-        <Field label="Access key">
-          <div className="relative">
-            <input className="field mono pr-12" type={reveal ? 'text' : 'password'} value={key} onChange={e => setKey(e.target.value)} placeholder="ss://, ssconf://, vless:// or vpn://" autoComplete="off" spellCheck={false} />
-            <IconButton label={reveal ? 'Hide key' : 'Show key'} className="absolute top-0.5 right-1" onClick={() => setReveal(!reveal)}>
-              {reveal ? <EyeOff size={16} /> : <Eye size={16} />}
-            </IconButton>
-          </div>
-        </Field>
-        <Note>The key holds private credentials. Ghostlink keeps it in the local service and never puts it in logs or connection details.</Note>
-        {error && <Note tone="bad">{error}</Note>}
-        <input
-          ref={file}
-          type="file"
-          accept=".conf,.txt"
-          hidden
-          onChange={e => {
-            const f = e.target.files?.[0];
-            e.target.value = '';
-            if (f) importFile(f);
-          }}
-        />
-        <button type="submit" hidden />
-      </form>
-    </Sheet>
-  );
-}
-
 function RenameSheet({ profile, onClose }: { profile: Profile | null; onClose: () => void }) {
-  const { act } = useService();
+  const { act, busy } = useService();
   const [value, setValue] = useState('');
   useEffect(() => setValue(profile?.display_name || profile?.name || ''), [profile]);
   const save = async () => {
@@ -358,8 +300,8 @@ function RenameSheet({ profile, onClose }: { profile: Profile | null; onClose: (
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="cta" onClick={save}>
-            Save name
+          <Button variant="cta" disabled={busy || !value.trim()} onClick={save}>
+            {busy ? 'Saving…' : 'Save name'}
           </Button>
         </>
       }

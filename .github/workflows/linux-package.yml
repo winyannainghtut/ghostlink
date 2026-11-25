@@ -21,11 +21,11 @@ jobs:
     name: Linux ${{ inputs.arch }} (client and server packages)
     runs-on: ${{ inputs.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.11'
           cache-dependency-path: core/outline-worker/go.sum
@@ -172,6 +172,33 @@ jobs:
           test ! -e /etc/sysctl.d/90-ghostlink-ipsec.conf
           sudo rm /var/lib/ghostlink-server/ipsec
           sudo rmdir /tmp/not-ipsec
+          # An "ipsec enable" that fails after it turned forwarding on puts it back, and leaves no
+          # sysctl file: the image's file is moved away, so that loading the component's image fails.
+          forwarding=$(cat /proc/sys/net/ipv4/ip_forward)
+          sudo sysctl -w net.ipv4.ip_forward=0
+          sudo mv /usr/lib/ghostlink-server/ipsec-image.tar.gz /usr/lib/ghostlink-server/ipsec-image.tar.gz.away
+          if sudo ghostlink-server ipsec enable 2> failed-enable.txt; then echo "ipsec enable went through without its image" >&2; exit 1; fi
+          sudo mv /usr/lib/ghostlink-server/ipsec-image.tar.gz.away /usr/lib/ghostlink-server/ipsec-image.tar.gz
+          cat failed-enable.txt
+          grep -q 'could not load the bundled IPsec image' failed-enable.txt
+          test ! -e /etc/sysctl.d/90-ghostlink-ipsec.conf
+          test "$(cat /proc/sys/net/ipv4/ip_forward)" = 0
+          sudo sysctl -w net.ipv4.ip_forward="$forwarding"
+          # The state's files are the container account's too: root prints no file that a symlink in the
+          # place of one points at (the key's file is only rewritten when the key is replaced).
+          echo 'NOT-THE-KEY-7f3a9c' | sudo tee /tmp/not-the-key.txt > /dev/null
+          sudo mv /var/lib/ghostlink-server/management-key.json /var/lib/ghostlink-server/management-key.json.kept
+          sudo ln -sT /tmp/not-the-key.txt /var/lib/ghostlink-server/management-key.json
+          if sudo ghostlink-server show-key > linked-key.txt 2>&1; then echo "show-key followed a symlink" >&2; exit 1; fi
+          cat linked-key.txt
+          if grep -q 'NOT-THE-KEY' linked-key.txt; then echo "show-key printed the file a symlink points at" >&2; exit 1; fi
+          sudo rm /var/lib/ghostlink-server/management-key.json /tmp/not-the-key.txt
+          sudo mv /var/lib/ghostlink-server/management-key.json.kept /var/lib/ghostlink-server/management-key.json
+          sudo ghostlink-server show-key | grep '^{' > /dev/null
+          # The status summary reads the state the same way.
+          sudo ghostlink-server status | tee status.txt
+          grep -Eq 'management API: TCP [0-9]+' status.txt
+          grep -Eq 'Shadowsocks: TCP and UDP [0-9]+' status.txt
           # An upgrade (here: reinstall) keeps users and keys.
           sudo apt-get install -y --reinstall "./$deb"
           curl -sk --fail "$url/users" | jq -e 'length == 1 and (.[0].keys | length) == 4'
@@ -196,6 +223,15 @@ jobs:
           sudo ghostlink-server kit smoke --output kit.html
           sudo grep -q 'vless://' kit.html
           test "$(stat -c %a kit.html)" = 600
+          # A kit goes only into a new file: one that is there is never touched, and a command that
+          # fails leaves no file behind.
+          echo keep > existing-kit.html
+          if sudo ghostlink-server kit smoke --output existing-kit.html 2> exists.txt; then echo "kit overwrote a file" >&2; exit 1; fi
+          grep -q 'already exists' exists.txt
+          test "$(cat existing-kit.html)" = keep
+          if sudo ghostlink-server kit nobody-by-this-name --output missing-kit.html 2> unknown.txt; then echo "kit for an unknown user went through" >&2; exit 1; fi
+          cat unknown.txt
+          test ! -e missing-kit.html
           # rotate-key: the old key is refused at once, the new one (also in show-key) works with
           # the same certificate, and the users and the commands through the local API carry on.
           old=$url
@@ -284,7 +320,7 @@ jobs:
           # 1. "Add node": the command the app shows, with the local package instead of a download.
           invite=$(sudo ghostlink-server --json mesh invite --tags ci | tee invite.json | jq -r .invite)
           jq -e '.command | contains("install-mesh.sh") and contains("--join")' invite.json
-          cat scripts/install-mesh.sh | sudo bash -s -- --package "./$deb" --join "$invite" --name ci-node | tee join.txt
+          cat scripts/install-mesh.sh | sudo bash -s -- --package "./$deb" --join "$invite" --name ci-node --port 51822 | tee join.txt
           systemctl is-active ghostlink-mesh
           connected
           jq -e '.node.name == "ci-node" and (.node.address | startswith("100.96."))' agent.json
@@ -292,6 +328,10 @@ jobs:
           ip -brief address show glmesh0 | grep ' 100\.96\.' > /dev/null
           getent hosts ci-node.mesh | grep '^100\.96\.' > /dev/null
           sudo ghostlink-server --json mesh nodes | jq -e '[.nodes[] | select(.name == "ci-node" and .online and .tags == ["ci"])] | length == 1'
+          # Run again without --port: the node keeps the port it joined with, and the output names it.
+          cat scripts/install-mesh.sh | sudo bash -s -- --package "./$deb" | tee again.txt
+          grep -q 'allow UDP 51822 in its firewall' again.txt
+          connected
           # 2. Leaving removes the node from the coordinator and everything on the host.
           sudo systemctl stop ghostlink-mesh
           sudo ghostlink-mesh leave
@@ -321,11 +361,60 @@ jobs:
           rpm -qp --scripts artifacts/linux-$ARCH/ghostlink-mesh-*.rpm > mesh-scripts.txt
           grep -q 'posttrans scriptlet' mesh-scripts.txt
           grep -q 'ghostlink-mesh leave' mesh-scripts.txt
+      - name: Swap file of the installer (--add-swap, a real swapon, and a failed one taken away)
+        run: |
+          # The installer is sourced to call its function (it runs its main only when it is executed):
+          # --add-swap makes the file only on a server with under 900 MB, which a runner is not.
+          set -euo pipefail
+          # GitHub's runner images already have a /swapfile, which the installer rightly refuses to
+          # touch: this runner is thrown away after the job, so take that one away first (and its
+          # fstab line, so that the line checked below is the installer's own).
+          if [ -e /swapfile ]; then sudo swapoff /swapfile || true; sudo rm -f /swapfile; fi
+          sudo sed -i '\#^/swapfile #d' /etc/fstab
+          sudo bash -c '. scripts/install-server.sh; add_swap_file'
+          swapon --show=NAME | grep -x /swapfile > /dev/null
+          test "$(stat -c %a /swapfile)" = 600
+          test "$(stat -c %s /swapfile)" = 1073741824
+          grep -qx '/swapfile none swap sw 0 0' /etc/fstab
+          # A second one is refused, and the first stays.
+          if sudo bash -c '. scripts/install-server.sh; add_swap_file' 2> again.txt; then echo "a swap file was made over another" >&2; exit 1; fi
+          grep -q 'already exists' again.txt
+          swapon --show=NAME | grep -x /swapfile > /dev/null
+          sudo swapoff /swapfile
+          sudo rm /swapfile
+          sudo sed -i '\#^/swapfile #d' /etc/fstab
+          # A swap file that cannot be turned on is taken away again, and fstab does not list it.
+          sudo mkdir /tmp/failing-swapon
+          printf '#!/bin/sh\nexit 1\n' | sudo tee /tmp/failing-swapon/swapon > /dev/null
+          sudo chmod +x /tmp/failing-swapon/swapon
+          if sudo env PATH="/tmp/failing-swapon:$PATH" bash -c '. scripts/install-server.sh; add_swap_file' 2> failed.txt; then echo "a swap file that cannot be turned on went through" >&2; exit 1; fi
+          cat failed.txt
+          grep -q 'could not turn the swap file on' failed.txt
+          test ! -e /swapfile
+          if grep '^/swapfile ' /etc/fstab > /dev/null; then echo "a failed swap file was written to fstab" >&2; exit 1; fi
+          sudo rm -r /tmp/failing-swapon
       - name: Purge the server .deb
         run: |
           set -eu
           sudo apt-get purge -y ghostlink-server
           if docker ps -a --format '{{.Names}}' | grep -qx ghostlink-server; then echo "container left after purge" >&2; exit 1; fi
+          test ! -e /var/lib/ghostlink-server
+          if id ghostlink-server 2>/dev/null; then echo "the account is left after purge" >&2; exit 1; fi
+      - name: Purge the server .deb while Docker is stopped (Docker is started to remove the containers)
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -eu
+          deb=$(ls artifacts/linux-$ARCH/ghostlink-server_*.deb)
+          sudo GHOSTLINK_SERVER_HOSTNAME=127.0.0.1 apt-get install -y "./$deb" > /dev/null
+          docker ps --format '{{.Names}}' | grep -qx ghostlink-server
+          # The containers restart unless they were stopped: one left behind by a purge would start
+          # again with Docker, after the state and the account are gone.
+          sudo systemctl stop docker.socket docker.service
+          if docker info > /dev/null 2>&1; then echo "Docker did not stop" >&2; exit 1; fi
+          sudo apt-get purge -y ghostlink-server
+          docker info > /dev/null
+          if docker ps -a --format '{{.Names}}' | grep -Eqx 'ghostlink-(server|ipsec)'; then echo "a container was left after the purge" >&2; exit 1; fi
           test ! -e /var/lib/ghostlink-server
           if id ghostlink-server 2>/dev/null; then echo "the account is left after purge" >&2; exit 1; fi
       - name: Smoke-test the migration from Outline (installer --migrate-outline, rollback)
@@ -426,7 +515,7 @@ jobs:
         run: |
           bash scripts/ipsec-source.sh "$VERSION" "$ARCH" "artifacts/linux-$ARCH/ipsec-packages-$ARCH.txt"
           tar -tzf "artifacts/source/Ghostlink-$VERSION-ipsec-component-source-$ARCH.tar.gz" | grep -E '/strongswan/upstream/strongswan-.*\.tar\.bz2$'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ inputs.arch }}
           if-no-files-found: error

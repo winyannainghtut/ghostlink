@@ -2,7 +2,7 @@
 // (admin/protocols.ts). Run: node --experimental-strip-types --test tests/
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { firstKeyProtocol, turnedOn } from '../admin/protocols.ts';
+import { firstKeyProtocol, profilePath, turnedOn } from '../admin/protocols.ts';
 
 test('new clients and keys start with Shadowsocks whenever it is on', () => {
   // A new server: only Shadowsocks is on.
@@ -28,4 +28,13 @@ test('turning a protocol on names the port to allow', () => {
   // No port reported, or a protocol this version does not know: no port to name.
   assert.equal(turnedOn('WireGuard', 'wireguard', 0), 'WireGuard is on.');
   assert.equal(turnedOn('Hysteria', 'hysteria', 443), 'Hysteria is on.');
+});
+
+test('an Apple profile can ask for the password later and connect by itself', () => {
+  const user = { id: '3' }, key = { id: '12' };
+  assert.equal(profilePath(user, key), '/users/3/keys/12/profile');
+  assert.equal(profilePath(user, key, { askPassword: true }), '/users/3/keys/12/profile?prompt_password=1');
+  assert.equal(profilePath(user, key, { onDemand: true }), '/users/3/keys/12/profile?on_demand=1');
+  assert.equal(profilePath(user, key, { askPassword: true, onDemand: true }), '/users/3/keys/12/profile?prompt_password=1&on_demand=1');
+  assert.equal(profilePath(user, key, { askPassword: false, onDemand: false }), '/users/3/keys/12/profile');
 });

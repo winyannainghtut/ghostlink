@@ -117,7 +117,9 @@ func (d *device) setRoutes(routes []string, endpoints []netip.Addr) ([]string, e
 			}
 		}
 	}
-	// Every route in the main table that is not one of the agent's own.
+	// Every route in the main table that is not one of the agent's own. RouteListFiltered lists the
+	// main table only, unless RT_FILTER_TABLE is in the mask (routes of other tables are skipped
+	// before the mask is looked at), so the mask 0 here, and the one below, do not read other tables.
 	all, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{}, 0)
 	if err != nil {
 		return nil, err

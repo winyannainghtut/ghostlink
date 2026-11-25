@@ -1,6 +1,7 @@
 // A two-series area chart (download and upload) drawn at the element's real pixel size, with
 // monotone curves (no overshoot below zero) and a hover readout.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { axisGutter } from './chart';
 import { speed } from './format';
 
 export type RatePoint = { t: number; down: number; up: number };
@@ -40,6 +41,9 @@ export function AreaChart({ points, height = 220, timeLabel, empty }: {
   empty?: string;
 }) {
   const box = useRef<HTMLDivElement>(null);
+  // Two charts on a page (or the same one twice) must not share gradient ids: the second would paint
+  // with the first's. useId's text has characters a url(#…) reference is safer without.
+  const uid = useId().replace(/[^A-Za-z0-9_-]/g, '');
   const [width, setWidth] = useState(800);
   const [hover, setHover] = useState<number | null>(null);
   useEffect(() => {
@@ -50,16 +54,18 @@ export function AreaChart({ points, height = 220, timeLabel, empty }: {
     return () => observer.disconnect();
   }, []);
 
-  const left = 4, right = 4, top = 12, bottom = 26;
-  const plotW = width - left - right, plotH = height - top - bottom;
   const max = niceMax(Math.max(0, ...points.flatMap(p => [p.down, p.up])));
+  const ticks = [0.25, 0.5, 0.75, 1].map(f => f * max);
+  // The tick labels have a gutter of their own on the right: drawn inside the plot, they sat on the
+  // live edge of the curve.
+  const left = 4, right = axisGutter(ticks.map(speed)), top = 12, bottom = 26;
+  const plotW = width - left - right, plotH = height - top - bottom;
   const x = (i: number) => left + (points.length > 1 ? (i / (points.length - 1)) * plotW : plotW);
   const y = (v: number) => top + plotH - (Math.min(v, max) / max) * plotH;
   const series = (key: 'down' | 'up') => points.map((p, i) => [x(i), y(p[key])] as [number, number]);
   const line = (key: 'down' | 'up') => monotone(series(key));
   const area = (key: 'down' | 'up') => (points.length ? `${line(key)} L${x(points.length - 1).toFixed(1)},${top + plotH} L${x(0).toFixed(1)},${top + plotH} Z` : '');
   const quiet = points.every(p => p.down + p.up === 0);
-  const ticks = [0.25, 0.5, 0.75, 1].map(f => f * max);
   const at = hover !== null && points[hover] ? points[hover] : null;
 
   return (
@@ -80,11 +86,11 @@ export function AreaChart({ points, height = 220, timeLabel, empty }: {
         onPointerLeave={() => setHover(null)}
       >
         <defs>
-          <linearGradient id="fill-down" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={`${uid}-down`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0" className="stop-down" stopOpacity="0.32" />
             <stop offset="1" className="stop-down" stopOpacity="0" />
           </linearGradient>
-          <linearGradient id="fill-up" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={`${uid}-up`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0" className="stop-up" stopOpacity="0.26" />
             <stop offset="1" className="stop-up" stopOpacity="0" />
           </linearGradient>
@@ -92,7 +98,7 @@ export function AreaChart({ points, height = 220, timeLabel, empty }: {
         {ticks.map(v => (
           <g key={v}>
             <line className="gridline" x1={left} x2={width - right} y1={y(v)} y2={y(v)} strokeDasharray="2 4" />
-            <text className="axis-label" x={width - right} y={y(v) - 4} textAnchor="end">
+            <text className="axis-label" x={width - 4} y={y(v)} textAnchor="end" dominantBaseline="central">
               {speed(v)}
             </text>
           </g>
@@ -100,8 +106,8 @@ export function AreaChart({ points, height = 220, timeLabel, empty }: {
         <line className="gridline" x1={left} x2={width - right} y1={top + plotH} y2={top + plotH} />
         {points.length > 0 && (
           <>
-            <path className="area-down" d={area('down')} />
-            <path className="area-up" d={area('up')} />
+            <path d={area('down')} fill={`url(#${uid}-down)`} />
+            <path d={area('up')} fill={`url(#${uid}-up)`} />
             <path className="line-down" d={line('down')} />
             <path className="line-up" d={line('up')} />
             <text className="axis-label" x={left} y={height - 8}>

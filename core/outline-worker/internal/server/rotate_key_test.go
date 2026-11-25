@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // rotated is the answer of POST /server/rotate-key.
@@ -118,6 +121,90 @@ func TestRotateKeyWhileRequestsArrive(t *testing.T) {
 	}
 	close(stop)
 	<-done
+}
+
+// rotateNow runs one rotation of api, as its handler does, and returns the key it answers with.
+func rotateNow(t *testing.T, api *API) ManagementKey {
+	t.Helper()
+	status, body, err := api.rotateKey(nil)
+	if err != nil || status != http.StatusOK {
+		t.Errorf("rotation: %d %v", status, err)
+		return ManagementKey{}
+	}
+	return body.(map[string]any)["management_key"].(ManagementKey)
+}
+
+// keyInUse is the secret the API accepts, the one in the saved state and the one in the key file.
+func keyInUse(t *testing.T, server *testServer, api *API) (inUse, saved, filed string) {
+	t.Helper()
+	loaded, err := Load(server.store.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.ReadFile(filepath.Join(server.store.Dir(), ManagementKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api.secretNow(), loaded.State.API.Secret, secretOf(parseKey(t, file))
+}
+
+// Two rotations that overlap end with one key, the later one: the key that works is the one in the
+// saved state and in the key file, and it is the key the later caller was given. The first rotation
+// is held back after it saved its secret; before, the second one then ran to its end, and the first
+// put its older secret in use afterwards: the management key that worked was not the one anyone had
+// been given last, and not the one that survives a restart.
+func TestOverlappingRotationsEndWithOneKey(t *testing.T) {
+	server := newTestServer(t, nil)
+	api := NewAPI(server.service, "test")
+	var held atomic.Bool
+	saved, release := make(chan struct{}), make(chan struct{})
+	api.afterRotationSave = func() {
+		if held.CompareAndSwap(false, true) {
+			close(saved)
+			<-release
+		}
+	}
+	var first, second ManagementKey
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); first = rotateNow(t, api) }()
+	<-saved
+	wg.Add(1)
+	go func() { defer wg.Done(); second = rotateNow(t, api) }()
+	// The second rotation is started while the first is between saving and using its secret. It
+	// finishes first if it can; give it the time.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	inUse, savedSecret, filed := keyInUse(t, server, api)
+	if inUse != savedSecret || savedSecret != filed {
+		t.Fatalf("the key in use is %q, the saved state has %q and the key file %q", inUse, savedSecret, filed)
+	}
+	if secretOf(first) == secretOf(second) || inUse != secretOf(second) {
+		t.Fatalf("the key in use is %q; the first rotation answered %q and the second, the later one, %q", inUse, secretOf(first), secretOf(second))
+	}
+}
+
+// Many rotations at once leave the key in use, the saved state and the key file the same.
+func TestManyRotationsAtOnceAgree(t *testing.T) {
+	server := newTestServer(t, nil)
+	api := NewAPI(server.service, "test")
+	var wg sync.WaitGroup
+	for caller := 0; caller < 6; caller++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 8; i++ {
+				rotateNow(t, api)
+			}
+		}()
+	}
+	wg.Wait()
+	inUse, saved, filed := keyInUse(t, server, api)
+	if inUse != saved || saved != filed {
+		t.Fatalf("the key in use is %q, the saved state has %q and the key file %q", inUse, saved, filed)
+	}
 }
 
 // `ghostlink-server rotate-key`, on the server: it prints the new key and the old one in the key

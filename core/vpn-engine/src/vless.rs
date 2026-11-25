@@ -54,6 +54,24 @@ pub fn fingerprint(value: &str) -> String {
     }
 }
 
+/// Whether the text of a switch such as `allowInsecure=` says "off": nothing, `0` or `false` in
+/// any case. Every other text, whatever it is (`1`, `true`, `TRUE`, `yes`, `on`), asks for what is
+/// never allowed, so only a clear "off" is let through.
+fn flag_is_off(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "" | "0" | "false")
+}
+
+/// The same for a switch in a JSON document: absent, `null`, `false`, `0`, or text that is off.
+fn json_flag_is_off(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(on) => !on,
+        Value::String(text) => flag_is_off(text),
+        Value::Number(number) => number.as_u64() == Some(0),
+        _ => false,
+    }
+}
+
 fn host(value: &str) -> Result<String> {
     let value = value.trim_matches(['[', ']']);
     ensure!(
@@ -143,7 +161,13 @@ impl VlessKey {
             .and_then(|f| crate::outline::key_label(&percent_decode_str(f).decode_utf8_lossy()));
         let mut query = std::collections::BTreeMap::new();
         for (name, item) in url.query_pairs() {
-            query.insert(name.to_string(), item.to_string());
+            // The last value of a repeated parameter would win here, while another client reads
+            // the first: `security=none&security=reality`, `allowInsecure=1&allowInsecure=0`.
+            // Real clients never repeat one.
+            ensure!(
+                query.insert(name.to_string(), item.to_string()).is_none(),
+                "Repeated vless:// parameter {name}"
+            );
         }
         for (name, item) in &query {
             match name.as_str() {
@@ -152,10 +176,9 @@ impl VlessKey {
                 "headerType" => {
                     ensure!(item == "none", "VLESS header obfuscation is not supported")
                 }
-                "allowInsecure" | "insecure" => ensure!(
-                    item != "1" && item != "true",
-                    "Insecure TLS is never allowed"
-                ),
+                "allowInsecure" | "insecure" => {
+                    ensure!(flag_is_off(item), "Insecure TLS is never allowed")
+                }
                 other => bail!("Unsupported vless:// parameter {other}"),
             }
         }
@@ -196,8 +219,12 @@ impl VlessKey {
         } else {
             &stream["tlsSettings"]
         };
+        // Xray reads the names of its settings without regard to case.
         ensure!(
-            settings["allowInsecure"] != true,
+            settings.as_object().is_none_or(|fields| fields
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("allowInsecure"))
+                .all(|(_, value)| json_flag_is_off(value))),
             "Insecure TLS is never allowed"
         );
         let text = |v: &Value| v.as_str().unwrap_or("").to_string();
@@ -260,5 +287,77 @@ mod tests {
         let key = VlessKey::from_xray(&config, Some("Amnezia XRay".into())).unwrap();
         assert_eq!(key.server, "198.51.100.9");
         assert_eq!(key.server_name, "www.googletagmanager.com");
+    }
+
+    fn link(query: &str) -> String {
+        format!("vless://{ID}@203.0.113.7:443?{query}")
+    }
+
+    /// The link is read with the last value of a repeated parameter, but another client reads the
+    /// first. Real clients never repeat one, so a link that does is refused (code review
+    /// 2026-11-25, M3).
+    #[test]
+    fn repeated_parameters_are_refused() {
+        let reality = format!("security=reality&pbk={PBK}");
+        assert!(VlessKey::parse(&link(&reality)).is_ok());
+        for repeated in [
+            format!("{reality}&sni=a.example&sni=b.example"),
+            format!("security=none&{reality}"),
+            format!("{reality}&allowInsecure=1&allowInsecure=0"),
+            format!("{reality}&allowInsecure=0&allowInsecure=1"),
+            format!("{reality}&insecure=1&insecure=0"),
+            format!("{reality}&flow=xtls-rprx-vision&flow="),
+            // The same name once spelled with an escape.
+            format!("{reality}&fp=chrome&%66p=firefox"),
+        ] {
+            assert!(VlessKey::parse(&link(&repeated)).is_err(), "{repeated}");
+        }
+    }
+
+    /// Only a clear "off" lets the flag through: the old check refused "1" and "true" and let
+    /// every other spelling of yes pass unnoticed.
+    #[test]
+    fn insecure_tls_is_refused_in_every_spelling_of_yes() {
+        let reality = format!("security=reality&pbk={PBK}");
+        for flag in ["allowInsecure", "insecure"] {
+            for on in ["1", "true", "TRUE", "True", "yes", "on", "2", "enabled"] {
+                let text = link(&format!("{reality}&{flag}={on}"));
+                assert!(VlessKey::parse(&text).is_err(), "{flag}={on}");
+            }
+            for off in ["0", "false", "FALSE", "False", ""] {
+                let text = link(&format!("{reality}&{flag}={off}"));
+                assert!(VlessKey::parse(&text).is_ok(), "{flag}={off}");
+            }
+        }
+    }
+
+    #[test]
+    fn xray_configurations_refuse_insecure_tls_in_any_form() {
+        let outbound = |settings: serde_json::Value| serde_json::json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"198.51.100.9","port":443,"users":[{"id":ID,"encryption":"none"}]}]},"streamSettings":{"network":"raw","security":"tls","tlsSettings":settings}}]});
+        let key = |settings: serde_json::Value| VlessKey::from_xray(&outbound(settings), None);
+        assert!(key(serde_json::json!({"serverName":"a.example"})).is_ok());
+        for off in [
+            serde_json::json!(false),
+            serde_json::json!(null),
+            serde_json::json!("false"),
+            serde_json::json!("0"),
+            serde_json::json!(0),
+        ] {
+            let settings = serde_json::json!({"serverName":"a.example","allowInsecure":off});
+            assert!(key(settings).is_ok(), "{off}");
+        }
+        for on in [
+            serde_json::json!(true),
+            serde_json::json!("true"),
+            serde_json::json!("TRUE"),
+            serde_json::json!("1"),
+            serde_json::json!(1),
+            serde_json::json!("yes"),
+            serde_json::json!([true]),
+            serde_json::json!({}),
+        ] {
+            let settings = serde_json::json!({"serverName":"a.example","allowInsecure":on});
+            assert!(key(settings).is_err(), "{on}");
+        }
     }
 }

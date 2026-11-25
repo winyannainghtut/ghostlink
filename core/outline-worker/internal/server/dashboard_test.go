@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -176,6 +177,76 @@ func TestDashboardSignInAndProtections(t *testing.T) {
 	h.server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"dashboard_public": false}, nil)
 	if got := h.send(t, "GET", "/", nil, nil, false, "").StatusCode; got != 200 {
 		t.Fatalf("back to private: %d", got)
+	}
+}
+
+// A change saved after the dashboard was closed does not open its port again: this is what the last
+// accounting pass of a stopping server can do, when a client reaches its data limit.
+func TestDashboardApplyAfterCloseDoesNothing(t *testing.T) {
+	h := newDashboardHarness(t)
+	h.dashboard.mu.Lock()
+	port := h.dashboard.running.Port
+	h.dashboard.mu.Unlock()
+	if !listensOn(port) {
+		t.Fatal("the dashboard does not listen")
+	}
+	h.dashboard.Close()
+	if listensOn(port) {
+		t.Fatal("the dashboard still listens after Close")
+	}
+	// A change to the dashboard's settings runs Apply, as the server's hook does.
+	h.server.must(t, http.StatusOK, "PATCH", "/server", map[string]any{"reset_dashboard_token": true}, nil)
+	if err := h.dashboard.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if listensOn(port) {
+		t.Fatal("a change saved after Close opened the dashboard port again")
+	}
+}
+
+// Apply calls made at once act on the state in the order they get their turn, so the last one to
+// act has read the state last. The first call here has read the dashboard port that was saved first
+// and is held; a second saves a newer one and applies it; the first then goes on. Before, the first
+// one went on with what it had read and put the older port in place of the newer.
+func TestDashboardApplyActsOnTheStateAsItIsWhenItsTurnComes(t *testing.T) {
+	server := newTestServer(t, func(s *State) {
+		s.Dashboard = DashboardConfig{Port: freeTCPPort(t), Token: "test-token-1234567890"}
+	})
+	dashboard := NewDashboard(server.service, NewAPI(server.service, "test"))
+	t.Cleanup(dashboard.Close)
+	if err := dashboard.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	setPort := func(port uint16) {
+		if err := server.service.Change(func(s *State) error { s.Dashboard.Port = port; return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	older := server.unreservedPort(t)
+	setPort(older)
+	var held atomic.Bool
+	atHook, proceed := make(chan struct{}), make(chan struct{})
+	dashboard.afterRead = func() {
+		if held.CompareAndSwap(false, true) {
+			close(atHook)
+			<-proceed
+		}
+	}
+	done := make(chan error, 2)
+	go func() { done <- dashboard.Apply() }()
+	<-atHook // the first Apply has read the older port
+	newer := server.unreservedPort(t)
+	setPort(newer)
+	go func() { done <- dashboard.Apply() }()
+	time.Sleep(300 * time.Millisecond) // the second Apply is under way; the first one is held
+	close(proceed)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !listensOn(newer) || listensOn(older) {
+		t.Fatalf("the newer port %d listens: %v; the older port %d listens: %v", newer, listensOn(newer), older, listensOn(older))
 	}
 }
 

@@ -461,6 +461,46 @@ mod tests {
         }
     }
 
+    /// `route-ipv6` is skipped by the duplicate check but has no arm of its own in the directive
+    /// match, so every use of it, once or repeated, ends in the same refusal and nothing of it can
+    /// reach the canonical profile (code review 2026-11-25, M3).
+    #[test]
+    fn ipv6_routes_are_refused_before_duplicates_matter() {
+        for extra in [
+            "route-ipv6 2001:db8::/32\n",
+            "route-ipv6 2001:db8::/32\nroute-ipv6 2001:db8:1::/48\n",
+        ] {
+            let error = validate("t", &profile(extra, None)).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("forbidden or unsupported directive"),
+                "{extra}: {error}"
+            );
+        }
+    }
+
+    /// A cipher directive is a gate: weak ciphers are refused. What the canonical profile offers
+    /// does not follow what was written, it is always the three modern AEAD ciphers.
+    #[test]
+    fn cipher_directives_are_a_gate_for_the_fixed_modern_set() {
+        for weak in [
+            "cipher BF-CBC\n",
+            "cipher AES-256-CBC\n",
+            "data-ciphers AES-256-GCM:AES-128-CBC\n",
+        ] {
+            assert!(validate("t", &profile(weak, None)).is_err(), "{weak}");
+        }
+        for written in ["cipher AES-256-GCM\n", "data-ciphers CHACHA20-POLY1305\n"] {
+            let kept = validate("t", &profile(written, None)).unwrap();
+            assert!(
+                kept.canonical
+                    .contains("\ndata-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\n"),
+                "{written}"
+            );
+        }
+    }
+
     #[test]
     fn executable_directives_and_missing_certificates_fail() {
         for s in [

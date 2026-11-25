@@ -4,6 +4,79 @@ All notable changes to Ghostlink. Versions follow [semantic versioning](https://
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-26
+
+Fixes from two reviews of 0.9.0 (`docs/development/code-review-2026-11-25.md` and `docs/development/ui-ux-review-2026-11-25.md`). Each finding was checked against the code before anything was changed: a few were wrong or smaller than reported, and one fix a review suggested was not enough. A table at the end of each report says what became of every finding. A working server, tunnel or client behaves as before; the changes you can notice are listed under **Behaviour that changed**.
+
+### Fixed: the Windows service, the CLI and the app
+
+- **Files that hold secrets are private from the moment they exist.** Key and token files the CLI writes (`--output`), the exports the app saves in Downloads, and the service's data folder were created with inherited permissions and restricted a moment later. They are now created private (SYSTEM and your account on Windows, mode 0600 and 0700 elsewhere). `ghostlink agent grant` creates its token file before it issues the grant, so a path that cannot be written no longer leaves a grant behind.
+- **A failed network cleanup no longer blocks the service until it is restarted.** After a forced stop or a failed cleanup, Ghostlink refused every connect and disconnect, and only restarting the service helped. At each connect, switch and disconnect it now asks Windows whether the tunnel adapter and its addresses are gone, and carries on only if they are. If it cannot tell, the block stays. An OpenVPN that crashes after it set up its interface now sets the block too, like a forced stop.
+- **A second connect while one is active answers `busy` first**, before it unseals the profile or fetches a dynamic `ssconf://` key. A server call no longer waits for the service lock a second time just to write its audit line.
+- **A cancelled start leaves no stray tunnel worker,** and a stop during the worker's first request ends it at once (it took up to 2 s). The service checks that the worker still owns its local port before it sends the session secret.
+- **The health probe's name lookup always goes through the tunnel,** also in "only listed apps and sites" mode.
+- **WireGuard, AmneziaWG and VLESS keys are checked as strictly as the worker is.** Numbers such as `+4`, a stray carriage return in I1 to I5 and an IPv6 endpoint without brackets are refused at import; tabs around ranges are cleaned up. The DNS of an AmneziaWG key is always applied (it was dropped silently with Windows line endings or a lower-case `[interface]`). A VLESS link with a repeated parameter, or with an insecure flag that is not off, is refused.
+- **The installed Windows service no longer lets its user start a second server on the pipe's name.** The user can still connect and talk to the service as before. The service now serves the client in hand if it cannot make its next pipe instance at once, and tries again.
+- **Smaller:** the app waits 75 s for the service, like the CLI and the MCP bridge (it gave up after 30 s); `ghostlink key add` reads files up to 64 KiB (it stopped at 16 KiB); a key issued with `--import` or `--output` stays in the answer if it could not be saved; the tray tooltip shows the connection state.
+
+### Fixed: the server
+
+- **Rotating the management key twice at once** could leave a working key that differed from the one saved and printed by `show-key`. One rotation runs at a time.
+- **The provider lookup:** turning it off ends a running download at once; turning it off and on again during a download now gets the list (it ended with no list and an error until the next hourly check); the saved list read at start can no longer come back after the lookup was turned off. Operator names are cut at 60 characters wherever spaces fall (a space at the 59th character let up to 4096 through).
+- **The traffic history of a deleted client could come back** if the history was being saved at that moment.
+- **Turning the mesh off, or moving its port, while a node's report was being answered** could stall for 3 s, and a listener could open again while the server was stopping. The server now stops its accounting loop before it closes the dashboard and mesh listeners, and two changes made at once end on the later one.
+- **Ports of a feature that is off stay reserved.** `PATCH /server` no longer lets a protocol or the dashboard move onto the port of a mesh that is off, or onto IKEv2/IPsec's DNS port while IPsec is off.
+- **The mesh view:** the report of a removed node is no longer kept in memory; a node whose clock is more than 3 minutes off no longer breaks the fall back to the relay or the return to a direct link; the coordinator no longer offers a loopback or a mesh address to other nodes as a node's endpoint.
+- **The health shows the VPN engine as down at once** when a change fails and its rollback fails too (it said so only at the next check, 30 s later).
+
+### Fixed: the mesh agent and the IPsec component
+
+- **The IPsec component puts back its firewall rules after a firewall reload.** A reload (`firewall-cmd --reload`, `ufw reload`, netfilter-persistent) or `iptables -F` removed its jumps and usually the rules behind them; the component put the jumps back into emptied chains, which meant no isolation, no NAT and no DNS redirect, or failed with only a log line. Every 30 s it now checks that its jumps and chains are there and applies the whole rule set again if anything is missing, so it is back within about 35 s. A repair that fails shows as an error in `ipsec status`.
+- **The IPsec component lists its sessions and writes its status every 5 s,** also during a burst of events (it did so after every fifth event).
+- **A mesh node that is waiting for approval, or disabled, takes down what a crashed or killed agent left** (the interface, routes, firewall rules and the `/etc/hosts` block) at its first answer from the coordinator.
+- **Mesh endpoints:** link-local, unspecified, multicast and broadcast endpoints are refused; a loopback endpoint is accepted but never offered to other nodes (`join` prints a note); the addresses of podman, LXD, Incus, Calico and Cilium bridges are no longer offered; a peer endpoint on loopback or inside the mesh is ignored, with a note in the node's status; a shared subnet that covers the coordinator's address is no longer routed into the mesh.
+- **`ghostlink-mesh leave` while the agent runs:** the agent no longer re-applies a configuration, saves the identity or writes its status after `leave`.
+- **AmneziaWG client shutdown no longer waits a second per queued packet.**
+
+### Fixed: the installers, the packages and the host script
+
+- **The host script reads the server's state with more care.** Reads of `state.json`, `management-key.json` and the IPsec status as root no longer follow a symlink or wait on a pipe left in their place (`O_NOFOLLOW`). `kit` and `profile` write into one exclusively created file and remove only a file they created (a failed create used to delete someone else's file). The IPsec directory is checked again while the component starts. A symlink swapped in at the very moment Docker mounts the directory is not closed by a shell script: see **Not done**.
+- **`ipsec enable` undoes what it changed if it fails** before the container exists (the forwarding drop-in and the sysctl value). `--add-swap` creates its file exclusively, handles Btrfs, writes `fstab` only after `swapon` worked and removes a partial file.
+- **The installer opens ports without reloading firewalld** (the reload flushed the IPsec and mesh agents' rules just installed), puts the mesh interface in firewalld's trusted zone, and warns instead of aborting when a firewall command fails. It no longer runs `dpkg --configure -a` for a package that is only removed with its configuration left. `install-mesh.sh` keeps its port on a re-run, no longer fails on `ghostlink-mesh version` under `pipefail`, and installs `iproute2` when it is missing.
+- **`remove` and `apt purge` start a stopped Docker** (waiting up to 30 s) to remove the containers: a container left behind would restart with Docker after its state and account were gone.
+- **Windows installer:** it builds for a pre-release tag (the MSI gets the numeric core of the version and carries the full text in the Add or Remove Programs comment; before, Windows Installer rejected `0.9.1-rc.1`); the owner check no longer reads the SYSTEM account's SID as the owner (an unattended install now stops with a message); a stale build folder no longer feeds an old licence file into the installer.
+- **Linux package names:** client and mesh packages of a pre-release are named `-rc.1`, like the server's, which the installers and release notes expect. A normal release's names do not change.
+- **CI:** the five actions the workflows use are pinned to commits (the tag is in a comment); the release workflow runs the mesh and IPsec end-to-end tests before it publishes, which adds 15 to 20 minutes; the unprivileged check of the process suite runs on Linux; the IPsec test now removes the component's jumps and rules like a firewall reload does and waits for them to come back; the mesh test kills an agent, restarts the node disabled and runs `leave` against a running agent.
+
+### Fixed and added: the app and the dashboard
+
+- **One row at the default window size.** The bar at the top wrapped onto two rows at 1060 px and jumped when the VPN connected. It is one bar now (68 px), the live speeds appear when there is room, and the finish and motion settings moved into an **Appearance** button.
+- **A server's page has its own header** with tabs, one frosted status pill and one **New client** button, instead of a second bar with a second black pill and a second primary button under the app bar. **Add server** leaves the app bar while a server is open.
+- **Placeholders instead of empty-state flashes:** "No matching clients" no longer shows for a moment before the list loads, and other lists show placeholders while they load. A list that failed shows the error.
+- **Buttons cannot be pressed twice:** a double click no longer creates two keys, two invites or two saves. If creating a client's key fails after the client was created, **Create the key** resumes with the same client instead of failing on the name; if renaming a new key fails, **Set the name** resumes. A client's **Save** is on only when something changed. The split-tunnel **Save** waits for the saved policy to load (saving earlier replaced it with "everything uses the VPN").
+- **Charts:** the scale labels sit in their own margin instead of over the curve; lists show **+N more**; the usage chart has time labels along the bars and can be read by tapping.
+- **Add access key:** a **Paste** button, WireGuard and AmneziaWG text pasted as it is, a preview of protocol, host and port (never the secret), and a note that `.ovpn` files are imported with the CLI. Saved servers have **Replace key**, which keeps the server's ID and name.
+- **Servers I run:** **Update key** for a server whose management key changed (it keeps its name), **Update the list now** for the provider list, a switch for Apple **Connect automatically** per key and for new clients, and **Replace the group key** for IPsec in server settings (it asks first).
+- **Mesh:** open invites with **Revoke** and a note, node rename and the masquerade switch, traffic per node and link speeds with the age of the last handshake, and the mesh's name and network (the network until the first node joins).
+- **Clients:** a sort control (oldest, name, status, live speed, data used, last seen), badges for the protocols a client has (two shown, then how many more), and rules and split-tunnel lists checked line by line as you type.
+- **Diagnostics** are rows with a **Copy report** button, and a **Service log** page shows the service's recent audit entries.
+- **Copying never fails silently;** avatar letters no longer split an emoji.
+- **Readability:** secondary text had a contrast of 2.8 to 3.4 to 1 and is now above 5 in all three finishes; sheets focus their first field; menus work with the arrow keys; messages stay as long as their text needs, with a close button and a pause while the pointer is over them. The dashboard sign-in has a field for a pasted login link or token.
+- **The README screenshots** show 0.9.1 and speeds in bytes per second (they were 0.7.0 and Mbit/s).
+
+### Behaviour that changed
+
+- `PATCH /mesh` with only `cidr` chooses the network and leaves a mesh that does not exist yet turned off. Only `enabled: true` turns it on (the app, the dashboard and both CLIs always sent both).
+- On a state that already has a port clash with a mesh that is off, a `PATCH /server` that moves a port is refused until the clash is fixed; the message names the pair.
+- `sudo ghostlink-server remove` and `apt purge ghostlink-server` start Docker if it is stopped, which also starts the other containers on the host that Docker restarts by itself.
+- The installer no longer reloads firewalld to open ports (it adds each port to the running firewall and to the permanent configuration).
+- The Windows service's pipe gives its user read and write access without the right to create another instance.
+- A release now waits for the mesh and IPsec tests, and takes 15 to 20 minutes longer.
+
+### Not done
+
+From the reviews, with reasons in each report's table and in `agent.md` (*Known limits*): the daemon lock is still held during a dynamic `ssconf://` fetch; the swap of the IPsec directory for a symlink at the moment Docker mounts it (a shell cannot close it: the exchange directory has to move out of the server account's reach); a cross-process lock between `ghostlink-mesh leave` and a running agent; RPM dependencies on Docker; `CloseApplication` and `ServiceConfig` in the MSI; pinned Alpine package versions; a checksum-pinned `rustup`; the lockfile audit as a gate; RPM install tests; OpenVPN and MSI in the Windows CI; drag-and-drop of a `.conf` file onto Add access key; rotating the management key from the app; zoom and pan of the mesh map; **Connect now** after **Use on this device**; React render tests.
+
 ## [0.9.0] - 2026-11-13
 
 Three additions for servers, asked for after running one: replace the management key, see which network clients connect from, and keep track of the disk on a small server. Nothing changes until you use them, except that the Overview and `settings` now show how much room the disk has left.
