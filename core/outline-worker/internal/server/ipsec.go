@@ -210,6 +210,13 @@ func (svc *Service) writeIPsecDesired(now time.Time, force bool) error {
 	if err != nil || unchanged {
 		return err
 	}
+	// The generation is the time of the write, in nanoseconds, and always larger than the last
+	// one: the agent applies a file only when its generation differs from the one it applied, and
+	// on Windows the wall clock moves only with the system timer (about 15.6 ms), so two writes
+	// within one tick read the same time (a changed file with the old generation was ignored).
+	if desired.Generation <= svc.ipsecGeneration {
+		desired.Generation = svc.ipsecGeneration + 1
+	}
 	svc.ipsecWritten = ""
 	// The agent runs as root with no file capabilities, in this account's group: the directory
 	// and the settings are shared with the group only.
@@ -224,7 +231,7 @@ func (svc *Service) writeIPsecDesired(now time.Time, force bool) error {
 	if err := writeFileMode(filepath.Join(dir, ipsecproto.DesiredFile), data, 0o640); err != nil {
 		return err
 	}
-	svc.ipsecWritten = fingerprint
+	svc.ipsecWritten, svc.ipsecGeneration = fingerprint, desired.Generation
 	return nil
 }
 

@@ -38,6 +38,7 @@ The parts that 0.9.1 left undone, from the two reviews of 0.9.0 (`docs/developme
 - **Windows installer:** the service restarts by itself after a crash (twice, 10 s apart, counted over a day); an upgrade ends a running desktop app before it replaces its files, so no restart of Windows is needed; a release replaces its release candidate of the same version.
 - **Daylight's warning text** is darker (it was about 2.4 to 1 on a light card, now above 5); the status dots keep their colour.
 - **The missing-Docker message** names the packages of Fedora, RHEL and Amazon Linux too.
+- **Every write of the IPsec settings gets a larger generation than the last.** The generation was the time of the write, and two writes within one tick of a coarse clock (Windows: about 15.6 ms) got the same one, so the component would have ignored the second. On Linux, where the server runs, the clock counts nanoseconds.
 
 ### Tests and CI
 
