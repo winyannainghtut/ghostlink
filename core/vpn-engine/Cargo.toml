@@ -45,5 +45,10 @@ harness = false
 name = "openvpn_exit"
 harness = false
 
+# Lets the tests of the service serve a dynamic (ssconf://) key from a local HTTP server. Only a
+# dev dependency of the service enables it; no release build has it.
+[features]
+test-hooks = []
+
 [lints]
 workspace = true

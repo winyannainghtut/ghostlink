@@ -167,33 +167,7 @@ pub async fn resolve(source: &str) -> Result<AccessKey> {
         url.username().is_empty() && url.password().is_none(),
         "Dynamic key URLs cannot contain HTTP credentials"
     );
-    let host = url
-        .host_str()
-        .context("Dynamic key has no hostname")?
-        .trim_matches(['[', ']'])
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .context("Invalid dynamic key port")?;
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await
-    .context("Dynamic key DNS timed out")??
-    .collect();
-    ensure!(
-        !addresses.is_empty() && addresses.iter().all(|a| is_public(a.ip())),
-        "Dynamic keys must use public HTTPS servers; local and private destinations are blocked"
-    );
-    // Resolve once, validate, and pin: redirects and DNS rebinding cannot target local services.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .resolve_to_addrs(&host, &addresses)
-        .build()?;
+    let (client, url) = pinned_client(url).await?;
     let mut response = client
         .get(url)
         .send()
@@ -244,6 +218,52 @@ pub async fn resolve(source: &str) -> Result<AccessKey> {
         key.label = label;
     }
     Ok(key)
+}
+
+/// The client for a dynamic key's address, with the address looked up once, checked and pinned:
+/// redirects and DNS rebinding cannot send the request to a local service.
+async fn pinned_client(url: Url) -> Result<(reqwest::Client, Url)> {
+    // Only in the builds the tests of the service use (the feature is enabled by its dev
+    // dependency, never by a release build) and only when the test sets the variable: the key is
+    // served by a local HTTP server that the test controls, because the checks below refuse
+    // every local address and plain HTTP.
+    #[cfg(feature = "test-hooks")]
+    if let Some(local) = std::env::var_os("GHOSTLINK_TEST_DYNAMIC_KEY_URL") {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let local = local.to_str().context("Invalid test key address")?;
+        return Ok((client, Url::parse(local)?));
+    }
+    let host = url
+        .host_str()
+        .context("Dynamic key has no hostname")?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("Invalid dynamic key port")?;
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .context("Dynamic key DNS timed out")??
+    .collect();
+    ensure!(
+        !addresses.is_empty() && addresses.iter().all(|a| is_public(a.ip())),
+        "Dynamic keys must use public HTTPS servers; local and private destinations are blocked"
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .resolve_to_addrs(&host, &addresses)
+        .build()?;
+    Ok((client, url))
 }
 
 fn is_public(ip: IpAddr) -> bool {

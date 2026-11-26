@@ -3,6 +3,18 @@ $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot
 Set-Location -LiteralPath $repository
 function Assert-Success([string]$Step) { if ($LASTEXITCODE -ne 0) { throw "$Step failed (exit $LASTEXITCODE)" } }
+# Defence in depth: the service has a hook for its tests (core/vpn-engine, Cargo feature test-hooks, which
+# only the daemon's dev-dependencies turn on) that replaces the pinned fetch of dynamic keys by a plain
+# local one. A release build never enables it; nothing that ships may even contain the name of its variable.
+function Assert-NoTestHook([string[]]$Files) {
+    $needle = 'GHOSTLINK_TEST_DYNAMIC_KEY_URL'
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591) # one char per byte, so IndexOf finds the bytes of the name
+    foreach ($file in $Files) {
+        if ($latin1.GetString([System.IO.File]::ReadAllBytes($file)).IndexOf($needle, [System.StringComparison]::Ordinal) -ge 0) {
+            throw "$file contains ${needle}: it was built with the test-hooks feature and must not be released"
+        }
+    }
+}
 if (-not $Version) {
     # Same authoritative version and consistency check as the release workflow.
     $Version = (& node (Join-Path $PSScriptRoot 'release-version.mjs')).Trim()
@@ -40,6 +52,8 @@ New-Item -ItemType Directory -Force -Path $stage,(Join-Path $stage 'engine'),(Jo
 foreach ($name in @('ghostlink.exe','ghostlinkd.exe','ghostlink-mcp.exe')) { Copy-Item -LiteralPath (Join-Path $repository "target\release\$name") -Destination (Join-Path $stage $name) }
 Copy-Item -LiteralPath (Join-Path $repository 'target\release\ghostlink-tunnel.exe') -Destination (Join-Path $stage 'engine\ghostlink-tunnel.exe')
 Copy-Item -LiteralPath (Join-Path $repository 'apps\desktop\src-tauri\target\release\ghostlink-desktop.exe') -Destination (Join-Path $stage 'ghostlink-desktop.exe')
+# Every program that goes into the installer and the portable archive, as staged (also with -SkipCompile).
+Assert-NoTestHook @(Get-ChildItem -LiteralPath $stage -Recurse -Filter '*.exe' | ForEach-Object FullName)
 Copy-Item -LiteralPath (Join-Path $repository 'LICENSE'),(Join-Path $repository 'NOTICE.md') -Destination (Join-Path $stage 'licenses')
 Copy-Item -Path (Join-Path $repository 'LICENSES\*') -Destination (Join-Path $stage 'licenses') -Recurse -Force
 $wixDirectory = Join-Path $repository '.tools\wix314'
@@ -51,13 +65,18 @@ $objectDirectory = Join-Path $repository 'artifacts\windows-x64\wix'
 New-Item -ItemType Directory -Force -Path $objectDirectory | Out-Null
 # One explicit output file per source: a directory -out needs a trailing backslash, which
 # Windows PowerShell 5.1 turns into an escaped quote when the path contains a space.
-$candleArguments = @('-nologo', '-arch', 'x64', "-dVersion=$Version", "-dMsiVersion=$msiVersion", "-dStage=$stage", "-dRoot=$repository", "-dLicenses=$(Join-Path $stage 'licenses')")
+# WixUtilExtension (in the pinned WiX tools: scripts/bootstrap-windows.ps1) is for util:CloseApplication
+# and util:ServiceConfig.
+$candleArguments = @('-nologo', '-arch', 'x64', '-ext', 'WixUtilExtension', "-dVersion=$Version", "-dMsiVersion=$msiVersion", "-dStage=$stage", "-dRoot=$repository", "-dLicenses=$(Join-Path $stage 'licenses')")
 & (Join-Path $wixDirectory 'candle.exe') @candleArguments -out (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $repository 'packages\windows\Ghostlink.wxs')
 Assert-Success 'Installer compilation'
 & (Join-Path $wixDirectory 'candle.exe') @candleArguments -out (Join-Path $objectDirectory 'licenses.wixobj') $harvest
 Assert-Success 'License fragment compilation'
 $installer = Join-Path $repository "artifacts\windows-x64\Ghostlink-$Version-windows-x64.msi"
-& (Join-Path $wixDirectory 'light.exe') -nologo -out $installer (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $objectDirectory 'licenses.wixobj')
+# ICE61 and ICE63 are warnings about two things that are meant (see the comments in Ghostlink.wxs: the
+# same-version upgrade and the close of the desktop app ahead of RemoveExistingProducts). Every other
+# ICE still runs; a new warning shows.
+& (Join-Path $wixDirectory 'light.exe') -nologo -ext WixUtilExtension -sice:ICE61 -sice:ICE63 -out $installer (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $objectDirectory 'licenses.wixobj')
 Assert-Success 'Installer linking and validation'
 Compress-Archive -Path $stage -DestinationPath (Join-Path $repository "artifacts\windows-x64\Ghostlink-$Version-windows-x64-portable.zip") -Force
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Format-List

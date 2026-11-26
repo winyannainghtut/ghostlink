@@ -4,6 +4,53 @@ All notable changes to Ghostlink. Versions follow [semantic versioning](https://
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-26
+
+The parts that 0.9.1 left undone, from the two reviews of 0.9.0 (`docs/development/code-review-2026-11-25.md`, `docs/development/ui-ux-review-2026-11-25.md`). The last open security finding of those reviews is closed: the IPsec component's files no longer live where the server's own account could redirect a root-run mount. A working server, tunnel or client behaves as before; what you can notice is listed under **Behaviour that changed**.
+
+### Fixed: security
+
+- **The IPsec component's exchange directory moved out of the server account's reach** (finding C1, the part 0.9.1 could not close). The server and the component share `/var/lib/ghostlink-ipsec` (owner root, the server account's group, mode 2770) instead of `$STATE/ipsec`. The account can write files into it but can no longer replace the directory itself, so the path Docker mounts into the root-run component, also when it restarts after a reboot, cannot be pointed somewhere else on the host. An upgrade moves the component there, writes its settings before it starts, and removes the old directory. `ghostlink-server serve` takes `--ipsec-dir`.
+- **Two dependencies updated for advisories** that the new lockfile audit found: `url` 2.5.9 (RUSTSEC-2026-0592, a stack overflow in `Url::origin`, which nothing here calls) and `cookie` 0.18.3 in the desktop app (RUSTSEC-2026-0594, nonce reuse of private cookies after `fork`, which nothing here uses).
+
+### Fixed: the Windows service, the CLI and the app
+
+- **Connecting with a dynamic `ssconf://` key no longer stalls the service.** The key used to be fetched (up to 15 s) while the service held its lock, so every other request, the app's polling included, waited. Now the service plans the connection, fetches the key without the lock and checks again before it starts: other requests are answered at once; another connect or switch meanwhile is `busy`; a disconnect gives the connection up (`cancelled`); a server removed or changed meanwhile is not started.
+- **Amnezia `vpn://` keys with an IPv6 endpoint without brackets import again** (0.9.1 refused them). The endpoint is bracketed when the key is read; everything else is checked as strictly as before, and a `.conf` file with such an endpoint is still refused.
+
+### Added
+
+- **Replace a server's management key from the app:** **Server settings → Management key → Replace the management key**, or `ghostlink server rotate-key --server NAME`. The app's service saves the new key on this device, sealed like the old one, and never shows it; other devices need the new key (`sudo ghostlink-server show-key`). In the web dashboard the same button shows the new key once, to copy. A key in the server's answer for another host, port or certificate is refused. Agents and the MCP bridge cannot use it.
+- **Drop a `.conf` or key file onto Add access key.** It is read like pasted text, with a drop zone while you drag. The app's window no longer opens dropped files itself.
+- **Connect now** after **Use on this device**, in the message and in the New client sheet. If another server is connected it asks before it switches.
+- **The mesh map zooms and pans:** wheel and pinch, dragging the background, buttons with the zoom level and **Show the whole map**, and `+`, `-`, `0` and the arrow keys. Subnet labels no longer cover each other or a node.
+- **The tray menu follows the connection:** it shows the state, offers **Connect to** the default server when disconnected, and enables **Disconnect** only while a session runs.
+- **`ghostlink-mesh leave` stops a running agent first** (it asks it to stop and waits up to 30 s), then removes the node while it holds the agent's lock, so the two never work at the same time. The agent stops with status 0, so systemd does not start it again, and a second agent on the same state is refused.
+- **The IPsec component notices one chain emptied on its own** (`iptables -F GHOSTLINK-IPSEC-OUT`) while its jump stays: it counts each chain's rules against what it applied and applies them again once.
+
+### Changed
+
+- **Windows installer:** the service restarts by itself after a crash (twice, 10 s apart, counted over a day); an upgrade ends a running desktop app before it replaces its files, so no restart of Windows is needed; a release replaces its release candidate of the same version.
+- **Daylight's warning text** is darker (it was about 2.4 to 1 on a light card, now above 5); the status dots keep their colour.
+- **The missing-Docker message** names the packages of Fedora, RHEL and Amazon Linux too.
+
+### Tests and CI
+
+- RPM install tests in Fedora, Rocky Linux 9 and Amazon Linux 2023 containers; an MSI install, upgrade (from 0.9.1, with the desktop app running) and uninstall test on the Windows runner, which is also the first run of the installed service as SYSTEM with its narrowed pipe rights; the IPsec test upgrades from the published 0.9.1 with a client connected, and checks the new directory cannot be replaced by the server's account; the mesh test checks that `leave` stops a running agent cleanly; the lockfile audit is a CI gate, with the accepted findings listed with their reasons in `scripts/audit-allowlist.toml`; OpenVPN on the Windows runner for the process test that needs it; `rustup` downloaded at a pinned version and checksum instead of `curl | sh`; React render tests (with the Vite already used for the build); the release builds fail if a test-only hook is found in a binary they package.
+
+### Behaviour that changed
+
+- The IPsec component's files are in `/var/lib/ghostlink-ipsec`. `ipsec enable` refuses a server container from before the move until `sudo ghostlink-server setup` has run (an upgrade of the package runs it).
+- While a connection with a dynamic key is being prepared, a second connect or switch is `busy`, even for the same server, and `status` shows no `connecting` until the fetch is done.
+- Over the mesh map the mouse wheel zooms instead of scrolling the page.
+- A running `ghostlink-mesh serve` keeps a lock file, `agent.lock`, in its state directory.
+
+### Not done
+
+- **The RPM server package still does not depend on Docker:** the package names differ between distributions (`docker-ce`, `moby-engine`, `docker`, and `podman-docker`, which conflicts with `docker-ce`), and the new container tests record what each distribution would install. The installer still installs Docker first.
+- **Alpine package versions in the IPsec image are not pinned,** on purpose: Alpine removes superseded versions from its mirrors, so every security update would break the build. The base image is pinned by digest and the archive of its sources records the versions.
+- **Importing a dynamic `ssconf://` key** still holds the service's lock while it fetches it; connecting no longer does.
+
 ## [0.9.1] - 2026-11-26
 
 Fixes from two reviews of 0.9.0 (`docs/development/code-review-2026-11-25.md` and `docs/development/ui-ux-review-2026-11-25.md`). Each finding was checked against the code before anything was changed: a few were wrong or smaller than reported, and one fix a review suggested was not enough. A table at the end of each report says what became of every finding. A working server, tunnel or client behaves as before; the changes you can notice are listed under **Behaviour that changed**.

@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import zlib from 'node:zlib';
 import path from 'node:path';
 import net from 'node:net';
+import https from 'node:https';
 import readline from 'node:readline';
 import Ajv from 'ajv/dist/2020.js';
 
@@ -268,7 +269,7 @@ test('crash leftovers are removed at startup and do not block state writes', asy
   assert.equal((await cli(['profile', 'list'])).data.profiles[0].name, 'singapore');
 });
 test('version is local, unknown profile exit is predictable, and switch validates target first', async () => {
-  assert.equal((await cli(['version'])).data.version, '0.9.1');
+  assert.equal((await cli(['version'])).data.version, '0.9.2');
   assert.equal((await cli(['connect', '--profile', 'missing'], 2)).error.code, 'not_found');
   assert.equal((await cli(['switch', '--profile', 'missing'], 2)).error.code, 'not_found');
 });
@@ -346,6 +347,13 @@ test('WireGuard, AmneziaWG, VLESS and Amnezia vpn:// keys import with strict val
   const document = { containers: [{ container: 'amnezia-awg2', awg: { last_config: JSON.stringify(last) } }], defaultContainer: 'amnezia-awg2', description: 'Amnezia Test', dns1: '1.1.1.1' };
   const imported = await cli(['key', 'add', '--name', 'amnezia-test', '--file', await write('amnezia.txt', amnezia(document))]);
   assert.equal(imported.data.kind, 'amneziawg'); assert.equal(imported.data.display_name, 'Amnezia Test');
+  // Amnezia writes an IPv6 endpoint without brackets: such a key imports (it was refused in 0.9.1),
+  // and a configuration file with the same endpoint is still refused, as the port cannot be told
+  // from the last group of the address there.
+  const v6conf = conf('Jc = 4\nJmin = 10\nJmax = 50\nS1 = 24\nS2 = 28\nH1 = 100-199\nH2 = 200-299\nH3 = 300-399\nH4 = 400-499').replace('203.0.113.5:51820', '2001:db8::1:51820');
+  const v6 = await cli(['key', 'add', '--name', 'amnezia-v6', '--file', await write('amnezia-v6.txt', amnezia({ ...document, containers: [{ container: 'amnezia-awg2', awg: { last_config: JSON.stringify({ config: v6conf }) } }] }))]);
+  assert.equal(v6.data.kind, 'amneziawg'); assert.deepEqual([v6.data.remotes[0].host, v6.data.remotes[0].port], ['2001:db8::1', 51820]);
+  assert.equal((await cli(['profile', 'import', await write('v6.conf', v6conf), '--name', 'rejected'], 2)).error.code, 'invalid_profile');
   const fullAccess = await cli(['key', 'add', '--name', 'rejected', '--file', await write('admin.txt', amnezia({ ...document, userName: 'root', password: 'ssh-secret-never-shown' }))], 2);
   assert.match(fullAccess.error.message, /full-access/); assert.ok(!JSON.stringify(fullAccess).includes('ssh-secret-never-shown'));
   const listed = JSON.stringify(await cli(['profile', 'list']));
@@ -359,7 +367,7 @@ test('WireGuard, AmneziaWG, VLESS and Amnezia vpn:// keys import with strict val
       assert.ok(!Buffer.from(profiles[name].sealed_content).toString().includes(secret), `${name} is not sealed`);
     }
   }
-  for (const name of ['wg-home', 'awg-home', 'vless-tokyo', 'amnezia-test']) await cli(['profile', 'remove', name]);
+  for (const name of ['wg-home', 'awg-home', 'vless-tokyo', 'amnezia-test', 'amnezia-v6']) await cli(['profile', 'remove', name]);
 });
 test('split tunneling policies validate, persist per scope and stay owner-only', async () => {
   assert.equal((await cli(['split', 'show'])).data.policy.mode, 'full');
@@ -571,13 +579,45 @@ test('a real Ghostlink server is managed through its pinned management key', asy
   const tokenPath = path.join(temp, 'server.token'); await cli(['agent', 'grant', '--name', 'server-agent', '--control', '--token-file', tokenPath]);
   const token = (await fs.readFile(tokenPath, 'utf8')).trim();
   // A valid control token, so it is the operation's scope that refuses these.
-  const ops = [{ op: 'info' }, { op: 'live' }, { op: 'kit', user }, { op: 'key_profile', user, key: '1' }];
+  const ops = [{ op: 'info' }, { op: 'live' }, { op: 'kit', user }, { op: 'key_profile', user, key: '1' }, { op: 'rotate_key' }];
   for (const action of [{ type: 'managed_server_list' }, ...ops.map(op => ({ type: 'server_call', server: 'home', op })), { type: 'managed_server_add', name: 'x', management_key: key }]) {
     const refused = (await rpc({ schema_version: 1, agent_token: token, action })).error;
     assert.equal(refused.code, 'permission_denied', JSON.stringify(action)); assert.match(refused.message, /capability/);
   }
   await cli(['agent', 'revoke', '--name', 'server-agent']);
   assert.ok(!JSON.stringify(await cli(['logs', '--tail', '1000'])).includes(secret), 'audit log contains the management secret');
+
+  // Replacing the management key from this device (0.9.2). The service asks the server, saves the
+  // new key in place of the old one (same name, label and address) and answers without any key.
+  const answered = async apiUrl => new Promise(resolve => https.get(`${apiUrl}/server`, { rejectUnauthorized: false }, res => { res.resume(); resolve(res.statusCode); }).on('error', () => resolve(0)));
+  assert.equal(await answered(management.apiUrl), 200, 'the key from init works against the server');
+  assert.equal((await cli(['server', 'rotate-key', '--server', 'missing'], 2)).error.code, 'not_found');
+  const rotate = await cli(['server', 'rotate-key', '--server', 'home']);
+  assert.equal(rotate.data.rotated, true);
+  assert.deepEqual([rotate.data.server.name, rotate.data.server.label, rotate.data.server.endpoint], ['home', 'My home server', new URL(management.apiUrl).host]);
+  const fresh = JSON.parse(await fs.readFile(path.join(dir, 'management-key.json'), 'utf8'));
+  const freshSecret = new URL(fresh.apiUrl).pathname.slice(1);
+  assert.notEqual(freshSecret, secret, 'the server has a new secret');
+  assert.equal(fresh.certSha256, management.certSha256, 'the certificate is the same');
+  // The old key no longer works against the server, and the new one does.
+  assert.notEqual(await answered(management.apiUrl), 200, 'the old key still works against the server');
+  assert.equal(await answered(fresh.apiUrl), 200);
+  // The answer, the listing and the audit log hold neither secret, nor the pin.
+  const spoken = JSON.stringify([rotate, await cli(['server', 'list']), await cli(['logs', '--tail', '1000'])]);
+  for (const hidden of [secret, freshSecret, management.certSha256]) assert.ok(!spoken.includes(hidden), 'a key leaked into an answer or the audit log');
+  // Saved in place: the service state holds the new key (sealed on Windows; on Linux the state
+  // directory is private and the key is stored as it is) and not the old one, never as text.
+  const savedKey = JSON.parse(await fs.readFile(path.join(state, 'state.json'), 'utf8')).managed_servers.home.sealed_key;
+  const savedText = Buffer.from(savedKey).toString('latin1');
+  assert.ok(!(await fs.readFile(path.join(state, 'state.json'), 'utf8')).includes(freshSecret));
+  assert.ok(!savedText.includes(secret), 'the old key is still saved');
+  assert.equal(savedText.includes(freshSecret), !windows, windows ? 'the new key is not sealed' : 'the new key was not saved');
+  // The next calls use the re-sealed key, and so does a second rotation.
+  assert.equal((await cli(['server', 'info', '--server', 'home'])).data.protocols.shadowsocks.enabled, true);
+  assert.equal((await cli(['server', 'rotate-key', '--server', 'home'])).data.rotated, true);
+  assert.equal((await cli(['server', 'usage', '--server', 'home'])).data.users[0].usage_bytes, 0);
+  assert.notEqual(await answered(fresh.apiUrl), 200, 'the key of the first rotation still works');
+  assert.ok(!JSON.stringify(await cli(['logs', '--tail', '1000'])).includes(freshSecret), 'audit log contains a management secret');
 
   server.kill(); await once(server, 'exit');
   assert.equal((await cli(['server', 'info', '--server', 'home'], 1)).error.code, 'server_unreachable');

@@ -12,6 +12,9 @@ ConditionPathExists=/var/lib/ghostlink-mesh/node.json
 [Service]
 Type=simple
 ExecStart=/usr/bin/ghostlink-mesh serve
+# `ghostlink-mesh leave` stops the running agent with SIGTERM (it finds it by the lock the agent holds
+# on agent.lock in the state directory). The agent then ends with status 0, which on-failure does not
+# restart; and with node.json gone, ConditionPathExists above keeps systemd from starting it at all.
 Restart=on-failure
 RestartSec=5
 UMask=0077

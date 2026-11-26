@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
   <!-- MsiVersion is the numeric a.b.c of the release (scripts/build-windows.ps1 derives it): Windows
        Installer takes no pre-release such as 0.9.1-rc.1. Version is the whole semantic version. -->
   <Product Id="*" Name="Ghostlink" Language="1033" Version="$(var.MsiVersion)" Manufacturer="Ghostlink contributors" UpgradeCode="4F528F86-19CA-46DC-83EA-6B8784640206">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="Personal Outline-compatible VPN client" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Ghostlink is already installed." Schedule="afterInstallInitialize" />
+    <!-- An rc and its final release share one MsiVersion (0.9.2-rc.1 and 0.9.2 are both 0.9.2), and
+         every build has a product code of its own (Id="*"). Without AllowSameVersionUpgrades the Upgrade
+         table finds only older versions, and a product of the same version counts as a newer one
+         (DowngradeErrorMessage), so the final could not replace the rc. With it, VersionMax is inclusive:
+         ICE61 warns about exactly that, which is meant (build-windows.ps1 suppresses it). Installing the
+         very same MSI again is no upgrade (the same product code): it stays a maintenance-mode
+         reinstall, as before. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Ghostlink is already installed." Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Property Id="ARPNOREPAIR" Value="yes" />
     <Property Id="ARPCOMMENTS" Value="Ghostlink $(var.Version)" />
@@ -38,6 +45,13 @@
           <File Id="DaemonExe" Source="$(var.Stage)\ghostlinkd.exe" KeyPath="yes" />
           <ServiceInstall Id="InstallService" Name="Ghostlink" DisplayName="Ghostlink" Description="Privileged local Ghostlink tunnel service" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Arguments="--service --owner-sid &quot;[GHOSTLINK_OWNER_SID]&quot; --outline-engine &quot;[INSTALLFOLDER]engine\ghostlink-tunnel.exe&quot; --data-dir &quot;[CommonAppDataFolder]Ghostlink&quot;" Vital="yes" />
           <ServiceControl Id="ServiceControl" Name="Ghostlink" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+          <!-- After a crash (the process ends without the service reporting that it stopped) the Service
+               Control Manager starts the service again after 10 s, and again at the second crash; a third
+               crash within a day leaves it stopped, so that a service that cannot start does not loop. A
+               stop the service reports itself, with or without an error code, is not a crash. It is the
+               util extension's element: the core ServiceConfig (Windows Installer 5) has no failure actions
+               in WiX 3 (candle warns CNDL1150 that it does not work as expected). -->
+          <util:ServiceConfig ServiceName="Ghostlink" FirstFailureActionType="restart" SecondFailureActionType="restart" ThirdFailureActionType="none" RestartServiceDelayInSeconds="10" ResetPeriodInDays="1" />
         </Component>
         <Component Id="InstallationMetadata" Guid="*" Win64="yes">
           <RegistryValue Root="HKLM" Key="Software\Ghostlink" Name="OwnerSID" Value="[GHOSTLINK_OWNER_SID]" Type="string" KeyPath="yes" />
@@ -48,6 +62,18 @@
       <Directory Id="ProgramMenuFolder" />
       <Directory Id="DesktopFolder" />
     </Directory>
+    <!-- The desktop app keeps running in the tray when its window is closed, so an upgrade or an uninstall
+         finds its file in use and would ask for a reboot. WixCloseApplications asks the app to close and,
+         when it does not, ends it (exit code 1): the connection lives in the service, which the installer
+         stops and starts itself, so ending the window loses nothing. It never asks (PromptToContinue
+         would hold up a silent install). The extension runs it just before InstallFiles, after the old
+         product has been removed; it has to run before that, so it is placed right after InstallInitialize,
+         ahead of RemoveExistingProducts (ICE63 warns about an action in between; build-windows.ps1
+         suppresses it). The row repeats the extension's condition. -->
+    <util:CloseApplication Id="CloseDesktopApp" Target="ghostlink-desktop.exe" Description="Ghostlink is open" CloseMessage="yes" RebootPrompt="no" TerminateProcess="1" />
+    <InstallExecuteSequence>
+      <Custom Action="WixCloseApplications" Before="RemoveExistingProducts"><![CDATA[VersionNT > 400]]></Custom>
+    </InstallExecuteSequence>
     <Feature Id="MainFeature" Title="Ghostlink" Level="1">
       <ComponentRef Id="Desktop" /><ComponentRef Id="Cli" /><ComponentRef Id="Mcp" /><ComponentRef Id="Daemon" /><ComponentRef Id="TunnelWorker" /><ComponentRef Id="InstallationMetadata" />
       <ComponentGroupRef Id="LicenseFiles" />

@@ -152,8 +152,16 @@ export type Transport = {
   text(path: string): Promise<string>;
   // Saves a file the user asked for; returns where it went, when the app knows.
   save(file: SavedFile): Promise<string | null>;
-  // The desktop app can also use a key on this device (it becomes a VPN connection there).
-  useHere?: (user: User, key: Key) => Promise<void>;
+  // The desktop app's own transport: its local service holds the management keys (it seals a new
+  // one itself), and it can use keys on this device.
+  desktop?: boolean;
+  // The desktop app can also use a key on this device (it becomes a VPN connection there). The
+  // answer is the ID of the new server on this device.
+  useHere?: (user: User, key: Key) => Promise<string>;
+  // Connects to a server on this device by its ID (desktop only). While another server is
+  // connected it throws ActiveElsewhere (connectHere.ts), unless `switch` says to disconnect that
+  // one first.
+  connect?: (profile: string, options?: { switch?: boolean }) => Promise<void>;
 };
 
 // One server's API, bound to its transport. Each view of a server gets its own (useApi in
@@ -164,8 +172,12 @@ export type ServerApi = {
   api: <T>(method: string, path: string, body?: unknown) => Promise<T>;
   apiText: (path: string) => Promise<string>;
   saveFile: (file: SavedFile) => Promise<string | null>;
+  // Whether this is the desktop app (see Transport.desktop).
+  desktop: boolean;
   canUseHere: boolean;
-  useHere: (user: User, key: Key) => Promise<void>;
+  useHere: (user: User, key: Key) => Promise<string>;
+  canConnect: boolean;
+  connect: (profile: string, options?: { switch?: boolean }) => Promise<void>;
 };
 
 export function bindApi(transport: Transport): ServerApi {
@@ -173,8 +185,11 @@ export function bindApi(transport: Transport): ServerApi {
     api: <T,>(method: string, path: string, body?: unknown) => transport.call<T>(method, path, body),
     apiText: path => transport.text(path),
     saveFile: file => transport.save(file),
+    desktop: !!transport.desktop,
     canUseHere: !!transport.useHere,
     useHere: (user, key) => (transport.useHere ? transport.useHere(user, key) : Promise.reject(new Error('Only the desktop app can use a key on this device.'))),
+    canConnect: !!transport.connect,
+    connect: (profile, options) => (transport.connect ? transport.connect(profile, options) : Promise.reject(new Error('Only the desktop app can connect.'))),
   };
 }
 

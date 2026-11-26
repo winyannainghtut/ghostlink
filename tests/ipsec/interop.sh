@@ -15,6 +15,8 @@ deb=$(realpath "$1")
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 state=/var/lib/ghostlink-server
+# Where the server and the IPsec component exchange their files: root's, outside the state.
+exchange=/var/lib/ghostlink-ipsec
 step() { printf '\n=== %s\n' "$*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -25,7 +27,7 @@ cleanup() {
         echo "--- agent log"; docker logs --tail 120 ghostlink-ipsec 2>&1
         echo "--- client log"; docker logs --tail 120 glclient 2>&1
         echo "--- server log"; docker logs --tail 40 ghostlink-server 2>&1
-        echo "--- status"; cat "$state/ipsec/status.json" 2>/dev/null
+        echo "--- status"; cat "$exchange/status.json" 2>/dev/null
         echo "--- firewall"; iptables-save 2>/dev/null | grep -i ghostlink
     fi
     docker rm -f glclient >/dev/null 2>&1
@@ -36,6 +38,10 @@ cleanup() {
     exit $status
 }
 trap cleanup EXIT
+
+step "Upgrade from the published 0.9.1 package (IPsec on, a client connected) to this one"
+# It makes its own network, and ends with the package purged and the network gone.
+bash "$here/upgrade.sh" "$deb" "$work"
 
 # The server's address (10.99.0.1) must exist before anything calls its API.
 ip link add glh0 type veth peer name glc0
@@ -52,7 +58,26 @@ grep -Eq '^readonly=true drop=\[ALL\] add=\[[A-Z_ ]+\] user=0:[0-9]+ net=host nn
     fail "IPsec container is not hardened as expected"
 added=$(sed -n 's/.* add=\[\([^]]*\)\].*/\1/p' "$work/container.txt" | tr ' ' '\n' | sed 's/^CAP_//' | sort | tr '\n' ' ')
 test "$added" = "NET_ADMIN NET_BIND_SERVICE NET_RAW " || fail "unexpected capabilities: $added"
-test "$(stat -c %a "$state/ipsec")" = 770
+# The exchange directory is root's, with the server account's group and the setgid bit, in root's
+# /var/lib: the component and the server mount exactly it (and the server also the state), and the
+# server account, which owns the state, cannot rename, remove or replace it, so no mount of it
+# (resolved by path, also again when the container restarts) can be sent elsewhere.
+test "$(stat -c '%U:%G %a' "$exchange")" = 'root:ghostlink-server 2770' || fail "the exchange directory is $(stat -c '%U:%G %a' "$exchange")"
+test ! -L "$exchange"
+mounted() { docker inspect "$1" --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' | grep . | sort | tr '\n' ' '; }
+test "$(mounted ghostlink-ipsec)" = "$exchange " || fail "the IPsec component mounts: $(mounted ghostlink-ipsec)"
+test "$(mounted ghostlink-server)" = "$exchange $state " || fail "the server mounts: $(mounted ghostlink-server)"
+if sudo -u ghostlink-server mv "$exchange" "$exchange.moved" 2>"$work/denied.txt"; then fail "the server account renamed the exchange directory"; fi
+cat "$work/denied.txt"
+grep -q 'Permission denied' "$work/denied.txt"
+if sudo -u ghostlink-server rmdir "$exchange" 2>"$work/denied.txt"; then fail "the server account removed the exchange directory"; fi
+if sudo -u ghostlink-server ln -s /etc "$exchange.link" 2>"$work/denied.txt"; then fail "the server account made a link next to the exchange directory"; fi
+test -d "$exchange"
+test ! -L "$exchange"
+# It can still write its settings into the directory, and they stay in its group.
+sudo -u ghostlink-server sh -c "echo probe > $exchange/probe"
+test "$(stat -c %G "$exchange/probe")" = ghostlink-server
+rm "$exchange/probe"
 test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
 test -f /etc/sysctl.d/90-ghostlink-ipsec.conf
 
@@ -76,8 +101,8 @@ api POST "/users/$user/keys" '{"protocol":"ipsec","auth":"psk"}' | jq -e '.warni
 # identity. The agent refuses a whole settings file for one bad identity.
 odd=$(api POST /users '{"name":"_odd name"}' | jq -r .id)
 api POST "/users/$odd/keys" '{"protocol":"ikev2"}' >/dev/null
-jq -e '.allowed | any(test("^odd-name-[0-9]+@ghostlink$"))' "$state/ipsec/desired.json" >/dev/null ||
-    fail "no valid identity for a user named _odd name: $(jq -c .allowed "$state/ipsec/desired.json")"
+jq -e '.allowed | any(test("^odd-name-[0-9]+@ghostlink$"))' "$exchange/desired.json" >/dev/null ||
+    fail "no valid identity for a user named _odd name: $(jq -c .allowed "$exchange/desired.json")"
 
 step "Client configuration from the profiles"
 python3 "$here/client_config.py" "$work/client" \
@@ -182,8 +207,8 @@ connect() { swan --initiate --child "$1" --timeout 40 >"$work/initiate-$1.log" 2
 refused() { if swan --initiate --child "$1" --timeout 25 >"$work/refused-$1.log" 2>&1; then fail "$1 connected but should be refused ($2)"; fi; swan --terminate --ike "$1" --timeout 10 >/dev/null 2>&1 || true; }
 wait_applied() {
     for i in $(seq 1 30); do
-        want=$(jq .generation "$state/ipsec/desired.json")
-        got=$(jq .applied_generation "$state/ipsec/status.json" 2>/dev/null || echo 0)
+        want=$(jq .generation "$exchange/desired.json")
+        got=$(jq .applied_generation "$exchange/status.json" 2>/dev/null || echo 0)
         [ "$want" = "$got" ] && return 0
         sleep 1
     done
@@ -224,7 +249,7 @@ since=$(date +%s)
 docker restart ghostlink-ipsec >/dev/null
 swan --terminate --ike ikev2-eap --timeout 10 >/dev/null 2>&1 || true
 for i in $(seq 1 60); do
-    [ "$(jq -r --argjson since "$since" 'if .running and .updated_unix >= $since then 1 else 0 end' "$state/ipsec/status.json" 2>/dev/null || echo 0)" = 1 ] && break
+    [ "$(jq -r --argjson since "$since" 'if .running and .updated_unix >= $since then 1 else 0 end' "$exchange/status.json" 2>/dev/null || echo 0)" = 1 ] && break
     sleep 1
 done
 wait_applied
@@ -362,8 +387,38 @@ swan --terminate --ike ikev2-eap --timeout 15 >/dev/null
 # In steady state the next checks (every 30 s) find nothing missing and leave the firewall alone.
 sleep 40
 [ "$(restores)" = "$restored" ] || fail "the agent keeps restoring its firewall rules although nothing took them away again"
-if jq -e '(.error // "") | test("firewall")' "$state/ipsec/status.json" >/dev/null; then
-    fail "the agent still reports a firewall fault: $(jq -r .error "$state/ipsec/status.json")"
+if jq -e '(.error // "") | test("firewall")' "$exchange/status.json" >/dev/null; then
+    fail "the agent still reports a firewall fault: $(jq -r .error "$exchange/status.json")"
+fi
+
+step "Firewall: one chain emptied while its jump stays"
+# "iptables -F CHAIN" empties one chain and leaves every jump to it where it was, so a check of the
+# jumps and of the chains' existence finds nothing missing. The agent also compares how many rules
+# each chain holds with what it applied, puts the rules back once, says so in its log, and then
+# leaves the firewall alone.
+out_rules() { ipt -S GHOSTLINK-IPSEC-OUT 2>/dev/null | grep -c '^-A GHOSTLINK-IPSEC-OUT ' || true; }
+agent_rules_in_place || fail "the agent's firewall rules are not in place before one chain is flushed"
+want_rules=$(out_rules)
+[ "$want_rules" -gt 1 ] || fail "GHOSTLINK-IPSEC-OUT holds $want_rules rules before it is flushed"
+before=$(restores)
+ipt -F GHOSTLINK-IPSEC-OUT
+[ "$(out_rules)" = 0 ] || fail "the flush left rules in GHOSTLINK-IPSEC-OUT"
+ipt -C FORWARD -j GHOSTLINK-IPSEC-FWD 2>/dev/null || fail "flushing one chain took the agent's jump away"
+for i in $(seq 1 50); do [ "$(out_rules)" = "$want_rules" ] && break; sleep 1; done
+[ "$(out_rules)" = "$want_rules" ] || fail "the agent did not put the rules of the emptied chain back within 50 s ($(out_rules) of $want_rules)"
+agent_rules_in_place || fail "the agent's firewall is not whole after the repair"
+restored=$(restores)
+[ "$restored" -gt "$before" ] || fail "the agent put the emptied chain back without saying so in its log"
+docker logs ghostlink-ipsec >"$work/agent-chain.log" 2>&1
+grep -q 'filter/GHOSTLINK-IPSEC-OUT holds 0 of' "$work/agent-chain.log" || fail "the agent's log does not name the emptied chain"
+connect ikev2-eap
+check_tunnel ikev2-eap 10.79.0.1
+swan --terminate --ike ikev2-eap --timeout 15 >/dev/null
+sleep 40
+[ "$(restores)" = "$restored" ] || fail "the agent keeps restoring its firewall rules although only one chain was emptied, once"
+[ "$(out_rules)" = "$want_rules" ] || fail "GHOSTLINK-IPSEC-OUT changed after the repair"
+if jq -e '(.error // "") | test("firewall")' "$exchange/status.json" >/dev/null; then
+    fail "the agent still reports a firewall fault: $(jq -r .error "$exchange/status.json")"
 fi
 
 step "Usage is counted and the data limit cuts the user off"
@@ -406,5 +461,10 @@ if iptables-save | grep -q GHOSTLINK-IPSEC; then fail "firewall chains left behi
 if ip link show glipsec0 >/dev/null 2>&1; then fail "glipsec0 left behind"; fi
 test ! -e /etc/sysctl.d/90-ghostlink-ipsec.conf
 ghostlink-server ipsec status | grep -q "not installed"
+# The exchange directory stays with the installed package (it holds only what the server derives
+# from its state) and goes with the state on a purge.
+test -d "$exchange"
 apt-get purge -y ghostlink-server >/dev/null
+test ! -e "$exchange"
+test ! -e "$state"
 step "IPsec interop passed"

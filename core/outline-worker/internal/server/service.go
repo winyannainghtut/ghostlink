@@ -45,6 +45,9 @@ type Service struct {
 	// written last (see writeIPsecDesired).
 	ipsecMu      sync.Mutex
 	ipsecWritten string
+	// ipsecDir is the directory shared with the IPsec agent when it is not <state>/ipsec (see
+	// SetIPsecDir).
+	ipsecDir atomic.Pointer[string]
 	// startup is the work Start left running in the background.
 	startup sync.WaitGroup
 	// engineErr is why the engine last failed to start ("" while it runs); see ensureEngine.

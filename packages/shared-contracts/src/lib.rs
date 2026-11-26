@@ -178,6 +178,10 @@ pub enum ServerOp {
     },
     /// Download the list behind the provider lookup again (the lookup must be on).
     AsnUpdate {},
+    /// Replaces the server's management key: a new secret, the same address and certificate. The
+    /// service saves the new key, sealed, in place of the old one and never returns it; the
+    /// answer is `{"rotated": true, "server": <the server's summary>}`.
+    RotateKey {},
     /// A key's QR code: `format` svg or text; `content` auto, key or conf.
     KeyQr {
         user: String,
@@ -477,6 +481,7 @@ impl ServerOp {
             Self::Stats { .. } => "server_stats",
             Self::Clients { .. } => "server_clients",
             Self::AsnUpdate {} => "server_asn_update",
+            Self::RotateKey {} => "server_rotate_key",
             Self::KeyQr { .. } => "server_key_qr",
             Self::Kit { .. } => "server_kit",
             Self::KeyProfile { .. } => "server_key_profile",
@@ -839,6 +844,10 @@ mod tests {
             },
             Action::ServerCall {
                 server: "x".into(),
+                op: ServerOp::RotateKey {},
+            },
+            Action::ServerCall {
+                server: "x".into(),
                 op: ServerOp::MeshInviteCreate {
                     invite: Default::default(),
                 },
@@ -905,6 +914,7 @@ mod tests {
             "mesh_invite_list",
             "mesh_rules_get",
             "mesh_topology",
+            "rotate_key",
         ] {
             let op: ServerOp = serde_json::from_str(&format!(r#"{{"op":"{name}"}}"#)).unwrap();
             assert_eq!(

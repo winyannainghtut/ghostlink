@@ -265,7 +265,11 @@ esac
 """
 
 # FAKE_* variables say what the daemon is like. A file at FAKE_DOCKER_DOWN means it is stopped, at
-# FAKE_IPSEC_CONTAINER that the IPsec container exists.
+# FAKE_IPSEC_CONTAINER that the IPsec container exists. FAKE_IPSEC_DIR is the exchange directory
+# (where the component writes status.json and the server desired.json), FAKE_SERVER_MOUNTS the
+# directories the server container has mounted (by default: the exchange directory, as made by a
+# setup of this version). The hooks run when a container is created: FAKE_RUN_HOOK for the IPsec
+# component, FAKE_SERVER_HOOK for the server.
 STAND_IN_DOCKER = r"""#!/bin/sh
 echo "docker $*" >> "$FAKE_LOG"
 last=
@@ -275,19 +279,40 @@ case "$1" in
     load) exit "${FAKE_LOAD_STATUS:-0}" ;;
     inspect)
         case "$last" in
-            ghostlink-server) echo "${FAKE_SERVER_RUNNING:-true}" ;;
+            ghostlink-server)
+                case "$*" in
+                    *Mounts*) printf '%s\n' ${FAKE_SERVER_MOUNTS-$FAKE_IPSEC_DIR} ;;
+                    *RestartCount*) echo "${FAKE_SERVER_RUNNING:-true} 0" ;;
+                    *) echo "${FAKE_SERVER_RUNNING:-true}" ;;
+                esac ;;
             ghostlink-ipsec) [ -e "$FAKE_IPSEC_CONTAINER" ] || exit 1; echo "${FAKE_IPSEC_RUNNING:-true}" ;;
             *) exit 1 ;;
         esac ;;
     exec) [ "${FAKE_ADMIN_STATUS:-0}" = 0 ] || exit "$FAKE_ADMIN_STATUS"; echo "ADMIN-OUTPUT $last" ;;
     run)
         [ "${FAKE_RUN_STATUS:-0}" = 0 ] || exit "$FAKE_RUN_STATUS"
-        : > "$FAKE_IPSEC_CONTAINER"
-        [ -z "${FAKE_RUN_HOOK:-}" ] || sh -c "$FAKE_RUN_HOOK"
-        if [ -n "${FAKE_STATUS_JSON:-}" ]; then printf '%s\n' "$FAKE_STATUS_JSON" > "$FAKE_STATE/ipsec/status.json"; fi ;;
-    rm) rm -f "$FAKE_IPSEC_CONTAINER" ;;
+        case "$*" in
+            *"--name ghostlink-ipsec "*)
+                : > "$FAKE_IPSEC_CONTAINER"
+                [ -z "${FAKE_RUN_HOOK:-}" ] || sh -c "$FAKE_RUN_HOOK"
+                if [ -n "${FAKE_STATUS_JSON:-}" ]; then printf '%s\n' "$FAKE_STATUS_JSON" > "$FAKE_IPSEC_DIR/status.json"; fi ;;
+            *"--name ghostlink-server "*)
+                [ -z "${FAKE_SERVER_HOOK:-}" ] || sh -c "$FAKE_SERVER_HOOK" ;;
+        esac ;;
+    rm) case "$*" in *ghostlink-ipsec*) rm -f "$FAKE_IPSEC_CONTAINER" ;; esac ;;
     *) exit 0 ;;
 esac
+"""
+
+# sleep that does not wait. With FAKE_SETTINGS_ON_SLEEP, the server "writes" the component's
+# settings at the first sleep after the server container was made and its image list was read
+# (the setup does that right after the container is up): a server that is a little slow.
+STAND_IN_SLEEP = r"""#!/bin/sh
+echo "sleep $*" >> "$FAKE_LOG"
+if [ -n "${FAKE_SETTINGS_ON_SLEEP:-}" ] && grep -q '^docker image ls .* ghostlink-server$' "$FAKE_LOG"; then
+    printf '{}\n' > "$FAKE_IPSEC_DIR/desired.json"
+fi
+exit 0
 """
 
 STAND_IN_SYSTEMCTL_DOCKER = r"""#!/bin/sh
@@ -377,13 +402,18 @@ class ServerHostScript(StandIns):
         put(self.forward, "1\n")
         self.container = self.root / "ipsec-container"
         self.docker_down = self.root / "docker-down"
+        # The exchange directory is not made here: the script makes it, as it does in /var/lib.
+        self.ipsec = self.root / "ghostlink-ipsec"
         for name, text in (("id", STAND_IN_ID), ("docker", STAND_IN_DOCKER), ("systemctl", STAND_IN_SYSTEMCTL_DOCKER),
                            ("sysctl", STAND_IN_SYSCTL), ("install", STAND_IN_INSTALL), ("chown", STAND_IN_QUIET),
-                           ("modprobe", STAND_IN_QUIET), ("ip", STAND_IN_QUIET)):
+                           ("modprobe", STAND_IN_QUIET), ("ip", STAND_IN_QUIET), ("sleep", STAND_IN_SLEEP)):
             self.stand_in(name, text)
+        # chmod really changes the mode (on Linux the tests check it), and says what it was asked.
+        self.stand_in("chmod", f'#!/bin/sh\necho "chmod $*" >> "$FAKE_LOG"\nexec "{Path(shutil.which("chmod")).as_posix()}" "$@"\n')
         text = self.patched(SERVER_SCRIPT, [
             ("LIB=/usr/lib/ghostlink-server\n", f"LIB={self.root.as_posix()}/lib\n"),
             ("STATE=/var/lib/ghostlink-server\n", f"STATE={self.state.as_posix()}\n"),
+            ("IPSEC_DIR=/var/lib/ghostlink-ipsec\n", f"IPSEC_DIR={self.ipsec.as_posix()}\n"),
             ("SYSCTL_FILE=/etc/sysctl.d/90-ghostlink-ipsec.conf\n", f"SYSCTL_FILE={self.sysctl.as_posix()}\n"),
             ("/proc/sys/net/ipv4/ip_forward", self.forward.as_posix()),
             ("/run/systemd/system", f"{self.root.as_posix()}/run-systemd"),
@@ -393,7 +423,7 @@ class ServerHostScript(StandIns):
 
     def run_host(self, *arguments, **extra):
         environment = self.environment(FAKE_STATE=self.state.as_posix(), FAKE_FORWARD=self.forward.as_posix(),
-                                       FAKE_IPSEC_CONTAINER=self.container.as_posix(),
+                                       FAKE_IPSEC_CONTAINER=self.container.as_posix(), FAKE_IPSEC_DIR=self.ipsec.as_posix(),
                                        FAKE_DOCKER_DOWN=self.docker_down.as_posix(), **extra)
         return subprocess.run([SHELL, self.script.as_posix(), *arguments], env=environment,
                               capture_output=True, text=True, timeout=120)
@@ -452,13 +482,22 @@ class ServerHostScript(StandIns):
     STATUS = '{\n  "running": true,\n  "applied_generation": 3,\n  "sessions": [\n    {\n      "identity": "alice@ghostlink"\n    }\n  ]\n}\n'
 
     def test_ipsec_status_reads_what_the_component_reports(self):
-        (self.state / "ipsec").mkdir()
-        put(self.state / "ipsec/status.json", self.STATUS)
+        put(self.ipsec / "status.json", self.STATUS)
         put(self.container, "")
         result = self.run_host("ipsec", "status")
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in ("  running: true", "  applied_generation: 3", "  connections: 1"):
             self.assertIn(line, result.stdout)
+
+    def test_ipsec_status_ignores_a_report_in_the_state(self):
+        # 0.9.1 and earlier exchanged the files in the state's ipsec directory, which the server
+        # account can fill with whatever it likes: nothing reads it any more.
+        put(self.state / "ipsec/status.json", self.STATUS)
+        put(self.container, "")
+        result = self.run_host("ipsec", "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("running: true", result.stdout)
+        self.assertIn("connections: 0", result.stdout)
 
     @unittest.skipUnless(LINUX and DD_NOFOLLOW, "needs symlinks and a dd that opens with O_NOFOLLOW")
     def test_ipsec_status_never_reads_through_a_symlink(self):
@@ -468,14 +507,14 @@ class ServerHostScript(StandIns):
         put(other / "status.json", self.STATUS.replace('"running": true', '"error": "TOP-SECRET"'))
         for arrangement in ("directory", "file"):
             with self.subTest(arrangement=arrangement):
-                shutil.rmtree(self.state / "ipsec", ignore_errors=True)
-                if (self.state / "ipsec").is_symlink():
-                    (self.state / "ipsec").unlink()
+                shutil.rmtree(self.ipsec, ignore_errors=True)
+                if self.ipsec.is_symlink():
+                    self.ipsec.unlink()
                 if arrangement == "directory":
-                    (self.state / "ipsec").symlink_to(other, target_is_directory=True)
+                    self.ipsec.symlink_to(other, target_is_directory=True)
                 else:
-                    (self.state / "ipsec").mkdir()
-                    (self.state / "ipsec/status.json").symlink_to(other / "status.json")
+                    self.ipsec.mkdir()
+                    (self.ipsec / "status.json").symlink_to(other / "status.json")
                 result = self.run_host("ipsec", "status")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("TOP-SECRET", result.stdout + result.stderr)
@@ -568,11 +607,68 @@ class ServerHostScript(StandIns):
         self.assertTrue(self.sysctl.exists())
         self.assertEqual(self.forward.read_text().strip(), "1")
 
+    # The exchange directory: root's, outside the state, so the server account cannot replace it.
+
+    def mounts(self):
+        """The --volume arguments of every docker run, as {container name: [mounts]}."""
+        found = {}
+        for call in self.calls():
+            if call.startswith("docker run ") and " --name " in call:
+                name = call.split(" --name ")[1].split()[0]
+                found[name] = re.findall(r"--volume (\S+)", call)
+        return found
+
+    def test_ipsec_enable_makes_the_directory_root_s_with_the_accounts_group(self):
+        result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.ipsec.is_dir())
+        # Owner root, group of the server account (the stand-in id says 1001), set on "." inside the directory.
+        self.assertIn("chown 0:1001 .", self.calls())
+        self.assertIn("chmod 2770 .", self.calls())
+        if LINUX:
+            self.assertEqual(self.ipsec.stat().st_mode & 0o7777, 0o2770)
+
+    def test_a_report_of_an_earlier_run_is_not_taken_for_the_component_that_starts(self):
+        # The component is up once the new status.json says so: a "running" left by an earlier run
+        # (the component that was removed, or a status the server account put there) must not do.
+        put(self.ipsec / "status.json", self.RUNNING)
+        result = self.run_host("ipsec", "enable", FAKE_IPSEC_RUNNING="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not start", result.stderr)
+
+    def test_the_component_mounts_the_exchange_directory_and_not_the_state(self):
+        result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.mounts()["ghostlink-ipsec"], [f"{self.ipsec.as_posix()}:{self.ipsec.as_posix()}"])
+        run = [call for call in self.calls() if call.startswith("docker run ") and "--name ghostlink-ipsec " in call][0]
+        self.assertIn(f"serve --dir {self.ipsec.as_posix()} ", run)
+        self.assertNotIn(self.state.as_posix(), run)
+
+    def test_the_directory_is_given_its_owner_and_mode_again_at_each_start(self):
+        self.ipsec.mkdir(mode=0o777)
+        self.ipsec.chmod(0o777)
+        result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("chown 0:1001 .", self.calls())
+        if LINUX:
+            self.assertEqual(self.ipsec.stat().st_mode & 0o7777, 0o2770)
+
+    def test_ipsec_enable_refuses_a_file_for_the_directory_and_changes_nothing(self):
+        put(self.ipsec, "not a directory")
+        put(self.forward, "0\n")
+        result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a plain directory", result.stderr)
+        self.assertFalse(self.sysctl.exists())
+        self.assertEqual(self.forward.read_text().strip(), "0")
+        self.assertEqual(self.ipsec.read_text(), "not a directory")
+        self.assertEqual([call for call in self.calls() if call.startswith("docker run")], [])
+
     @unittest.skipUnless(LINUX, "needs symlinks")
     def test_ipsec_enable_refuses_a_symlink_for_the_directory_and_changes_nothing(self):
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
-        (self.state / "ipsec").symlink_to(elsewhere, target_is_directory=True)
+        self.ipsec.symlink_to(elsewhere, target_is_directory=True)
         put(self.forward, "0\n")
         result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING)
         self.assertNotEqual(result.returncode, 0)
@@ -580,18 +676,173 @@ class ServerHostScript(StandIns):
         self.assertFalse(self.sysctl.exists())
         self.assertEqual(self.forward.read_text().strip(), "0")
         self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual([call for call in self.calls() if call.startswith("docker run")], [])
 
     @unittest.skipUnless(LINUX, "needs symlinks")
-    def test_a_directory_swapped_while_the_component_starts_stops_it(self):
+    def test_a_symlink_at_the_old_place_changes_nothing(self):
+        # 0.9.1 and earlier mounted $STATE/ipsec, so a symlink the server account put there could
+        # send root's Docker mount anywhere. Nothing mounts, reads or enters it now.
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
+        (self.state / "ipsec").symlink_to(elsewhere, target_is_directory=True)
+        # And one put there while the component is created, as the old script's race had it.
         hook = 'rm -rf "$FAKE_STATE/ipsec" && ln -s "$FAKE_OTHER" "$FAKE_STATE/ipsec"'
         result = self.run_host("ipsec", "enable", FAKE_RUN_HOOK=hook, FAKE_OTHER=elsewhere.as_posix(),
                                FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        for container, mounts in self.mounts().items():
+            self.assertNotIn(f"{self.state.as_posix()}/ipsec", " ".join(mounts), container)
+        self.assertEqual(self.mounts()["ghostlink-ipsec"], [f"{self.ipsec.as_posix()}:{self.ipsec.as_posix()}"])
+
+    def test_ipsec_enable_stops_for_a_server_container_that_does_not_share_the_directory(self):
+        # Made by 0.9.1, or by a setup that did not finish: it would write the settings to the state,
+        # where a component that reads the exchange directory never looks.
+        put(self.forward, "0\n")
+        result = self.run_host("ipsec", "enable", FAKE_STATUS_JSON=self.RUNNING, FAKE_SERVER_MOUNTS=self.state.as_posix())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sudo ghostlink-server setup", result.stderr)
+        self.assertFalse(self.sysctl.exists())
+        self.assertEqual(self.forward.read_text().strip(), "0")
+        self.assertEqual([call for call in self.calls() if call.startswith("docker run")], [])
+
+    def test_ipsec_disable_clears_the_report_and_leaves_the_directory(self):
+        put(self.container, "")
+        put(self.ipsec / "status.json", self.STATUS)
+        result = self.run_host("ipsec", "disable")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.ipsec / "status.json").exists())
+        self.assertTrue(self.ipsec.is_dir())
+
+    # setup: the server gets the directory, and an upgrade moves the component to it.
+
+    def set_up_server(self, **files):
+        put(self.state / "management-key.json", self.KEY)
+        for name, text in files.items():
+            put(self.state / name.replace("__", "/"), text)
+
+    def test_setup_makes_the_directory_before_the_server_that_mounts_it(self):
+        self.set_up_server()
+        result = self.run_host("setup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.ipsec.is_dir())
+        self.assertIn("chown 0:1001 .", self.calls())
+        self.assertEqual(self.mounts()["ghostlink-server"],
+                         [f"{self.state.as_posix()}:{self.state.as_posix()}", f"{self.ipsec.as_posix()}:{self.ipsec.as_posix()}"])
+        run = [call for call in self.calls() if call.startswith("docker run ") and "--name ghostlink-server " in call][0]
+        self.assertTrue(run.endswith(f"serve --state {self.state.as_posix()} --ipsec-dir {self.ipsec.as_posix()}"), run)
+        # No IPsec component is made for a host that never enabled it.
+        self.assertNotIn("ghostlink-ipsec", self.mounts())
+
+    def test_setup_refuses_something_else_in_place_of_the_directory_before_it_stops_anything(self):
+        self.set_up_server()
+        put(self.ipsec, "not a directory")
+        result = self.run_host("setup")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a plain directory", result.stderr)
-        self.assertIn("docker stop --time 20 ghostlink-ipsec", self.calls())
-        self.assertIn("docker rm --force ghostlink-ipsec", self.calls())
+        self.assertEqual([call for call in self.calls() if call.startswith(("docker stop", "docker run", "docker rm"))], [])
+
+    UPGRADE_STATE = '{\n  "ipsec": {\n    "ikev2_enabled": true,\n    "ipsec_enabled": false\n  }\n}\n'
+
+    def old_layout(self):
+        """What 0.9.1 left: the component's files in the state, and its container."""
+        self.set_up_server(**{"state.json": self.UPGRADE_STATE, "ipsec__desired.json": '{"old": "OLD-SECRET"}',
+                              "ipsec__status.json": self.STATUS})
+        put(self.container, "")
+
+    def settings_present_when_the_component_starts(self):
+        witness = self.root / "witness"
+        hook = f'[ -s "$FAKE_IPSEC_DIR/desired.json" ] && : > "{witness.as_posix()}"; true'
+        return witness, hook
+
+    def test_an_upgrade_recreates_the_component_on_the_exchange_directory_after_the_server_wrote_its_settings(self):
+        self.old_layout()
+        witness, hook = self.settings_present_when_the_component_starts()
+        result = self.run_host("setup", FAKE_SETTINGS_ON_SLEEP="1", FAKE_RUN_HOOK=hook, FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        runs = [call for call in calls if call.startswith("docker run ") and " --name " in call]
+        self.assertEqual([call.split(" --name ")[1].split()[0] for call in runs], ["ghostlink-server", "ghostlink-ipsec"])
+        self.assertEqual(self.mounts()["ghostlink-ipsec"], [f"{self.ipsec.as_posix()}:{self.ipsec.as_posix()}"])
+        self.assertIn(f"serve --dir {self.ipsec.as_posix()} ", runs[1])
+        self.assertTrue(witness.exists(), "the component was created before the server had written its settings")
+        self.assertNotIn("has not written", result.stderr)
+
+    def test_an_upgrade_goes_on_when_the_server_is_slow_with_its_settings(self):
+        self.old_layout()
+        result = self.run_host("setup", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("has not written the IPsec settings", result.stderr)
+        self.assertIn("ghostlink-ipsec", self.mounts())
+
+    def test_an_upgrade_does_not_wait_for_settings_that_nothing_writes(self):
+        # IKEv2 and IPsec are off: the server writes nothing at its start, and there is nothing to wait for.
+        self.old_layout()
+        put(self.state / "state.json", self.STATE_JSON)
+        result = self.run_host("setup", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("has not written", result.stderr)
+        calls = self.calls()
+        server_up = [number for number, call in enumerate(calls) if call.startswith("docker image ls") and call.endswith("ghostlink-server")][0]
+        self.assertEqual([call for call in calls[server_up:] if call.startswith("sleep")], [], "setup waited for settings that are not coming")
+        self.assertIn("ghostlink-ipsec", self.mounts())
+
+    def test_an_upgrade_takes_the_old_directory_away_and_never_reads_it(self):
+        self.old_layout()
+        result = self.run_host("setup", FAKE_SETTINGS_ON_SLEEP="1", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "ipsec").exists(), "the old exchange directory was left in the state")
+        # The settings in the new place are the server's, not a copy of the old file.
+        self.assertNotIn("OLD-SECRET", (self.ipsec / "desired.json").read_text())
+
+    def test_what_else_is_in_the_old_directory_stays(self):
+        self.old_layout()
+        put(self.state / "ipsec/notes.txt", "mine")
+        result = self.run_host("setup", FAKE_SETTINGS_ON_SLEEP="1", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([path.name for path in (self.state / "ipsec").iterdir()], ["notes.txt"])
+
+    @unittest.skipUnless(LINUX, "needs symlinks")
+    def test_a_symlink_in_the_old_place_is_unlinked_and_not_followed(self):
+        self.old_layout()
+        shutil.rmtree(self.state / "ipsec")
+        elsewhere = self.root / "elsewhere"
+        put(elsewhere / "desired.json", "PRECIOUS")
+        (self.state / "ipsec").symlink_to(elsewhere, target_is_directory=True)
+        result = self.run_host("setup", FAKE_SETTINGS_ON_SLEEP="1", FAKE_STATUS_JSON=self.RUNNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "ipsec").is_symlink() or (self.state / "ipsec").exists())
+        self.assertEqual((elsewhere / "desired.json").read_text(), "PRECIOUS")
+
+    def test_a_setup_that_cannot_start_the_component_keeps_the_old_directory(self):
+        # Until the component runs on the new directory, nothing is taken away.
+        self.old_layout()
+        result = self.run_host("setup", FAKE_SETTINGS_ON_SLEEP="1", FAKE_IPSEC_RUNNING="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.state / "ipsec/desired.json").exists())
+
+    # The package scripts: a purge takes the exchange directory away with the state.
+
+    def package_script(self, name, *arguments):
+        text = self.patched(f"packages/linux/scripts/{name}", [
+            ("/var/lib/ghostlink-server", self.state.as_posix()), ("/var/lib/ghostlink-ipsec", self.ipsec.as_posix())])
+        script = self.root / name
+        script.write_bytes(text.encode())
+        self.stand_in("userdel", STAND_IN_QUIET)
+        return subprocess.run([SHELL, script.as_posix(), *arguments], env=self.environment(), capture_output=True, text=True, timeout=60)
+
+    def test_a_purge_deletes_the_exchange_directory_with_the_state_and_a_removal_keeps_both(self):
+        put(self.ipsec / "desired.json", "{}")
+        self.set_up_server()
+        for action in ("remove", "upgrade"):
+            result = self.package_script("server-postremove.sh", action)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((self.ipsec / "desired.json").exists() and (self.state / "management-key.json").exists(), action)
+        result = self.package_script("server-postremove.sh", "purge")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.ipsec.exists(), "a purge left the exchange directory")
+        self.assertFalse(self.state.exists(), "a purge left the state")
+        self.assertIn("userdel ghostlink-server", self.calls())
 
     # remove: a Docker that is not running cannot remove the containers, which then start with it.
 
@@ -617,10 +868,19 @@ class ServerHostScript(StandIns):
         lines = (ROOT / SERVER_SCRIPT).read_text(encoding="utf-8").splitlines()
         for number, line in enumerate(lines, 1):
             code = line.split("#", 1)[0]
-            for name in ("state.json", "management-key.json", "status.json"):
-                allowed = ("state_cat", "ipsec_cat", "rm -f status.json", 'die "')  # a name in a message is no read
+            for name in ("state.json", "management-key.json", "status.json", "desired.json"):
+                # A name in a message is no read, and rm unlinks a symlink without following it.
+                allowed = ("state_cat", "ipsec_cat", "rm -f --", 'die "', 'echo "')
                 if name in code and not any(helper in code for helper in allowed):
                     self.fail(f"{SERVER_SCRIPT}:{number} touches {name} without state_cat, ipsec_cat or in_state_dir: {line.strip()}")
+
+    def test_only_the_state_and_the_exchange_directory_are_mounted(self):
+        # The server account owns the state, so a mount of anything inside it (the old $STATE/ipsec) is
+        # one it could redirect. The exchange directory is root's, in /var/lib.
+        mounts = []
+        for line in (ROOT / SERVER_SCRIPT).read_text(encoding="utf-8").splitlines():
+            mounts += re.findall(r'--volume (\S+)', line.split("#", 1)[0])
+        self.assertEqual(sorted(mounts), sorted(['"$STATE:$STATE"', '"$IPSEC_DIR:$IPSEC_DIR"', '"$IPSEC_DIR:$IPSEC_DIR"']))
 
 
 JQ = shutil.which("jq")

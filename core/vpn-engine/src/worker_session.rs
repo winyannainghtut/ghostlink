@@ -23,7 +23,7 @@ use tokio::{
 };
 
 pub const WORKER_VERSION: &str =
-    "Ghostlink tunnel worker 0.9.1; sing-box 1.14.4; amneziawg-go 3.1.20260828";
+    "Ghostlink tunnel worker 0.9.2; sing-box 1.14.4; amneziawg-go 3.1.20260828";
 
 /// Tag of the tunnel outbound or endpoint in every generated configuration.
 pub const PROXY_TAG: &str = "proxy";
@@ -604,6 +604,93 @@ mod tests {
             .unwrap()
             .iter()
             .any(|o| o["tag"] == "direct"));
+    }
+
+    /// The evidence behind what the cleanup check looks for on Linux (the decision of 0.9.2: the
+    /// interface and its addresses, and no `ip rule` or nftables entries). A worker that dies
+    /// leaves nothing in the kernel that outlives its TUN interface and can cut traffic, because
+    /// of how this configuration sets the TUN up in sing-box 1.14.4 and its sing-tun:
+    ///
+    /// - The TUN device is not persistent (sing-tun never sets TUNSETPERSIST): it goes with the
+    ///   process, and the kernel removes the routes of the table `auto_route` filled (2022) and the
+    ///   addresses with it. systemd-resolved drops a link's DNS settings when the link goes.
+    /// - There is no `auto_redirect`: no nftables or iptables entries, no packet marks, no rules
+    ///   that match on them. Those are what a dead worker would leave behind (the redirect would
+    ///   keep sending packets to a port nobody listens on).
+    /// - What does outlive it are the `ip rule`s at priorities 9000 to 9010 that send lookups to
+    ///   table 2022. A rule that points at an empty table does not match: the lookup goes on to
+    ///   the next rule and ends in the main table. `strict_route` adds `unreachable` rules (which
+    ///   would cut a family off for good) only for an address family that the TUN has no address
+    ///   in, and both families have one here. And the worker removes all of 9000 to 9010 itself
+    ///   at the start of the next session, so a check that held the barrier for them would never
+    ///   be lifted by the connection that is the way to clean them.
+    ///
+    /// The test pins the configuration that this rests on: whoever adds a setting to the TUN
+    /// inbound (`auto_redirect`, `iproute2_*`, interface or UID filters) or drops one address
+    /// family must read the above again, and change the check or this test knowingly.
+    #[test]
+    fn the_tunnel_inbound_leaves_nothing_that_outlives_its_interface_and_cuts_traffic() {
+        use std::collections::BTreeSet;
+        let shadowsocks = Outbound::Shadowsocks(
+            AccessKey::parse("ss://aes-256-gcm:test-only@192.0.2.10:8388").unwrap(),
+        );
+        // A limited WireGuard profile routes only its prefixes into the TUN: one more key.
+        let wireguard = Outbound::WireGuard(crate::wireguard::parse("[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.8.1.2/32\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nEndpoint = 203.0.113.5:51820\nAllowedIPs = 10.0.0.0/8\n").unwrap());
+        for (outbound, extra) in [(shadowsocks, None), (wireguard, Some("route_address"))] {
+            let document = config(&outbound, 1, 2, "secret", true, &RoutingPolicy::default());
+            let tun = document["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|inbound| inbound["type"] == "tun")
+                .expect("a tunnel inbound");
+            let keys: BTreeSet<&str> = tun
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = BTreeSet::from([
+                "type",
+                "tag",
+                "interface_name",
+                "address",
+                "auto_route",
+                "strict_route",
+                "dns_mode",
+                "mtu",
+                "stack",
+            ]);
+            expected.extend(extra);
+            assert_eq!(
+                keys, expected,
+                "the TUN inbound changed: read the comment of this test"
+            );
+            assert_eq!(tun["interface_name"], TUN_NAME);
+            assert_eq!(tun["auto_route"], true);
+            assert_eq!(tun["strict_route"], true);
+            assert!(
+                tun.get("auto_redirect").is_none(),
+                "auto_redirect leaves nftables entries"
+            );
+            // Both families have an address, so strict_route adds no `unreachable` rule.
+            assert_eq!(tun["address"], json!(TUN_CIDRS));
+            let families: Vec<bool> = TUN_CIDRS
+                .iter()
+                .map(|cidr| {
+                    cidr.split('/')
+                        .next()
+                        .and_then(|address| address.parse::<std::net::IpAddr>().ok())
+                        .expect("an address")
+                        .is_ipv4()
+                })
+                .collect();
+            assert_eq!(families, [true, false], "one IPv4 and one IPv6 address");
+        }
+        // What the service looks for is the same interface and the same addresses.
+        let looked_for = footprint();
+        assert_eq!(looked_for.interface.as_deref(), Some(TUN_NAME));
+        assert_eq!(looked_for.addresses.len(), 2);
     }
 
     #[tokio::test]

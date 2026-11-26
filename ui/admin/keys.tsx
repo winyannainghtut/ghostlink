@@ -2,10 +2,12 @@
 // new-client flow. Files go through the transport (a download in the dashboard, the Downloads
 // folder in the desktop app).
 import { Copy, Globe, Laptop, Smartphone, UserRound } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { confName, fileSafe } from '@shared/format';
 import { Button, Sheet, useUI } from '@shared/glass';
+import { exclusive, type Lock } from '@shared/lock';
 import { APPLE, protocolName, svgURL, type Key, type KeySummary, type ServerApi, type User } from './api';
+import { connectHere, type ConnectResult } from './connectHere';
 import { profilePath, type ProfileOptions } from './protocols';
 import { useApi } from './store';
 
@@ -66,10 +68,20 @@ const scanHint = (key: Key, content: string) =>
         ? 'Scan with v2rayNG, Hiddify, Streisand or Shadowrocket.'
         : 'Scan with the AmneziaVPN app.';
 
+// "Connect now" for a key just saved on this device: connects to it by its ID, asking first when
+// another server is connected. One at a time: a second press while the first is running is refused.
+export function useConnectHere(): (profile: string, label: string) => Promise<ConnectResult | undefined> {
+  const { toast, confirm } = useUI();
+  const { connect } = useApi();
+  const lock = useRef<Lock>({ running: false });
+  return (profile, label) => exclusive(lock.current, () => connectHere({ connect, confirm, toast }, profile, label));
+}
+
 export function useKeyTools(onChanged?: () => void) {
   const { toast, confirm, copy } = useUI();
   const server = useApi();
   const { api } = server;
+  const connectNow = useConnectHere();
   const [qr, setQr] = useState<{ url: string; title: string; note: string } | null>(null);
   // A profile saved without its password: the password stays on screen until the admin is done,
   // rather than in a toast that disappears.
@@ -113,8 +125,8 @@ export function useKeyTools(onChanged?: () => void) {
     downloadKit: (user: User) => run(async () => toast(await saveKit(server, user))),
     useHere: (user: User, id: string) =>
       run(async () => {
-        await server.useHere(user, await full(user, id));
-        toast('Saved under My servers on this device.');
+        const profile = await server.useHere(user, await full(user, id));
+        toast('Saved under My servers on this device.', 'ok', server.canConnect ? { label: 'Connect now', run: () => void connectNow(profile, user.name) } : undefined);
       }),
     revoke: (user: User, key: KeySummary) =>
       run(async () => {

@@ -1,3 +1,4 @@
+mod connect;
 mod ipc;
 mod remote;
 #[cfg(windows)]
@@ -233,6 +234,18 @@ fn remove_stale_runtime_files(data_dir: &Path) -> bool {
     removed
 }
 
+/// The answer to a request that failed with an error.
+fn failure(error: anyhow::Error) -> Response {
+    if error.is::<StateTooLarge>() {
+        Response::err(
+            "invalid_request",
+            "Saved servers and profiles would exceed the service's 64 MiB limit; remove some first",
+        )
+    } else {
+        Response::err("internal", "Service storage or engine operation failed; run doctor and inspect the service installation")
+    }
+}
+
 struct Daemon {
     args: Args,
     store: Store,
@@ -244,6 +257,8 @@ struct Daemon {
     admin_clients: std::sync::Mutex<
         std::collections::HashMap<String, (String, ghostlink_engine::server_admin::AdminClient)>,
     >,
+    /// The connection being prepared while a dynamic key is fetched without the service lock.
+    attempts: connect::Attempts,
 }
 impl Daemon {
     fn commit(&mut self, next: Store) -> Result<()> {
@@ -293,26 +308,31 @@ impl Daemon {
             }
         }
     }
-    async fn handle(&mut self, request: Request) -> Response {
+    /// Authorizes a request and records that it was accepted: the actor, or the answer to give.
+    /// Operations are refused if this audit entry cannot be durably recorded.
+    fn admit(&self, request: &Request) -> Result<String, Response> {
         let operation = request.action.name();
-        let actor = match self.authorize(&request) {
+        let actor = match self.authorize(request) {
             Ok(actor) => actor,
             Err(response) => {
                 let _ = self.audit("unauthorized", operation, "denied");
-                return response;
+                return Err(response);
             }
         };
-        // Refuse operations if the authorization audit cannot be durably recorded.
         if self.audit(&actor, operation, "accepted").is_err() {
-            return Response::err("internal", "Audit storage is unavailable");
+            return Err(Response::err("internal", "Audit storage is unavailable"));
         }
+        Ok(actor)
+    }
+    async fn handle(&mut self, request: Request) -> Response {
+        let operation = request.action.name();
+        let actor = match self.admit(&request) {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
         let response = match self.dispatch(request.action).await {
             Ok(response) => response,
-            Err(error) if error.is::<StateTooLarge>() => Response::err(
-                "invalid_request",
-                "Saved servers and profiles would exceed the service's 64 MiB limit; remove some first",
-            ),
-            Err(_) => Response::err("internal", "Service storage or engine operation failed; run doctor and inspect the service installation"),
+            Err(error) => failure(error),
         };
         let outcome = response
             .error
@@ -377,129 +397,6 @@ impl Daemon {
         }
         let _ = self.audit("service", "network_cleanup_check", "verified");
         true
-    }
-    async fn connect(&mut self, name: Option<String>, switching: bool) -> Result<Response> {
-        let name = match name.or_else(|| self.store.default_profile.clone()) {
-            Some(name) => name,
-            None => {
-                return Ok(Response::err(
-                    "not_found",
-                    "No default VPN profile is configured",
-                ))
-            }
-        };
-        let stored = match self.store.profiles.get(&name) {
-            Some(p) => p,
-            None => return Ok(Response::err("not_found", "VPN profile does not exist")),
-        };
-        // Connecting to the server that is already running only reports its state. Nothing is
-        // checked or fetched again: a dynamic key's host may be unreachable while the tunnel is
-        // up, and other requests wait while this one holds the service.
-        if !switching && self.session.is_some() {
-            let status = self.state.read().await.status();
-            let active = self
-                .session
-                .as_ref()
-                .is_some_and(|s| session_is_active(s.finished(), &status.status));
-            if active {
-                if status.profile.as_deref() == Some(&name) {
-                    return Ok(Response::ok(status));
-                }
-                // Another server is active, and this is not a switch. That is the answer, given
-                // before anything else is done for this request: reading the saved key and
-                // fetching a dynamic one can take 15 seconds while every other request waits, and
-                // a key that cannot be read or fetched must not turn "busy" into "invalid".
-                let what = if stored.summary.kind == "openvpn" {
-                    "profile"
-                } else {
-                    "server"
-                };
-                return Ok(Response::err(
-                    "busy",
-                    &format!("Another {what} is active; use switch"),
-                ));
-            }
-        }
-        let clear = storage::unseal(&stored.sealed_content)?;
-        let content = String::from_utf8(clear)?;
-        // Every kind except OpenVPN runs in the managed tunnel worker.
-        if stored.summary.kind != "openvpn" {
-            if !worker_session::worker_available(&self.args.sing_box).await {
-                return Ok(Response::err(
-                    "engine_unavailable",
-                    "Install the pinned managed Ghostlink tunnel worker in the service installation",
-                ));
-            }
-            // A server's own override wins over the global split-tunnel policy.
-            let policy = stored
-                .routing_override
-                .clone()
-                .unwrap_or_else(|| self.store.routing_policy.clone());
-            let outbound = match access::resolve(&content).await {
-                Ok(resolved) => resolved.outbound,
-                Err(_) => return Ok(Response::err("invalid_profile", "The saved key is invalid, unsupported or its dynamic configuration is unavailable")),
-            };
-            #[cfg(unix)]
-            if outbound.full_tunnel() && !self.args.allow_full_tunnel {
-                return Ok(Response::err("permission_denied", "Full tunnel requires the administrator to authorize route changes with --allow-full-tunnel after protecting SSH access"));
-            }
-            self.disconnect().await;
-            if let Some(error) = self.cleanup_failure().await {
-                return Ok(error);
-            }
-            self.session = Some(
-                worker_session::start(
-                    &self.args.sing_box,
-                    &self.args.data_dir.join("run"),
-                    name,
-                    outbound,
-                    policy,
-                    // Management APIs of servers administered here stay outside the tunnel.
-                    self.store
-                        .managed_servers
-                        .values()
-                        .map(|m| (m.host.clone(), m.port))
-                        .collect(),
-                    self.state.clone(),
-                    self.events.clone(),
-                    Duration::from_secs(self.args.connection_timeout_seconds),
-                )
-                .await?,
-            );
-            return Ok(Response::ok(self.state.read().await.status()));
-        }
-        let profile = match profile::validate(&name, &content) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(Response::err(
-                    "invalid_profile",
-                    "Stored profile is invalid or its certificate is expired or not yet valid",
-                ))
-            }
-        };
-        #[cfg(unix)]
-        if profile.summary.tunnel_mode == "full" && !self.args.allow_full_tunnel {
-            return Ok(Response::err("permission_denied", "Full tunnel is disabled by service policy; the administrator must authorize route changes with --allow-full-tunnel after protecting SSH access"));
-        }
-        if !self.args.openvpn.is_absolute() || !self.args.openvpn.is_file() {
-            return Ok(Response::err("engine_unavailable", "Install OpenVPN Community and configure the service with its absolute executable path"));
-        }
-        self.disconnect().await;
-        if let Some(error) = self.cleanup_failure().await {
-            return Ok(error);
-        }
-        let session = management::start(
-            &self.args.openvpn,
-            &self.args.data_dir.join("run"),
-            profile,
-            self.state.clone(),
-            &self.args.windows_driver,
-            self.events.clone(),
-            Duration::from_secs(self.args.connection_timeout_seconds),
-        )
-        .await?;
-        self.session = Some(session);
-        Ok(Response::ok(self.state.read().await.status()))
     }
     /// Imports any credential the managed worker uses: `ss://`, `ssconf://`, `vless://`,
     /// `vpn://` or WireGuard/AmneziaWG configuration text.
@@ -692,6 +589,8 @@ impl Daemon {
             Action::Connect { profile } => self.connect(profile, false).await,
             Action::Switch { profile } => self.connect(Some(profile), true).await,
             Action::Disconnect {} => {
+                // A connection still being prepared (a dynamic key being fetched) is given up.
+                self.attempts.cancel();
                 self.disconnect().await;
                 if let Some(error) = self.cleanup_failure().await {
                     return Ok(error);
@@ -941,6 +840,7 @@ async fn run(
         events,
         audit_log: audit_log.clone(),
         admin_clients: Default::default(),
+        attempts: Default::default(),
     }));
     let mut listener = ipc::Listener::bind(&args).await?;
     {
@@ -1004,6 +904,7 @@ async fn run(
                     let response = match request {
                         Ok(Ok(bytes)) => match serde_json::from_slice::<Request>(&bytes) {
                             Ok(request) if remote::is_remote(&request.action) => remote::handle(&daemon, request).await,
+                        Ok(request) if connect::is_connect(&request.action) => connect::handle(&daemon, request).await,
                         Ok(request) => daemon.lock().await.handle(request).await,
                             Err(_) => Response::err("invalid_request", "Invalid request; use the versioned Ghostlink contract"),
                         },
@@ -1045,6 +946,7 @@ pub(crate) fn test_daemon(name: &str) -> Daemon {
             lock: std::sync::Mutex::new(()),
         }),
         admin_clients: Default::default(),
+        attempts: Default::default(),
     }
 }
 

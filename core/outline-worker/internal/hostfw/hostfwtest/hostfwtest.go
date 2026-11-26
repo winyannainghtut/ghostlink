@@ -82,6 +82,33 @@ func (h *Host) Flush() {
 	}
 }
 
+// FlushChain is iptables -t TABLE -F CHAIN: the rules of that one chain go and the chain stays;
+// every other chain keeps its rules, the jump to this chain among them. It reports whether the
+// chain exists.
+func (h *Host) FlushChain(table, name string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c := h.tables[table][name]
+	if c == nil {
+		return false
+	}
+	c.rules = nil
+	return true
+}
+
+// AddRule is iptables -t TABLE -A CHAIN SPEC, as other software or an administrator does it. It
+// reports whether the chain exists.
+func (h *Host) AddRule(table, name, spec string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c := h.tables[table][name]
+	if c == nil {
+		return false
+	}
+	c.rules = append(c.rules, spec)
+	return true
+}
+
 // Reset is iptables -F followed by iptables -X, or a reload that replaces the whole ruleset
 // (netfilter-persistent, iptables-restore without --noflush): nothing of the agent is left, and
 // no user chain either.

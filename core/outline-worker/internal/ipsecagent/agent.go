@@ -435,9 +435,13 @@ func (a *Agent) cycle(ctx context.Context, full bool) {
 // keepFirewall puts the firewall back when something on the host took it away: a firewall reload
 // (firewalld, ufw), netfilter-persistent, or iptables -F. Those remove the agent's jumps, and with
 // them the rules of its chains or the chains themselves, so putting the jumps back is not enough
-// (they would send packets through empty chains: no isolation, no NAT, no DNS redirect). When
-// anything is missing it applies the whole rule set again, as for new settings. A failure shows in
-// the status until a later check finds the firewall whole. An intact firewall is left alone.
+// (they would send packets through empty chains: no isolation, no NAT, no DNS redirect). One
+// chain emptied on its own (iptables -F GHOSTLINK-IPSEC-OUT) leaves its jump in place, so the
+// check also compares the number of rules in each chain with the number the last apply put there
+// (the speed limit rules included: they are applied, and counted, whenever the sessions change).
+// When anything is missing it applies the whole rule set again, as for new settings. A failure
+// shows in the status until a later check finds the firewall whole. An intact firewall is left
+// alone, and so is one with more rules than were put in.
 func (a *Agent) keepFirewall(ctx context.Context) {
 	missing := a.FW.Missing(ctx)
 	if len(missing) == 0 {

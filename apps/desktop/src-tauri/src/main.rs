@@ -2,7 +2,7 @@
 use ghostlink_contracts::{Action, ConnectionState, Request, Response, Status, SCHEMA_VERSION};
 use std::time::Duration;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{TrayIcon, TrayIconBuilder},
     Manager,
 };
@@ -165,27 +165,159 @@ fn tray_tooltip(status: Option<&Status>) -> String {
     }
 }
 
-/// Keeps the tray icon's tooltip in step with the connection: the service is asked every few
-/// seconds, and the tooltip is set only when its text changes. The menu is untouched.
-async fn follow_connection(tray: TrayIcon) {
+/// What the tray menu shows: the state of the connection, and what can be done about it from the
+/// menu. The menu is built from this alone, so what it shows can be tested without a screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayMenu {
+    /// The first line, which is not a command: what the connection is doing.
+    state: String,
+    /// The default server's ID, when a connection to it can be started from the menu.
+    connect: Option<String>,
+    /// Whether a session is running (or starting) that the menu can stop.
+    can_disconnect: bool,
+}
+
+/// A server's ID as the tray names it: cut to 40 characters.
+fn short(profile: &str) -> String {
+    profile.chars().take(40).collect()
+}
+
+/// The menu for the service's status and its default server; None is a service that does not
+/// answer. "Connect to" is offered when no session runs (disconnected, or the last one failed:
+/// connecting again is also how a failed session is tried again) and there is a default; it is
+/// the server saved as the default, as the service knows it, never one the menu made up.
+/// Disconnect is enabled while a session is connecting, connected or reconnecting; a session that
+/// is already disconnecting, or none, has nothing to stop.
+fn tray_menu(status: Option<&Status>, default_profile: Option<&str>) -> TrayMenu {
+    let Some(status) = status else {
+        return TrayMenu {
+            state: "Ghostlink service is not running".into(),
+            connect: None,
+            can_disconnect: false,
+        };
+    };
+    let to = status
+        .profile
+        .as_deref()
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| format!(" to {}", short(profile)))
+        .unwrap_or_default();
+    let (state, running) = match status.status {
+        ConnectionState::Connected => (format!("Connected{to}"), true),
+        ConnectionState::Connecting => (format!("Connecting{to}"), true),
+        ConnectionState::Reconnecting => (format!("Reconnecting{to}"), true),
+        ConnectionState::Disconnecting => ("Disconnecting".into(), false),
+        ConnectionState::Failed => ("Connection failed".into(), false),
+        ConnectionState::Disconnected => ("Disconnected".into(), false),
+    };
+    let idle = matches!(
+        status.status,
+        ConnectionState::Disconnected | ConnectionState::Failed
+    );
+    TrayMenu {
+        state,
+        connect: default_profile
+            .filter(|profile| idle && connect_id(profile).is_some())
+            .map(String::from),
+        can_disconnect: running,
+    }
+}
+
+/// The id of the menu item that connects to `profile`; None for a name no server can have (IDs
+/// are 1 to 64 letters, digits, hyphens and underscores).
+fn connect_id(profile: &str) -> Option<String> {
+    let valid = !profile.is_empty()
+        && profile.len() <= 64
+        && profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then(|| format!("connect:{profile}"))
+}
+
+/// The server a menu item's id says to connect to, if it is the id of a "Connect to" item.
+fn connect_target(id: &str) -> Option<&str> {
+    let profile = id.strip_prefix("connect:")?;
+    connect_id(profile).map(|_| profile)
+}
+
+/// The tray menu as the app shows it: the lines of `model`, then Open and Quit.
+fn tray_menu_items<R: tauri::Runtime>(
+    app: &impl Manager<R>,
+    model: &TrayMenu,
+) -> tauri::Result<Menu<R>> {
+    let state = MenuItem::with_id(app, "state", &model.state, false, None::<&str>)?;
+    let connect = match &model.connect {
+        Some(profile) => Some(MenuItem::with_id(
+            app,
+            connect_id(profile).unwrap_or_default(),
+            format!("Connect to {}", short(profile)),
+            true,
+            None::<&str>,
+        )?),
+        None => None,
+    };
+    let disconnect = MenuItem::with_id(
+        app,
+        "disconnect",
+        "Disconnect",
+        model.can_disconnect,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let show = MenuItem::with_id(app, "show", "Open Ghostlink", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Ghostlink", true, None::<&str>)?;
+    let mut items: Vec<&dyn IsMenuItem<R>> = vec![&state];
+    if let Some(connect) = &connect {
+        items.push(connect);
+    }
+    items.extend([&disconnect as &dyn IsMenuItem<R>, &separator, &show, &quit]);
+    Menu::with_items(app, &items)
+}
+
+/// The status and the default server in the service's answer to `info`; None for a service that
+/// does not answer.
+fn read_info(response: Response) -> (Option<Status>, Option<String>) {
+    let Some(data) = response.data.filter(|_| response.success) else {
+        return (None, None);
+    };
+    let status = data
+        .get("connection")
+        .and_then(|connection| serde_json::from_value(connection.clone()).ok());
+    let default = data
+        .get("default_profile")
+        .and_then(|profile| profile.as_str())
+        .map(String::from);
+    (status, default)
+}
+
+/// Keeps the tray in step with the connection: the service is asked every few seconds, and the
+/// tooltip and the menu are set only when what they say changes.
+async fn follow_connection(tray: TrayIcon, app: tauri::AppHandle) {
     let endpoint = std::env::var("GHOSTLINK_ENDPOINT")
         .unwrap_or_else(|_| ghostlink_contracts::default_endpoint());
-    let mut shown = String::new();
+    let mut tooltip = String::new();
+    // The menu built at start.
+    let mut shown = tray_menu(None, None);
     loop {
         let request = Request {
             schema_version: SCHEMA_VERSION,
             agent_token: None,
-            action: Action::Status {},
+            action: Action::Info {},
         };
         let response = ghostlink_contracts::call(&endpoint, request, Duration::from_secs(3)).await;
-        let status: Option<Status> = response
-            .data
-            .filter(|_| response.success)
-            .and_then(|data| serde_json::from_value(data).ok());
+        let (status, default_profile) = read_info(response);
         let text = tray_tooltip(status.as_ref());
-        if text != shown {
+        if text != tooltip {
             let _ = tray.set_tooltip(Some(&text));
-            shown = text;
+            tooltip = text;
+        }
+        let menu = tray_menu(status.as_ref(), default_profile.as_deref());
+        if menu != shown {
+            // Tried again at the next round if it fails.
+            let set = tray_menu_items(&app, &menu).and_then(|built| tray.set_menu(Some(built)));
+            if set.is_ok() {
+                shown = menu;
+            }
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -195,11 +327,8 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![vpn_request, save_download])
         .setup(|app| {
-            let show = MenuItem::with_id(app, "show", "Open Ghostlink", true, None::<&str>)?;
-            let disconnect =
-                MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit Ghostlink", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &disconnect, &quit])?;
+            // The menu as it is until the service has been asked (see `follow_connection`).
+            let menu = tray_menu_items(app.handle(), &tray_menu(None, None))?;
             let mut tray = TrayIconBuilder::new()
                 .tooltip("Ghostlink")
                 .menu(&menu)
@@ -220,13 +349,23 @@ fn main() {
                         });
                     }
                     "quit" => app.exit(0),
-                    _ => {}
+                    id => {
+                        if let Some(profile) = connect_target(id) {
+                            let profile = profile.to_string();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = vpn_request(Action::Connect {
+                                    profile: Some(profile),
+                                })
+                                .await;
+                            });
+                        }
+                    }
                 });
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
             let tray = tray.build(app)?;
-            tauri::async_runtime::spawn(follow_connection(tray));
+            tauri::async_runtime::spawn(follow_connection(tray, app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -241,7 +380,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{download_name, save_in, tray_tooltip, ConnectionState, Status, REQUEST_TIMEOUT};
+    use super::{
+        connect_id, connect_target, download_name, read_info, save_in, tray_menu, tray_tooltip,
+        ConnectionState, Response, Status, TrayMenu, REQUEST_TIMEOUT,
+    };
 
     #[test]
     fn conf_files_keep_names_that_wireguard_can_import() {
@@ -375,6 +517,127 @@ mod tests {
         let text = tray_tooltip(Some(&status(ConnectionState::Connected, Some(&long))));
         assert!(text.chars().count() <= 127, "{text}");
         assert!(text.ends_with(&"x".repeat(40)));
+    }
+
+    fn status(state: ConnectionState, profile: Option<&str>) -> Status {
+        Status {
+            status: state,
+            profile: profile.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn menu(state: &str, connect: Option<&str>, can_disconnect: bool) -> TrayMenu {
+        TrayMenu {
+            state: state.into(),
+            connect: connect.map(String::from),
+            can_disconnect,
+        }
+    }
+
+    /// The tray menu follows the state: its first line says it, Disconnect is there to use only
+    /// while a session runs, and "Connect to" the default server only when none does.
+    #[test]
+    fn the_tray_menu_follows_the_connection() {
+        use ConnectionState::*;
+        let with = |state, profile| tray_menu(Some(&status(state, profile)), Some("home"));
+        assert_eq!(
+            with(Disconnected, None),
+            menu("Disconnected", Some("home"), false)
+        );
+        assert_eq!(
+            with(Connected, Some("office")),
+            menu("Connected to office", None, true)
+        );
+        assert_eq!(
+            with(Connecting, Some("home")),
+            menu("Connecting to home", None, true)
+        );
+        assert_eq!(
+            with(Reconnecting, Some("home")),
+            menu("Reconnecting to home", None, true)
+        );
+        // Nothing to stop: it is stopping already. Nothing to start from: it is not over.
+        assert_eq!(
+            with(Disconnecting, Some("home")),
+            menu("Disconnecting", None, false)
+        );
+        // The last session failed: no session runs, and connecting again is the way on.
+        assert_eq!(
+            with(Failed, Some("home")),
+            menu("Connection failed", Some("home"), false)
+        );
+        // Connected without a name (a status of an older service): no "to".
+        assert_eq!(with(Connected, None), menu("Connected", None, true));
+        // The service does not answer: nothing can be done from the menu but Open and Quit.
+        assert_eq!(
+            tray_menu(None, Some("home")),
+            menu("Ghostlink service is not running", None, false)
+        );
+    }
+
+    /// Without a default server there is nothing to connect to from the menu, and a default whose
+    /// name no server can have (the answer of another program) is not put in a menu id.
+    #[test]
+    fn the_tray_connects_only_to_a_default_server_that_exists() {
+        let idle = status(ConnectionState::Disconnected, None);
+        assert_eq!(tray_menu(Some(&idle), None).connect, None);
+        for bad in ["", "a b", "x/../y", "name:with:colons", &"x".repeat(65)] {
+            assert_eq!(tray_menu(Some(&idle), Some(bad)).connect, None, "{bad:?}");
+        }
+        assert_eq!(
+            tray_menu(Some(&idle), Some(&"x".repeat(64))).connect,
+            Some("x".repeat(64))
+        );
+        // The menu item's id names the server, and only such an id connects.
+        assert_eq!(connect_id("home").as_deref(), Some("connect:home"));
+        assert_eq!(connect_target("connect:home"), Some("home"));
+        assert_eq!(
+            connect_target(&connect_id(&"x".repeat(64)).unwrap()).map(str::len),
+            Some(64)
+        );
+        for id in [
+            "connect:",
+            "connect:a b",
+            "connect:../x",
+            "connect:home:2",
+            "disconnect",
+            "show",
+            "quit",
+            "state",
+        ] {
+            assert_eq!(connect_target(id), None, "{id:?}");
+        }
+        // A long ID is cut in the menu's text, not in what is connected to.
+        let long = "x".repeat(60);
+        assert_eq!(
+            tray_menu(Some(&status(ConnectionState::Connected, Some(&long))), None).state,
+            format!("Connected to {}", "x".repeat(40))
+        );
+    }
+
+    /// What the poller reads from the service's `info` answer: the connection and the default
+    /// server; nothing when it does not answer or the answer is not one.
+    #[test]
+    fn the_tray_reads_the_connection_and_the_default_server_from_info() {
+        let info = |default: serde_json::Value| {
+            Response::ok(serde_json::json!({
+                "connection": status(ConnectionState::Connected, Some("home")),
+                "autoconnect": false,
+                "default_profile": default,
+                "engines": [],
+                "version": "0.9.2"
+            }))
+        };
+        let (read, default) = read_info(info(serde_json::json!("home")));
+        assert_eq!(read.unwrap().status, ConnectionState::Connected);
+        assert_eq!(default.as_deref(), Some("home"));
+        assert_eq!(read_info(info(serde_json::Value::Null)).1, None);
+        assert!(read_info(Response::err("daemon_unavailable", "x"))
+            .0
+            .is_none());
+        let odd = Response::ok(serde_json::json!({"connection": "nothing"}));
+        assert!(read_info(odd).0.is_none());
     }
 
     /// The app waits for the service as long as the CLI and the MCP bridge do; it used to give up

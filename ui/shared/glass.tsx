@@ -293,7 +293,7 @@ export function Check({ checked, onChange, children }: { checked: boolean; onCha
 }
 
 export function Note({ children, tone = 'muted' }: { children: ReactNode; tone?: 'muted' | 'warn' | 'bad' }) {
-  return <p className={cx('text-[12.5px] leading-relaxed', tone === 'muted' && 'text-fg-3', tone === 'warn' && 'text-idle', tone === 'bad' && 'text-bad')}>{children}</p>;
+  return <p className={cx('text-[12.5px] leading-relaxed', tone === 'muted' && 'text-fg-3', tone === 'warn' && 'text-warn', tone === 'bad' && 'text-bad')}>{children}</p>;
 }
 
 export function Facts({ rows }: { rows: [ReactNode, ReactNode][] }) {
@@ -328,7 +328,7 @@ const LayerContext = createContext<(dialog: HTMLDialogElement, open: boolean) =>
 // closed, after which the browser would focus the Close button instead. A sheet with nothing to
 // type (a QR code, the About text) focuses its main button, so Enter or Space closes it, not the
 // small cross in its corner.
-export function Sheet({ open, onClose, title, subtitle, size = 'normal', children, footer }: {
+export function Sheet({ open, onClose, title, subtitle, size = 'normal', children, footer, drop }: {
   open: boolean;
   onClose: () => void;
   title: ReactNode;
@@ -336,6 +336,8 @@ export function Sheet({ open, onClose, title, subtitle, size = 'normal', childre
   size?: 'normal' | 'medium' | 'wide';
   children: ReactNode;
   footer?: ReactNode;
+  // Drag events of the whole sheet (header, body and footer), for a sheet that takes dropped files.
+  drop?: Pick<ComponentProps<'div'>, 'onDragEnter' | 'onDragOver' | 'onDragLeave' | 'onDrop'>;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
@@ -373,7 +375,7 @@ export function Sheet({ open, onClose, title, subtitle, size = 'normal', childre
       }}
     >
       {open && (
-        <div className="glass-strong flex max-h-[calc(100vh-48px)] flex-col overflow-hidden rounded-[28px]">
+        <div className="glass-strong flex max-h-[calc(100vh-48px)] flex-col overflow-hidden rounded-[28px]" {...drop}>
           <header className="flex items-start justify-between gap-4 px-6 pt-6 pb-3">
             <div className="min-w-0">
               <h2 id={titleId} className="text-[19px]">
@@ -395,10 +397,13 @@ export function Sheet({ open, onClose, title, subtitle, size = 'normal', childre
 
 // --- toasts and confirmations ---------------------------------------------------------------
 
-type Toast = { id: number; message: string; tone: 'ok' | 'bad' | 'info'; ms: number };
+// A button in a toast, for the one next step the toast is about ("Connect now"). Clicking it
+// dismisses the toast and runs the action.
+export type ToastAction = { label: string; run: () => void };
+type Toast = { id: number; message: string; tone: 'ok' | 'bad' | 'info'; ms: number; action?: ToastAction };
 type Ask = { title: string; text: string; action: string; danger?: boolean };
 type UI = {
-  toast: (message: string, tone?: Toast['tone']) => void;
+  toast: (message: string, tone?: Toast['tone'], action?: ToastAction) => void;
   confirm: (ask: Ask) => Promise<boolean>;
   // Copies text and says so (done) or says it could not (a toast in both cases); true when copied.
   copy: (text: string, done: string, failed?: string) => Promise<boolean>;
@@ -440,6 +445,18 @@ function ToastCard({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
     >
       <span className={cx('size-2 shrink-0 rounded-full', toast.tone === 'ok' ? 'bg-ok' : toast.tone === 'bad' ? 'bg-bad' : 'bg-down')} />
       <span className="min-w-0 flex-1">{toast.message}</span>
+      {toast.action && (
+        <button
+          type="button"
+          onClick={() => {
+            onDismiss();
+            toast.action?.run();
+          }}
+          className="inline-flex h-8 shrink-0 items-center rounded-full bg-cta px-3.5 text-[12.5px] font-medium whitespace-nowrap text-cta-fg transition hover:opacity-90 active:scale-[0.97]"
+        >
+          {toast.action.label}
+        </button>
+      )}
       <button type="button" aria-label="Dismiss" title="Dismiss" onClick={onDismiss} className="grid size-6 shrink-0 place-items-center rounded-full text-fg-3 transition hover:bg-glass-strong hover:text-fg">
         <X size={14} />
       </button>
@@ -452,9 +469,9 @@ export function UIProvider({ children }: { children: ReactNode }) {
   const [ask, setAsk] = useState<(Ask & { resolve: (yes: boolean) => void }) | null>(null);
   const [layers, setLayers] = useState<HTMLDialogElement[]>([]);
   const next = useRef(1);
-  const toast = useCallback((message: string, tone: Toast['tone'] = 'ok') => {
+  const toast = useCallback((message: string, tone: Toast['tone'] = 'ok', action?: ToastAction) => {
     const id = next.current++;
-    setToasts(list => [...list.slice(-2), { id, message, tone, ms: toastDuration(message, tone) }]);
+    setToasts(list => [...list.slice(-2), { id, message, tone, ms: toastDuration(message, tone, !!action), action }]);
   }, []);
   const dismiss = useCallback((id: number) => setToasts(list => list.filter(t => t.id !== id)), []);
   const copy = useCallback(

@@ -76,3 +76,35 @@ func TestRestoreReplacesDeclaredChainsAtomically(t *testing.T) {
 		t.Fatalf("Reset left %v", h.Chains())
 	}
 }
+
+// iptables -F CHAIN empties one chain and nothing else: the jump to it, in a built-in chain, stays,
+// and so do the other chains of the agent. A rule added behind the agent's back shows in -S.
+func TestFlushChainEmptiesOnlyThatChain(t *testing.T) {
+	h := New()
+	restore := "*filter\n:X-A - [0:0]\n:X-B - [0:0]\n-A X-A -j X-B\n-A X-B -s 192.0.2.1/32 -j DROP\n-A X-B -j ACCEPT\nCOMMIT\n"
+	run(t, h, true, restore, "iptables-nft-restore", "--noflush", "-w", "5")
+	run(t, h, true, "", "iptables-nft", "-t", "filter", "-I", "FORWARD", "1", "-j", "X-A")
+
+	if !h.FlushChain("filter", "X-B") {
+		t.Fatal("FlushChain does not know a chain that exists")
+	}
+	if !h.Has("filter", "X-B") || len(h.Rules("filter", "X-B")) != 0 {
+		t.Fatalf("X-B after -F: exists %v, rules %v", h.Has("filter", "X-B"), h.Rules("filter", "X-B"))
+	}
+	if !slices.Equal(h.Rules("filter", "FORWARD"), []string{"-j X-A"}) || !slices.Equal(h.Rules("filter", "X-A"), []string{"-j X-B"}) {
+		t.Fatalf("the jump or another chain was touched: FORWARD %v, X-A %v", h.Rules("filter", "FORWARD"), h.Rules("filter", "X-A"))
+	}
+	if out := run(t, h, true, "", "iptables-nft", "-t", "filter", "-S", "X-B"); out != "-N X-B\n" {
+		t.Fatalf("-S of the flushed chain: %q", out)
+	}
+	if h.FlushChain("filter", "NOWHERE") || h.FlushChain("nat", "X-B") {
+		t.Fatal("FlushChain flushed a chain that is not there")
+	}
+
+	if !h.AddRule("filter", "X-B", "-d 192.0.2.9/32 -j DROP") || h.AddRule("filter", "NOWHERE", "-j DROP") {
+		t.Fatal("AddRule")
+	}
+	if out := run(t, h, true, "", "iptables-nft", "-t", "filter", "-S", "X-B"); out != "-N X-B\n-A X-B -d 192.0.2.9/32 -j DROP\n" {
+		t.Fatalf("-S after AddRule: %q", out)
+	}
+}

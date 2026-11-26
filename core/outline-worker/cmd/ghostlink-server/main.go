@@ -38,6 +38,10 @@ commands:
 
 flags:
   --state DIR      state directory (default /var/lib/ghostlink-server)
+  --ipsec-dir DIR  directory shared with the IPsec component (serve; default <state>/ipsec).
+                   The host script gives a directory outside the state, which it makes and owns
+                   as root, so that the server account cannot replace it. It must exist: the
+                   server only writes its settings there and reads the component's report.
   --hostname HOST  public IP or DNS name clients use (init; detected when omitted)
   --name NAME      server display name (init)
   --log-level L    engine log level: off, error, warn, info, debug (serve; default off,
@@ -94,6 +98,7 @@ func main() {
 	flags := flag.NewFlagSet(command, flag.ExitOnError)
 	flags.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	state := flags.String("state", defaultState, "")
+	ipsecDir := flags.String("ipsec-dir", "", "")
 	hostname := flags.String("hostname", "", "")
 	name := flags.String("name", "", "")
 	// Off by default: at every level the engine logs failed lookups and connections with the
@@ -129,7 +134,10 @@ func main() {
 		}
 		fmt.Println("configuration ok")
 	case "serve":
-		serve(*state, *logLevel)
+		if err := checkIPsecDir(*ipsecDir); err != nil {
+			fail("%v", err)
+		}
+		serve(*state, *ipsecDir, *logLevel)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -146,7 +154,20 @@ func printKey(dir string) {
 	os.Stdout.Write(data)
 }
 
-func serve(dir, logLevel string) {
+// checkIPsecDir validates --ipsec-dir: empty (the default, <state>/ipsec) or an absolute, clean
+// path. A relative one would depend on the working directory, and one that is not clean (a "..",
+// a doubled slash) is not the path the host script mounted.
+func checkIPsecDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return fmt.Errorf("--ipsec-dir %q must be an absolute path without . or .. parts", dir)
+	}
+	return nil
+}
+
+func serve(dir, ipsecDir, logLevel string) {
 	switch logLevel {
 	case "off", "error", "warn", "info", "debug":
 	default:
@@ -165,6 +186,7 @@ func serve(dir, logLevel string) {
 	}
 	monitor := server.NewMonitor()
 	service := server.NewService(store, server.NewEngine(monitor, logLevel), monitor)
+	service.SetIPsecDir(ipsecDir) // before Start, which writes the IPsec settings
 	service.SetReporter(func(what string, err error) {
 		if err == nil {
 			fmt.Fprintf(os.Stderr, "ghostlink-server: %s: back to normal\n", what)

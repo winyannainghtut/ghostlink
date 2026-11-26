@@ -1,0 +1,42 @@
+# Findings of scripts/audit-lockfiles.py (OSV, both Rust lockfiles) that are accepted.
+#
+# One entry per advisory ID, crate and locked version: another version of the crate is a new
+# finding, and so is another ID for the same crate (OSV lists a RUSTSEC and a GHSA record apart).
+# `reason` says why it is no risk here or what is waiting; `reviewed` is the date somebody last
+# read the advisory (YYYY-MM-DD). The script warns when an entry is older than 180 days and when
+# it matches nothing any more (remove it then); neither stops the audit. Run the script with
+# --no-allowlist to see every finding. The GTK entries are also described in
+# docs/security/dependencies.md.
+
+# glib 0.18.5 and proc-macro-error 1.0.4: the GTK 3 stack of the Linux desktop app (Tauri 2).
+# Not compiled into the Windows application, and no fixed release fits Tauri's GTK 3 bindings.
+
+[[accepted]]
+id = "RUSTSEC-2024-0429"
+crate = "glib"
+version = "0.18.5"
+reason = "Unsound VariantStrIter in glib's GTK 3 bindings, fixed in 0.20 (a different ABI than Tauri's GTK 3 stack). Ghostlink does not call the iterator; only the Linux desktop app, which is not released, builds it."
+reviewed = "2026-11-26"
+
+[[accepted]]
+id = "GHSA-wrw7-89jp-8q8g"
+crate = "glib"
+version = "0.18.5"
+reason = "The GitHub record of RUSTSEC-2024-0429 (same advisory, same reason)."
+reviewed = "2026-11-26"
+
+[[accepted]]
+id = "RUSTSEC-2024-0370"
+crate = "proc-macro-error"
+version = "1.0.4"
+reason = "Unmaintained (no fixed release), a build-time macro dependency of the GTK 3 derive crates; nothing of it runs in a shipped program."
+reviewed = "2026-11-26"
+
+# chrono 0.4.45: the desktop app only, through serde_with.
+
+[[accepted]]
+id = "RUSTSEC-2026-0543"
+crate = "chrono"
+version = "0.4.45"
+reason = "An unmaintained notice for every version (no vulnerability, no fixed release). Tauri's serde_with uses it; watch for its move to another crate."
+reviewed = "2026-11-26"

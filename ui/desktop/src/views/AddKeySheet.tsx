@@ -1,14 +1,44 @@
 // Add an access key to this device, or replace the key of a server already here. The key can be an
-// ss://, ssconf://, vless:// or vpn:// key, or the text of a WireGuard or AmneziaWG file (pasted or
-// from a file): the sheet shows what it is (protocol, host, port) before it is added.
+// ss://, ssconf://, vless:// or vpn:// key, or the text of a WireGuard or AmneziaWG file (pasted, from
+// a file, or a file dropped on the sheet): the sheet shows what it is (protocol, host, port) before
+// it is added.
 import { ClipboardPaste, Eye, EyeOff, FileUp } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type DragEvent } from 'react';
 import { Button, Field, IconButton, Note, Sheet, useUI } from '@shared/glass';
 import { useBusy } from '@shared/hooks';
 import { step, type Done } from '@shared/steps';
+import { droppedText, hasFiles, nextDepth, OPENVPN_NOTE, pickDropped } from '../dropFile';
 import { request, slug, uniqueName, type Profile } from '../ipc';
 import { importKind, previewKey, previewText } from '../keyPreview';
 import { useService } from '../service';
+
+// A file's text, read in the page (a dropped file's path is not available here, and need not be).
+function readText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(reader.error ?? new Error('The file could not be read.'));
+    reader.readAsText(file);
+  });
+}
+
+// What the sheet shows while a file is dragged over it: it covers the form, and takes no pointer
+// events itself, so the drag keeps hitting the sheet.
+function DropZone() {
+  return (
+    <div
+      aria-hidden="true"
+      data-drop-zone=""
+      className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-[22px] border-2 border-dashed border-fg/50 bg-canvas text-center"
+    >
+      <div className="grid justify-items-center gap-1.5 px-6">
+        <FileUp size={28} />
+        <span className="text-[15px] font-medium">Drop the file to read it</span>
+        <span className="text-[12.5px] text-fg-2">A WireGuard or AmneziaWG .conf file, or a text file with an access key</span>
+      </div>
+    </div>
+  );
+}
 
 export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClose: () => void; replacing: Profile | null }) {
   const { profiles, refresh } = useService();
@@ -19,6 +49,10 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
   const [error, setError] = useState('');
   const { busy, run } = useBusy();
   const file = useRef<HTMLInputElement>(null);
+  // A file is being dragged over the sheet. dragenter and dragleave fire for every element the
+  // pointer crosses, so `depth` counts them (dropFile.ts).
+  const [over, setOver] = useState(false);
+  const depth = useRef(0);
   // Saving the key and naming it are two requests. When the name fails the key is saved already:
   // the steps that worked are kept, and the next try only names it (a second import would save the
   // same server again under another ID).
@@ -27,6 +61,8 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
     if (!open) {
       setKey('');
       setReveal(false);
+      setOver(false);
+      depth.current = 0;
       return;
     }
     done.current = new Map();
@@ -69,7 +105,7 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
   const add = () => {
     const source = key.trim();
     if (kind === 'cli') {
-      setError('This is an OpenVPN profile. The app adds access keys and WireGuard or AmneziaWG files; import an OpenVPN profile with the command line.');
+      setError(OPENVPN_NOTE);
       return;
     }
     if (kind === 'unknown') {
@@ -79,20 +115,81 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
     return submit(source, kind === 'file' ? 'file' : 'key', kind === 'file' ? preview?.host || 'WireGuard' : '');
   };
 
-  // WireGuard/AmneziaWG files are read here and sent straight to the service.
+  // The file picker: a WireGuard/AmneziaWG file is read here and sent straight to the service.
   const importFile = async (f: File) => {
     setError('');
-    if (f.size > 65536) {
-      setError('That file is too large to be a WireGuard configuration.');
+    const picked = pickDropped([f]);
+    if ('error' in picked) {
+      setError(picked.error);
       return;
     }
-    const text = await f.text();
-    const fileKind = importKind(previewKey(text));
-    if (fileKind === 'cli') {
-      setError('This is an OpenVPN profile. The app adds access keys and WireGuard or AmneziaWG files; import an OpenVPN profile with the command line.');
+    let text: string;
+    try {
+      const read = droppedText(await readText(f));
+      if ('error' in read) {
+        setError(read.error);
+        return;
+      }
+      text = read.text;
+    } catch (e) {
+      setError((e as Error).message);
+      return;
+    }
+    if (importKind(previewKey(text)) === 'cli') {
+      setError(OPENVPN_NOTE);
       return;
     }
     await submit(text, 'file', f.name.replace(/\.(conf|txt)$/i, ''));
+  };
+
+  // A file dropped on the sheet is handled like pasted text: it goes into the box, where the
+  // preview says what it is, and the person adds it with the button. (Tauri's own file-drop handler
+  // is off for this window, tauri.conf.json `dragDropEnabled`, or it would take the drop first.)
+  const accepting = open && !busy && !done.current.has('save');
+  const takeDropped = async (files: File[]) => {
+    setError('');
+    const picked = pickDropped(files);
+    if ('error' in picked) {
+      setError(picked.error);
+      return;
+    }
+    try {
+      const read = droppedText(await readText(picked.file));
+      if ('error' in read) {
+        setError(read.error);
+        return;
+      }
+      setKey(read.text);
+      // A WireGuard file takes its name from the file's, as the file picker does.
+      if (!name.trim() && importKind(previewKey(read.text)) === 'file') setName(picked.file.name.replace(/\.(conf|txt)$/i, '').slice(0, 80));
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+  const drop = {
+    onDragEnter: (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer.types)) return;
+      e.preventDefault();
+      depth.current = nextDepth(depth.current, 'enter');
+      setOver(true);
+    },
+    onDragOver: (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer.types)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = accepting ? 'copy' : 'none';
+    },
+    onDragLeave: (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer.types)) return;
+      depth.current = nextDepth(depth.current, 'leave');
+      if (depth.current === 0) setOver(false);
+    },
+    onDrop: (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer.types)) return;
+      e.preventDefault();
+      depth.current = nextDepth(depth.current, 'drop');
+      setOver(false);
+      if (accepting) takeDropped(Array.from(e.dataTransfer.files));
+    },
   };
 
   const paste = async () => {
@@ -108,6 +205,7 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
     <Sheet
       open={open}
       onClose={close}
+      drop={drop}
       title={replacing ? `Replace the key of ${replacing.display_name || replacing.name}` : 'Add access key'}
       subtitle={replacing ? 'The server keeps its name, its place in the list and its split-tunneling settings. Disconnect from it first.' : 'Paste the key shared by your server administrator: Outline, VLESS or Amnezia, or the text of a WireGuard file.'}
       footer={
@@ -122,12 +220,13 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
       }
     >
       <form
-        className="grid gap-4"
+        className="relative grid gap-4"
         onSubmit={e => {
           e.preventDefault();
           add();
         }}
       >
+        {over && accepting && <DropZone />}
         <Field label="Name on this device">
           <input className="field" maxLength={80} value={name} onChange={e => setName(e.target.value)} placeholder="For example Singapore" autoComplete="off" data-autofocus />
         </Field>
@@ -146,7 +245,7 @@ export function AddKeySheet({ open, onClose, replacing }: { open: boolean; onClo
               className={`field mono min-h-[96px] pr-12 ${reveal ? '' : 'masked'}`}
               value={key}
               onChange={e => setKey(e.target.value)}
-              placeholder={'ss://, ssconf://, vless:// or vpn://\nor the text of a WireGuard or AmneziaWG .conf file'}
+              placeholder={'ss://, ssconf://, vless:// or vpn://\nor the text of a WireGuard or AmneziaWG .conf file\n(or drop the file on this window)'}
               autoComplete="off"
               spellCheck={false}
             />

@@ -112,7 +112,7 @@ export function MeshCard() {
             <LegendLine className="bg-ok" label="Direct" />
             <LegendLine className="border-t-2 border-dashed border-relay bg-transparent" label="Through the relay" />
             <LegendLine className="border-t-2 border-dotted border-bad bg-transparent" label="Down" />
-            <span className="ml-auto">Drag nodes to arrange the map</span>
+            <span className="ml-auto">Drag a node to move it, the background to pan. Scroll or pinch to zoom; + − 0 when the map has focus.</span>
           </div>
         </div>
         <aside className="max-h-[min(62vh,800px)] overflow-y-auto">

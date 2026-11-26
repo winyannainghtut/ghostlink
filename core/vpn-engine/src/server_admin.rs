@@ -399,6 +399,7 @@ pub fn request(op: &ServerOp) -> Result<(Method, String, Option<Value>), AdminEr
         ServerOp::Metrics {} => (Method::GET, "/metrics".into(), None),
         ServerOp::Live {} => (Method::GET, "/live".into(), None),
         ServerOp::AsnUpdate {} => (Method::POST, "/asn/update".into(), None),
+        ServerOp::RotateKey {} => (Method::POST, "/server/rotate-key".into(), None),
         ServerOp::Stats { user, range } => {
             if !["24h", "7d", "30d", "90d"].contains(&range.as_str()) {
                 return Err(AdminError::Invalid(
@@ -924,6 +925,12 @@ mod tests {
                 Method::GET,
                 "/users/3/keys/4/profile?prompt_password=1&on_demand=0"
             )
+        );
+        // Replacing the management key: one fixed path, no body.
+        let (method, path, body) = request(&ServerOp::RotateKey {}).unwrap();
+        assert_eq!(
+            (method, path.as_str(), body),
+            (Method::POST, "/server/rotate-key", None)
         );
         // Mesh: fixed paths, numeric IDs, allowlisted rules.
         assert_eq!(

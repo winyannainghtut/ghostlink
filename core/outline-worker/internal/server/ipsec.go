@@ -16,7 +16,8 @@ import (
 	"ghostlink.local/outline-worker/internal/ipsecproto"
 )
 
-// IPsecDir holds the files shared with the IPsec agent.
+// IPsecDir holds the files shared with the IPsec agent, inside the state directory, unless the
+// server is told another place (see SetIPsecDir).
 const IPsecDir = "ipsec"
 
 // ipsecDNSTag names the DNS listener IPsec clients reach through their pool gateway.
@@ -136,6 +137,53 @@ func (s *State) ipsecSettings(now time.Time) ipsecproto.Desired {
 	return desired
 }
 
+// SetIPsecDir moves the files shared with the IPsec agent out of <state>/ipsec to dir, which
+// must be absolute. The host script uses it on a Linux server: the state belongs to this server's
+// account, and a directory the container runtime mounts into the IPsec component must not be one
+// that account could replace, so the script makes dir itself, outside the state, and mounts it
+// into both containers. The server then neither creates dir nor changes its owner or mode: it only
+// writes the settings into it and reads the agent's report from it (see prepareIPsecDir). An empty
+// dir restores the default. Call it before Start.
+func (svc *Service) SetIPsecDir(dir string) {
+	if dir == "" {
+		svc.ipsecDir.Store(nil)
+		return
+	}
+	svc.ipsecDir.Store(&dir)
+}
+
+// ipsecPath is the directory shared with the agent, and whether it is the default one in the state.
+func (svc *Service) ipsecPath() (string, bool) {
+	if dir := svc.ipsecDir.Load(); dir != nil {
+		return *dir, false
+	}
+	return filepath.Join(svc.store.Dir(), IPsecDir), true
+}
+
+// prepareIPsecDir returns the directory the settings are written to. The default one inside the
+// state is this server's to make: shared with the agent's group only, which is what the agent, as
+// root in the account's group without file capabilities, needs. A directory named with
+// SetIPsecDir is the host's: it is made, owned and given its mode (setgid, group of this account)
+// by the host script as root, so it only has to exist, and a chmod here would fail (this account
+// does not own it) or, worse, drop the setgid bit that keeps the agent's files in this group.
+func (svc *Service) prepareIPsecDir() (string, error) {
+	dir, inState := svc.ipsecPath()
+	if inState {
+		if err := os.MkdirAll(dir, 0o770); err != nil {
+			return "", err
+		}
+		return dir, os.Chmod(dir, 0o770)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("the IPsec directory: %w (the host script makes it: sudo ghostlink-server setup)", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("the IPsec directory %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
 // WriteIPsecDesired gives the agent the current configuration, also refreshing the CRL.
 func (svc *Service) WriteIPsecDesired(now time.Time) error { return svc.writeIPsecDesired(now, true) }
 
@@ -165,11 +213,8 @@ func (svc *Service) writeIPsecDesired(now time.Time, force bool) error {
 	svc.ipsecWritten = ""
 	// The agent runs as root with no file capabilities, in this account's group: the directory
 	// and the settings are shared with the group only.
-	dir := filepath.Join(svc.store.Dir(), IPsecDir)
-	if err := os.MkdirAll(dir, 0o770); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o770); err != nil {
+	dir, err := svc.prepareIPsecDir()
+	if err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(desired, "", "  ")
@@ -186,7 +231,8 @@ func (svc *Service) writeIPsecDesired(now time.Time, force bool) error {
 // IPsecStatus reads the agent's report; ok is false when it is missing or stale.
 func (svc *Service) IPsecStatus(now time.Time) (ipsecproto.Status, bool) {
 	var status ipsecproto.Status
-	data, err := os.ReadFile(filepath.Join(svc.store.Dir(), IPsecDir, ipsecproto.StatusFile))
+	dir, _ := svc.ipsecPath()
+	data, err := os.ReadFile(filepath.Join(dir, ipsecproto.StatusFile))
 	if err != nil || json.Unmarshal(data, &status) != nil {
 		return status, false
 	}

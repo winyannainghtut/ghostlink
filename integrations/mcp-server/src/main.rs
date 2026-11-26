@@ -43,6 +43,24 @@ fn tools(control: bool) -> Vec<Value> {
     values
 }
 
+/// The service request for a tool. This is the whole list of what an agent can ask for: reading,
+/// and connecting and disconnecting. No import, policy or server administration (managing a
+/// server's keys, replacing its management key) is reachable from here, and the service refuses
+/// them for an agent token too.
+fn action_for(name: &str, profile: Option<&str>) -> Option<Action> {
+    match name {
+        "vpn_list_profiles" => Some(Action::ProfileList {}),
+        "vpn_status" => Some(Action::Status {}),
+        "vpn_diagnostics" => Some(Action::Doctor {}),
+        "vpn_connect" => profile.map(|s| Action::Connect {
+            profile: Some(s.into()),
+        }),
+        "vpn_disconnect" => Some(Action::Disconnect {}),
+        "vpn_switch" => profile.map(|s| Action::Switch { profile: s.into() }),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -115,18 +133,7 @@ async fn main() -> anyhow::Result<()> {
                             o.is_empty()
                         }
                     });
-                    let action = match name {
-                        "vpn_list_profiles" => Some(Action::ProfileList {}),
-                        "vpn_status" => Some(Action::Status {}),
-                        "vpn_diagnostics" => Some(Action::Doctor {}),
-                        "vpn_connect" => profile.map(|s| Action::Connect {
-                            profile: Some(s.into()),
-                        }),
-                        "vpn_disconnect" => Some(Action::Disconnect {}),
-                        "vpn_switch" => profile.map(|s| Action::Switch { profile: s.into() }),
-                        _ => None,
-                    };
-                    if let Some(action) = action.filter(|_| allowed && valid) {
+                    if let Some(action) = action_for(name, profile).filter(|_| allowed && valid) {
                         let result = ghostlink_contracts::call(
                             &args.endpoint,
                             Request {
@@ -152,4 +159,67 @@ async fn main() -> anyhow::Result<()> {
         ghostlink_contracts::write_frame(&mut output, &response).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghostlink_contracts::ServerOp;
+
+    fn names(control: bool) -> Vec<String> {
+        tools(control)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// An agent gets no import, policy or server-admin powers (a product rule): the bridge lists
+    /// these tools and no others, and nothing that administers a server, such as replacing its
+    /// management key, can be asked for through it.
+    #[test]
+    fn the_bridge_exposes_no_server_administration() {
+        assert_eq!(
+            names(false),
+            ["vpn_list_profiles", "vpn_status", "vpn_diagnostics"]
+        );
+        assert_eq!(
+            names(true),
+            [
+                "vpn_list_profiles",
+                "vpn_status",
+                "vpn_diagnostics",
+                "vpn_connect",
+                "vpn_disconnect",
+                "vpn_switch"
+            ]
+        );
+        // No tool, or name that could be asked for, is the name of a server operation or of
+        // anything that changes keys, servers or policy.
+        let rotate = Action::ServerCall {
+            server: "home".into(),
+            op: ServerOp::RotateKey {},
+        };
+        let forbidden = [
+            rotate.name(),
+            "rotate_key",
+            "server_rotate_key",
+            "managed_server_add",
+            "access_key_import",
+            "routing_policy_set",
+            "agent_grant",
+        ];
+        for name in forbidden {
+            assert!(!names(true).iter().any(|n| n == name), "{name} is a tool");
+            assert!(
+                action_for(name, Some("home")).is_none(),
+                "{name} is reachable"
+            );
+        }
+        // Every tool maps to a request an agent token may make, and the others are not tools.
+        for name in names(true) {
+            let action = action_for(&name, Some("home")).expect(&name);
+            assert!(action.agent_allowed(true), "{name}");
+        }
+        assert!(!rotate.agent_allowed(true), "the service refuses it too");
+    }
 }
