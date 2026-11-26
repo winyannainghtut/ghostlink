@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from xml.etree import ElementTree
@@ -131,6 +132,9 @@ class WindowsInstallerOwner(unittest.TestCase):
 
 
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+# On Windows the first bash on the PATH can be the WSL launcher (System32\bash.exe), which runs
+# nothing without a Linux distribution: only Git's bash counts there, as in test_linux_packages.py.
+BASH = next((path for path in [shutil.which("bash")] if path and (sys.platform != "win32" or "git" in path.lower())), None)
 
 
 class WindowsInstallerVersion(unittest.TestCase):
@@ -215,7 +219,7 @@ class ReleaseBuildsRefuseTheTestHook(unittest.TestCase):
         self.assertLess(call, self.windows.index("& (Join-Path $wixDirectory 'heat.exe')"), "the installer is built before the check")
         self.assertLess(call, self.windows.index("Compress-Archive"), "the portable archive is made before the check")
 
-    @unittest.skipUnless(shutil.which("bash"), "bash is needed to run the check")
+    @unittest.skipUnless(BASH, "bash is needed to run the check")
     def test_the_linux_build_stops_for_a_program_with_the_hook(self):
         loop = re.search(r"^for program in .*?^done$", self.linux, re.S | re.M)
         self.assertIsNotNone(loop, "build-linux.sh does not look for the hook in what it stages")
@@ -230,7 +234,7 @@ class ReleaseBuildsRefuseTheTestHook(unittest.TestCase):
             shutil.copyfile(clean, stage / "lib/ghostlink/ghostlink-tunnel")
             # Relative to the working directory, whatever bash this is (Git's, Linux's, or WSL's launcher).
             (Path(temporary) / "check.sh").write_text("set -euo pipefail\nstage=stage\n" + loop.group(0) + "\n", encoding="utf-8", newline="\n")
-            run = lambda: subprocess.run(["bash", "check.sh"], cwd=temporary, capture_output=True, text=True)
+            run = lambda: subprocess.run([BASH, "check.sh"], cwd=temporary, capture_output=True, text=True)
             before = run()
             self.assertEqual(before.returncode, 0, before.stderr)
             shutil.copyfile(hooked, stage / "bin/ghostlinkd")
@@ -252,11 +256,11 @@ class PackageTestScripts(unittest.TestCase):
                                 env={**os.environ, "SCRIPT_TO_CHECK": str(ROOT / "tests/packages/msi-install.ps1")}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    @unittest.skipUnless(shutil.which("bash"), "bash is needed to read the scripts")
+    @unittest.skipUnless(BASH, "bash is needed to read the scripts")
     def test_the_rpm_install_test_scripts_are_valid_bash(self):
         for name in ("rpm-install.sh", "rpm-container.sh"):
             with self.subTest(script=name):
-                result = subprocess.run(["bash", "-n", name], cwd=ROOT / "tests/packages", capture_output=True, text=True)
+                result = subprocess.run([BASH, "-n", name], cwd=ROOT / "tests/packages", capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_every_image_the_rpm_test_starts_is_pinned_by_digest(self):

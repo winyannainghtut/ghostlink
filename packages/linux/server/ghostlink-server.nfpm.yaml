@@ -21,6 +21,11 @@ description: |-
   Installing prints a management key for the Ghostlink app.
 
 contents:
+  # The directory is the package's too, so that rpm takes it away on removal (it removes only the
+  # directories a package owns; dpkg removes an empty one either way).
+  - dst: /usr/lib/ghostlink-server
+    type: dir
+    file_info: {mode: 0755}
   - src: @PKG@/image.tar.gz
     dst: /usr/lib/ghostlink-server/image.tar.gz
     file_info: {mode: 0644}

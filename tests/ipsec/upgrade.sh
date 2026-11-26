@@ -71,6 +71,11 @@ mounts() { docker inspect "$1" --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{e
 test "$(mounts ghostlink-ipsec)" = "$state/ipsec "
 old_image=$(sed -n 's/^IPSEC_IMAGE=//p' /usr/lib/ghostlink-server/image.env)
 
+# The management key names the server by the address the client reaches it at (10.99.0.1), so that
+# address must exist before the first call to the API (the client's end is moved into its
+# container below, once the container runs).
+ip link add glh0 type veth peer name glc0
+ip addr add 10.99.0.1/24 dev glh0 && ip link set glh0 up
 key=$(ghostlink-server show-key | grep '^{')
 url=$(echo "$key" | jq -r .apiUrl)
 api() { # METHOD PATH [JSON]
@@ -87,8 +92,6 @@ chmod -R a+rX "$work/legacy-client"
 jq -e '.allowed | length == 1' "$state/ipsec/desired.json" >/dev/null
 
 step "A client connects (network: the client at 10.99.0.2, the server at 10.99.0.1)"
-ip link add glh0 type veth peer name glc0
-ip addr add 10.99.0.1/24 dev glh0 && ip link set glh0 up
 # The client runs the old release's own image (the new one is not loaded before the upgrade).
 docker run --detach --name glclient --network none --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW \
     --cap-add NET_BIND_SERVICE --read-only --tmpfs /run --volume "$work/legacy-client:/client:ro" \
