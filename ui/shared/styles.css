@@ -26,6 +26,7 @@
   --color-up: var(--up);
   --color-ok: var(--ok);
   --color-idle: var(--idle);
+  --color-warn: var(--warn);
   --color-bad: var(--bad);
   --color-relay: var(--relay);
 }
@@ -53,6 +54,9 @@
   --up: #bf8cff;
   --ok: #30d158;
   --idle: #ffd60a;
+  /* Warning text. --idle is the status colour (the dots, the star, a card's edge); text needs more
+     contrast than a dot does, and on a light card the yellow is only about 2.4:1. */
+  --warn: #ffd60a;
   --bad: #ff6961;
   --relay: #ffb340;
   --wave-a: #dfe6f1;
@@ -94,6 +98,7 @@
   --up: #9b51e0;
   --ok: #1fa84a;
   --idle: #d99a00;
+  --warn: #7a4b00;
   --bad: #e5352b;
   --relay: #d97a00;
   --wave-a: #8d9ab0;
@@ -327,6 +332,16 @@
 .mesh-map {
   touch-action: none;
   user-select: none;
+  cursor: grab;
+}
+.mesh-map.panning {
+  cursor: grabbing;
+}
+/* The map is focused as a whole (for + - 0 and the arrow keys): its ring goes inside the map, where
+   the rounded frame around it would otherwise cut it off. */
+.mesh-map:focus-visible {
+  outline-offset: -4px;
+  border-radius: 24px;
 }
 .mesh-map .link {
   stroke-linecap: round;

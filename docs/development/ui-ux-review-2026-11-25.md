@@ -231,3 +231,17 @@ Added by the maintainers after the fixes. Each finding was re-checked in the cod
 | U13 | Real | Fixed: `--fg-3` was 2.75 to 3.41 to 1 and is now at least 5.19 to 1 in all three finishes (measured by sampling pixels); first-field focus, Cancel focused in destructive confirmations, arrow keys in menus, toasts that last, close and pause, a sign-in field for a pasted link. Noted, not fixed: Daylight's warning yellow is about 2.4 to 1 on a light card |
 | U14 | Partly done | Fixed: `BarChart` ticks and tap, the shared `AppBar`, the four screenshots in `docs/images/` retaken (0.9.1, bytes per second). **Not done:** React render tests (49 tests of pure modules were added) |
 
+## Status in 0.9.2 (2026-11-26)
+
+What 0.9.1 left open, and what became of it:
+
+| ID | What was done in 0.9.2 |
+| --- | --- |
+| U7 | Drag and drop of a `.conf` or key file onto Add access key (the window's `dragDropEnabled` is off, so drops reach the page) |
+| U8 | The tray menu follows the connection: the state, **Connect to** the default server, **Disconnect** only while a session runs |
+| U9 | **Replace the management key** in Server settings: the app seals the new key in the service and never shows it; the dashboard shows it once |
+| U10 | The mesh map zooms and pans (wheel, pinch, buttons, keys, fit); subnet labels avoid each other and the nodes |
+| U11 | **Connect now** after **Use on this device**, asking before it switches from another server |
+| U13 | Daylight's warning text is readable (`--warn`, at least 5.29 to 1 measured); status dots keep their colour |
+| U14 | React render tests through Vite's `ssrLoadModule` and `react-dom/server`, with no new dependency |
+

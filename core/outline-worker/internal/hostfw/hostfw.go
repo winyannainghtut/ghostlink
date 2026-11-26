@@ -112,8 +112,13 @@ func backendOf(version string) string {
 }
 
 func (f *Firewall) iptables(ctx context.Context, args ...string) error {
-	_, err := f.run(ctx, "", "iptables-"+f.Backend, append([]string{"-w", "5"}, args...)...)
+	_, err := f.iptablesOut(ctx, args...)
 	return err
+}
+
+// iptablesOut is iptables for a command whose output is wanted.
+func (f *Firewall) iptablesOut(ctx context.Context, args ...string) (string, error) {
+	return f.run(ctx, "", "iptables-"+f.Backend, append([]string{"-w", "5"}, args...)...)
 }
 
 // tableNames are the tables an agent's chains are in, in the order they are restored.
@@ -192,13 +197,74 @@ func (f *Firewall) HasJumps(ctx context.Context, jumps []Jump) bool {
 	return true
 }
 
+// ruleChain returns the chain a line of iptables-restore input or of `iptables -S` output appends
+// a rule to ("-A CHAIN ..."), and false for any other line (a declaration, a policy, COMMIT).
+func ruleChain(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "-A ")
+	if !ok {
+		return "", false
+	}
+	chain, _, _ := strings.Cut(rest, " ")
+	return chain, chain != ""
+}
+
+// CountRules counts the rules each chain gets from iptables-restore input (the argument of
+// Restore): the lines "-A CHAIN ...", by "table/CHAIN". A chain that is declared and gets no rule
+// counts 0, or is not in the result. The agent passes what it restored to Missing, so the check
+// compares against what was applied, however the host's iptables writes the rules back.
+//
+// One line is one rule only while it does not expand when iptables-restore reads it: a list of
+// addresses ("-s a,b", "-d a,b") becomes one rule for each address (iptables' manual says so), so
+// the host then holds more rules than the input has lines. Missing treats more as nothing lost, so
+// a count that is too low never causes a repair; an agent whose render uses such lists loses only
+// the notice of one rule deleted out of a chain, not that of a flushed chain. (Port ranges
+// "--dport 6881:6889" and the multiport match are one rule.) The IPsec agent's render has no list;
+// a test there keeps it so.
+func CountRules(tables map[string]string) map[string]int {
+	counts := map[string]int{}
+	for table, input := range tables {
+		for _, line := range strings.Split(input, "\n") {
+			if chain, ok := ruleChain(line); ok {
+				counts[table+"/"+chain]++
+			}
+		}
+	}
+	return counts
+}
+
+// countIn counts the rules in the output of `iptables -S CHAIN`.
+func countIn(output, chain string) int {
+	n := 0
+	for _, line := range strings.Split(output, "\n") {
+		if name, ok := ruleChain(line); ok && name == chain {
+			n++
+		}
+	}
+	return n
+}
+
 // Missing lists what the host has lost of an agent's firewall: jumps that are not in place (the
-// DOCKER-USER copies included) and chains that do not exist (table -> chains). A firewall reload,
-// netfilter-persistent or iptables -F takes the jumps away and, with them, usually the rules in
-// the chains, or the chains themselves. A jump put back into a chain that is empty protects
-// nothing, so an agent that finds something missing must restore the whole rule set (Restore,
-// then EnsureJumps), not only the jumps. Nothing in the list means nothing is missing.
-func (f *Firewall) Missing(ctx context.Context, jumps []Jump, chains map[string][]string) []string {
+// DOCKER-USER copies included), chains that do not exist (table -> chains), and chains that hold
+// fewer rules than the agent put in them. A firewall reload, netfilter-persistent or iptables -F
+// takes the jumps away and, with them, usually the rules in the chains, or the chains themselves;
+// iptables -F CHAIN empties one chain and leaves its jump. A jump put back into a chain that is
+// empty protects nothing, so an agent that finds something missing must restore the whole rule set
+// (Restore, then EnsureJumps), not only the jumps. Nothing in the list means nothing is missing.
+//
+// want is how many rules each chain should hold, "table/CHAIN" -> number, from CountRules of what
+// the agent restored last; nil skips the counts (and so does a chain it does not name). Only
+// the number is compared, never the text of the rules: iptables writes a rule back differently
+// from how it was given, in a way that depends on its version and backend, and a comparison of
+// text would see damage in every check and restore the rules again and again. Fewer rules than
+// wanted is damage; as many or more is not. Another program may add a rule to a chain (an
+// administrator blocking an address in a hurry), or the host's iptables may split a rule in
+// several, and neither keeps the agent's rules from doing their work; replacing the chain at every
+// check would take such a rule away at the next 30 seconds, and fight with whatever adds it back.
+// The next full restore of the rules does replace the chain (it is the agent's).
+//
+// The check costs no command of its own: it reads the rules of each chain in the same `-S` that
+// tells whether the chain exists.
+func (f *Firewall) Missing(ctx context.Context, jumps []Jump, chains map[string][]string, want map[string]int) []string {
 	var missing []string
 	for _, j := range f.withDocker(ctx, jumps) {
 		if f.iptables(ctx, j.args("-C")...) != nil {
@@ -207,8 +273,15 @@ func (f *Firewall) Missing(ctx context.Context, jumps []Jump, chains map[string]
 	}
 	for _, table := range tableNames {
 		for _, chain := range chains[table] {
-			if f.iptables(ctx, "-t", table, "-S", chain) != nil {
+			out, err := f.iptablesOut(ctx, "-t", table, "-S", chain)
+			if err != nil {
 				missing = append(missing, "chain "+table+"/"+chain)
+				continue
+			}
+			if wanted, ok := want[table+"/"+chain]; ok {
+				if held := countIn(out, chain); held < wanted {
+					missing = append(missing, fmt.Sprintf("chain %s/%s holds %d of %d rules", table, chain, held, wanted))
+				}
 			}
 		}
 	}

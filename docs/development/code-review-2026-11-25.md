@@ -231,3 +231,18 @@ Added by the maintainers after the fixes. Each finding was re-checked against th
 | M11 | Partly done | Fixed: actions pinned by commit, release gating on the mesh and IPsec tests, the unprivileged check on Linux. **Deferred:** the `rustup` script (no verified checksum for arm64), `audit-lockfiles.py` as a gate, `.rpm` install tests, OpenVPN and the MSI in the Windows jobs |
 | UI | See the UI review | Status table in `ui-ux-review-2026-11-25.md` |
 
+## Status in 0.9.2 (2026-11-26)
+
+What 0.9.1 left open, and what became of it (details in `verification.md`, *v0.9.2*, and the CHANGELOG):
+
+| ID | What was done in 0.9.2 |
+| --- | --- |
+| C1 | **Closed.** The IPsec exchange directory moved to `/var/lib/ghostlink-ipsec` (root, the server account's group, 2770, in root's `/var/lib`): the account can write into it but cannot replace it, so the root-run mount cannot be redirected, also after a reboot. An upgrade moves the component and removes the old `$STATE/ipsec`; CI upgrades from the published 0.9.1 with a client connected |
+| C3 | The Linux check is decided: the generated tunnel inbound leaves nothing that outlives its interface and cuts traffic (no `auto_redirect`; the leftover `ip rule`s fall through and are removed by the next session); a test pins that configuration |
+| C4 | One chain emptied while its jump stays is now noticed, by counting each chain's rules against what was applied (fewer repair, more never do) |
+| M1 | **Done.** Connect plans, fetches a dynamic key without the lock, and checks again before it starts. Importing a dynamic key still fetches under the lock |
+| M3 | Amnezia keys with an unbracketed IPv6 endpoint import again; everything else as strict as in 0.9.1 |
+| M8 | `ghostlink-mesh leave` and a running agent: a cross-process lock (`agent.lock`, flock), leave stops the agent and waits, the agent exits 0 |
+| M10 | MSI: restart on failure, the desktop app closed on upgrade, same-version upgrades (rc to release). RPM install tests in Fedora, Rocky Linux 9 and Amazon Linux 2023 containers. **Still open:** an RPM dependency on Docker (the names differ, `podman-docker` conflicts with `docker-ce`). **Not changed, on purpose:** Alpine apk version pins |
+| M11 | `rustup` pinned by version and hash; the lockfile audit is a gate with an allowlist (it found `url` and `cookie` advisories, both updated); an MSI install, upgrade and uninstall test on the Windows runner; OpenVPN on the Windows runner for the process test that needs it |
+

@@ -42,9 +42,13 @@ type Service struct {
 	ipsecRateAt  time.Time
 	ipsecPending map[string]*[2]uint64
 	// ipsecMu serializes the writes of the agent's settings; ipsecWritten identifies the ones
-	// written last (see writeIPsecDesired).
-	ipsecMu      sync.Mutex
-	ipsecWritten string
+	// written last and ipsecGeneration is their generation (see writeIPsecDesired).
+	ipsecMu         sync.Mutex
+	ipsecWritten    string
+	ipsecGeneration int64
+	// ipsecDir is the directory shared with the IPsec agent when it is not <state>/ipsec (see
+	// SetIPsecDir).
+	ipsecDir atomic.Pointer[string]
 	// startup is the work Start left running in the background.
 	startup sync.WaitGroup
 	// engineErr is why the engine last failed to start ("" while it runs); see ensureEngine.

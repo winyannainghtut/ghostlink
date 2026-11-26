@@ -5,7 +5,7 @@ use crate::{vless::VlessKey, wireguard};
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::Value;
-use std::io::Read;
+use std::{io::Read, net::Ipv6Addr};
 
 pub(crate) const MAX_KEY: usize = 64 * 1024;
 const MAX_JSON: usize = 1024 * 1024;
@@ -123,6 +123,47 @@ fn config_from_fields(c: &Value) -> Result<String> {
     Ok(conf)
 }
 
+/// The endpoint with brackets around its IPv6 host, or None when it needs none or is not one:
+/// `2001:db8::1:51820` is `[2001:db8::1]:51820`. Only a host that is an IPv6 address and a port that
+/// is a number are taken for one; whatever else is wrong with the endpoint is left for
+/// `wireguard::parse`, which refuses it.
+fn bracketed(endpoint: &str) -> Option<String> {
+    if endpoint.starts_with('[') {
+        return None;
+    }
+    let (host, port) = endpoint.rsplit_once(':')?;
+    (host.parse::<Ipv6Addr>().is_ok()
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| format!("[{host}]:{port}"))
+}
+
+/// A configuration text in which the `Endpoint` of the `[Peer]` section has brackets around an
+/// IPv6 host. Amnezia writes it without them (`Endpoint = 2001:db8::1:51820`), as
+/// `config_from_fields` knows, and `wireguard::parse` refuses that in a configuration file, where
+/// the port cannot be told from the last group of the address. Here the endpoint always has a port,
+/// so the last group is it. Nothing else is changed, and nothing else is let through.
+fn with_bracketed_endpoint(config: &str) -> String {
+    let mut in_peer = false;
+    let mut text = String::with_capacity(config.len() + 2);
+    for line in config.lines() {
+        let item = wireguard::significant(line);
+        if item.starts_with('[') {
+            in_peer = item.eq_ignore_ascii_case("[peer]");
+        } else if let Some((name, value)) = item.split_once('=').filter(|_| in_peer) {
+            if let Some(fixed) =
+                bracketed(value.trim()).filter(|_| name.trim().eq_ignore_ascii_case("endpoint"))
+            {
+                text.push_str(&format!("{} = {fixed}\n", name.trim()));
+                continue;
+            }
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
 /// Adds `DNS = ...` right after the line that opens the `[Interface]` section. That line is found
 /// as `wireguard::parse` finds it, whatever its case, spacing, comment or line ending: an exact
 /// `"[Interface]\n"` search found nothing in a file with Windows line endings, a lower-case
@@ -200,6 +241,7 @@ pub fn decode(value: &str) -> Result<AmneziaKey> {
         Some(raw) if !raw.trim().is_empty() => raw.to_string(),
         _ => config_from_fields(&client)?,
     };
+    config = with_bracketed_endpoint(&config);
     // Amnezia templates may leave DNS out of the text; use the key's resolvers when present.
     if !config
         .lines()
@@ -368,6 +410,93 @@ pub(crate) mod tests {
             );
             assert_eq!(resolvers_of(&config), vec!["9.9.9.9"], "{dns}");
         }
+    }
+
+    /// The result of `decode` for a key whose configuration text has this `Endpoint` value, as
+    /// the host and port it connects to.
+    fn endpoint_of(endpoint: &str, newline: &str) -> Result<(String, u16)> {
+        let config = raw_config("[Interface]", newline).replace(
+            "Endpoint = 203.0.113.5:41820",
+            &format!("Endpoint = {endpoint}"),
+        );
+        let last = serde_json::json!({ "config": config });
+        let document = serde_json::json!({
+            "containers": [{"container": "amnezia-awg", "awg": {"last_config": last.to_string()}}],
+            "defaultContainer": "amnezia-awg", "description": "Amnezia Test"
+        });
+        match decode(&encode(&document))? {
+            AmneziaKey::WireGuard { config, .. } => {
+                let parsed = wireguard::parse(&config)?;
+                Ok((parsed.peer.host, parsed.peer.port))
+            }
+            AmneziaKey::Vless(_) => panic!("expected AmneziaWG"),
+        }
+    }
+
+    /// Amnezia writes an IPv6 endpoint without brackets, and 0.9.1 refused such keys: the port
+    /// cannot be told from the last group of an address in a configuration file, but here the
+    /// endpoint always has a port, so the last group is it. They import again, with the address
+    /// in brackets, and every other check stays: a configuration file with the same endpoint is
+    /// still refused, and so is anything that is not an IPv6 address and a port.
+    #[test]
+    fn an_ipv6_endpoint_without_brackets_imports_and_nothing_else_is_let_through() {
+        for (endpoint, expected) in [
+            ("2001:db8::1:51820", ("2001:db8::1", 51820)),
+            // A port that is also a valid group of the address.
+            ("2001:db8::5:443", ("2001:db8::5", 443)),
+            ("2001:db8:0:0:0:0:0:1:8080", ("2001:db8::1", 8080)),
+            ("[2001:db8::1]:51820", ("2001:db8::1", 51820)),
+            ("203.0.113.5:41820", ("203.0.113.5", 41820)),
+            ("vpn.example.com:41820", ("vpn.example.com", 41820)),
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let (host, port) = endpoint_of(endpoint, newline)
+                    .unwrap_or_else(|e| panic!("{endpoint:?} {newline:?}: {e}"));
+                let canonical = host
+                    .parse::<Ipv6Addr>()
+                    .map_or(host.clone(), |ip| ip.to_string());
+                assert_eq!(
+                    (canonical.as_str(), port),
+                    expected,
+                    "{endpoint:?} {newline:?}"
+                );
+            }
+        }
+        // With a comment after it.
+        assert_eq!(
+            endpoint_of("2001:db8::1:51820 # home", "\n").unwrap(),
+            ("2001:db8::1".to_string(), 51820)
+        );
+        // Still refused: no port, a port that is no port, no IPv6 address, more than one endpoint.
+        for bad in [
+            "2001:db8::1",
+            "2001:db8::1:0",
+            "2001:db8::1:65536",
+            "2001:db8::1:",
+            "2001:db8::zz:51820",
+            "2001:db8:1:2:3:4:5:6:7:51820",
+            "[2001:db8::1]",
+            "[2001:db8::1]:0",
+            "vpn.example.com",
+            ":51820",
+        ] {
+            assert!(endpoint_of(bad, "\n").is_err(), "accepted: {bad}");
+        }
+        let twice = raw_config("[Interface]", "\n")
+            .replace("AllowedIPs", "Endpoint = 2001:db8::2:1\nAllowedIPs")
+            .replace("203.0.113.5:41820", "2001:db8::1:51820");
+        assert!(wireguard::parse(&with_bracketed_endpoint(&twice)).is_err());
+        // Only the [Peer]'s endpoint is looked at; the setting in another section is not touched.
+        let elsewhere = raw_config("[Interface]", "\n").replace(
+            "Address = 10.8.1.2/32",
+            "Address = 10.8.1.2/32\nEndpoint = 2001:db8::1:51820",
+        );
+        let kept = with_bracketed_endpoint(&elsewhere);
+        assert!(kept.contains("Endpoint = 2001:db8::1:51820") && !kept.contains("[2001"));
+        // A configuration file (not a vpn:// key) is as strict as it was.
+        let file =
+            raw_config("[Interface]", "\n").replace("203.0.113.5:41820", "2001:db8::1:51820");
+        assert!(wireguard::parse(&file).is_err());
     }
 
     /// Without an `[Interface]` section there is nowhere to put them; the key is refused, as the

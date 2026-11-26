@@ -19,6 +19,10 @@ sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
 
+[dev-dependencies]
+# The service tests serve a dynamic key from a local HTTP server (see outline::pinned_client).
+ghostlink-engine = { workspace = true, features = ["test-hooks"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

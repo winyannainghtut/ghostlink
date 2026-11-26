@@ -27,6 +27,19 @@ rm -rf -- "$stage"
 mkdir -p "$stage/bin" "$stage/lib/ghostlink" "$stage/systemd" "$stage/licenses"
 install -m 0755 target/release/ghostlink target/release/ghostlinkd target/release/ghostlink-mcp "$stage/bin/"
 install -m 0755 target/release/ghostlink-tunnel "$stage/lib/ghostlink/"
+# Defence in depth: the service has a hook for its tests (core/vpn-engine, Cargo feature test-hooks, which
+# only the daemon's dev-dependencies turn on) that replaces the pinned fetch of dynamic keys by a plain
+# local one. A release build never enables it; nothing that ships (the archive, the .deb, the .rpm are made
+# from these staged files) may even contain the name of its variable.
+for program in "$stage"/bin/* "$stage"/lib/ghostlink/*; do
+  found=0
+  grep -q -a -F GHOSTLINK_TEST_DYNAMIC_KEY_URL "$program" || found=$?
+  case "$found" in
+    1) ;; # not found: as it should be
+    0) echo "$program contains GHOSTLINK_TEST_DYNAMIC_KEY_URL: it was built with the test-hooks feature and must not be released" >&2; exit 1 ;;
+    *) echo "cannot look for the test hook in $program (grep exit $found)" >&2; exit 1 ;;
+  esac
+done
 install -m 0644 packages/linux/ghostlinkd.service "$stage/systemd/"
 cp LICENSE NOTICE.md "$stage/licenses/"
 cp -R LICENSES/. "$stage/licenses/"

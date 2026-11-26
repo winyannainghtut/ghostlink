@@ -1,13 +1,13 @@
 // New client: name, protocol, an optional data limit and speed limit. The server creates the client and its
 // key (WireGuard-family keys get the next free /32 and a fresh Curve25519 key pair), then the
 // sheet shows the QR code, the .conf and the share options.
-import { Check as CheckIcon, Copy, FileDown, KeyRound, MonitorDown } from 'lucide-react';
+import { Check as CheckIcon, Copy, FileDown, KeyRound, MonitorDown, Power } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button, Check, Field, Inner, Note, Sheet, cx, useUI } from '@shared/glass';
 import { useBusy } from '@shared/hooks';
 import { step, type Done } from '@shared/steps';
 import { AUTH, KEY_PROTOCOLS, PROTOCOLS, PROTOCOL_HINTS, type Key, type ProtocolId, type User } from '../api';
-import { hasConf, isApple, qrFor, saveConf, saveKit, saveProfile } from '../keys';
+import { hasConf, isApple, qrFor, saveConf, saveKit, saveProfile, useConnectHere } from '../keys';
 import { dataLimitValue } from '../limits';
 import { firstKeyProtocol } from '../protocols';
 import { SpeedLimitField, speedValue, type SpeedChoice } from '../SpeedLimit';
@@ -34,6 +34,11 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
   const { busy, run: exclusive } = useBusy();
   const [error, setError] = useState('');
   const [created, setCreated] = useState<Created | null>(null);
+  // The ID the key was saved under on this device ("Use on this device"): the button then offers
+  // "Connect now", and pressing it a second time must not save the key again under another ID.
+  const [here, setHere] = useState<string | null>(null);
+  const connectNow = useConnectHere();
+  const { busy: using, run: saveOnce } = useBusy();
   // An Apple profile that makes the VPN connect by itself.
   const [onDemand, setOnDemand] = useState(false);
   // The client and the key are two requests. When the key fails, the client exists: the steps that
@@ -52,6 +57,7 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
     setSpeedLimit({ mode: 'default', mb: '' });
     setError('');
     setCreated(null);
+    setHere(null);
     setOnDemand(false);
     setPicked('shadowsocks');
     reloadServer().catch(() => {});
@@ -121,6 +127,15 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
 
   if (created) {
     const { user, key } = created;
+    const saveHere = () =>
+      saveOnce(async () => {
+        try {
+          setHere(await remote.useHere(user, key));
+          toast('Saved under My servers on this device.');
+        } catch (e) {
+          toast((e as Error).message, 'bad');
+        }
+      });
     return (
       <Sheet
         open={open}
@@ -176,9 +191,15 @@ export function NewClient({ open, onClose }: { open: boolean; onClose: () => voi
                 </Button>
               )}
               {remote.canUseHere && !isApple(key.protocol) && (
-                <Button icon={<MonitorDown size={14} />} onClick={() => run(async () => (await remote.useHere(user, key), 'Saved under My servers on this device.'))}>
-                  Use on this device
-                </Button>
+                here && remote.canConnect ? (
+                  <Button variant="cta" icon={<Power size={14} />} onClick={() => connectNow(here, user.name)}>
+                    Connect now
+                  </Button>
+                ) : (
+                  <Button icon={<MonitorDown size={14} />} disabled={using || !!here} onClick={saveHere}>
+                    {using ? 'Saving…' : here ? 'Saved on this device' : 'Use on this device'}
+                  </Button>
+                )
               )}
               <Button variant="ghost" icon={<FileDown size={14} />} onClick={() => run(() => saveKit(remote, user))}>
                 Connection kit

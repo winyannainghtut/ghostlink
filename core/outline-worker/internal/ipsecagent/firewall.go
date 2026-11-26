@@ -163,6 +163,13 @@ type Firewall struct {
 	Backend string // "nft" or "legacy"
 	// Exec runs the iptables commands; nil means the real ones. A test gives it a fake host.
 	Exec hostfw.Exec
+
+	// rendered is how many rules each chain got from the last Apply that went through ("table/CHAIN"
+	// -> number; hostfw.CountRules), nil before one did and after a failed one, when what the host
+	// holds is not known. Missing compares the host's chains with it. It follows the speed limits:
+	// they are part of what Apply renders, so a change of sessions that Apply put in is the new
+	// count, never a loss. The agent calls Apply and Missing from one goroutine.
+	rendered map[string]int
 }
 
 var chains = map[string][]string{
@@ -188,11 +195,17 @@ func DetectBackend(ctx context.Context) string { return hostfw.Detect(ctx) }
 
 func (f *Firewall) host() *hostfw.Firewall { return &hostfw.Firewall{Backend: f.Backend, Exec: f.Exec} }
 
-// Apply replaces the agent's chains and makes sure each is jumped to from its built-in chain.
+// Apply replaces the agent's chains and makes sure each is jumped to from its built-in chain. It
+// remembers how many rules it put in each chain, for Missing.
 func (f *Firewall) Apply(ctx context.Context, d ipsecproto.Desired, sas []ipsecproto.SA) error {
-	if err := f.host().Restore(ctx, Rules(d, sas)); err != nil {
+	rules := Rules(d, sas)
+	// A restore that fails may have changed some tables and not others: until one goes through,
+	// the host holds no known number of rules.
+	f.rendered = nil
+	if err := f.host().Restore(ctx, rules); err != nil {
 		return err
 	}
+	f.rendered = hostfw.CountRules(rules)
 	return f.EnsureJumps(ctx)
 }
 
@@ -202,12 +215,19 @@ func (f *Firewall) EnsureJumps(ctx context.Context) error {
 	return f.host().EnsureJumps(ctx, hostJumps())
 }
 
-// Missing lists the jumps and chains of the agent that are gone from the host (a firewall reload,
-// netfilter-persistent, iptables -F). Anything in the list means the rules need Apply again: a jump
-// put back into a chain that was flushed would send packets through nothing.
+// Missing lists what the agent lost of its firewall on the host: jumps and chains that are gone
+// (a firewall reload, netfilter-persistent, iptables -F), and chains that hold fewer rules than
+// the last Apply put in them (iptables -F GHOSTLINK-IPSEC-OUT, which leaves the chain and its jump).
+// Anything in the list means the rules need Apply again: a jump put back into a chain that was
+// flushed would send packets through nothing. Only the number of rules is compared, and more than
+// were put in is not a loss (see hostfw.Missing); every rule Rules renders is one rule on the host
+// (no address lists: TestRenderedRulesAreOneRuleEach).
 func (f *Firewall) Missing(ctx context.Context) []string {
-	return f.host().Missing(ctx, hostJumps(), chains)
+	return f.host().Missing(ctx, hostJumps(), chains, f.rendered)
 }
 
 // Remove deletes the jumps and the agent's chains, leaving the host as it was.
-func (f *Firewall) Remove(ctx context.Context) { f.host().Remove(ctx, hostJumps(), chains) }
+func (f *Firewall) Remove(ctx context.Context) {
+	f.rendered = nil
+	f.host().Remove(ctx, hostJumps(), chains)
+}

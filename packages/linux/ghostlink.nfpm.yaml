@@ -64,5 +64,10 @@ overrides:
       - libc6 (>= 2.35)
       - libssl3 | libssl3t64
   rpm:
+    # The libraries the binaries are linked with, by soname, not a package and version: Fedora 45's
+    # openssl-libs is OpenSSL 4 (libssl.so.4), which satisfied "openssl-libs >= 3.0" while
+    # ghostlinkd then failed to start; there libssl.so.3 comes from openssl3-libs, which dnf now
+    # pulls in. (64bit) is rpm's mark for a 64-bit library, on x86_64 and aarch64 alike.
     depends:
-      - openssl-libs >= 3.0
+      - libssl.so.3()(64bit)
+      - libcrypto.so.3()(64bit)

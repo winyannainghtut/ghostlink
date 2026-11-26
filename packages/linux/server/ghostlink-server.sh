@@ -8,6 +8,11 @@ LIB=/usr/lib/ghostlink-server
 STATE=/var/lib/ghostlink-server
 CONTAINER=ghostlink-server
 IPSEC_CONTAINER=ghostlink-ipsec
+# The directory the server and the IPsec component exchange their files in (desired.json from the
+# server, status.json from the component). It is root's, in root's /var/lib and not in the state,
+# so the server account cannot rename, remove or replace it, and so cannot send a bind mount that
+# Docker makes as root (also after a reboot, when Docker looks the path up again) to another place.
+IPSEC_DIR=/var/lib/ghostlink-ipsec
 SYSCTL_FILE=/etc/sysctl.d/90-ghostlink-ipsec.conf
 ACCOUNT=ghostlink-server
 # shellcheck source=/dev/null
@@ -97,7 +102,7 @@ need_root() {
 }
 
 need_docker() {
-    command -v docker >/dev/null 2>&1 || die "Docker is not installed (install docker.io or docker-ce)"
+    command -v docker >/dev/null 2>&1 || die "Docker is not installed (install docker.io or docker-ce on Debian and Ubuntu, docker-ce, moby-engine or docker on Fedora, RHEL and Amazon Linux)"
     docker info >/dev/null 2>&1 || die "Docker is not running (try: sudo systemctl enable --now docker)"
 }
 
@@ -138,10 +143,12 @@ nofollow_cat() { # FILE
     dd if="$1" iflag=nofollow,nonblock bs=65536 2>/dev/null
 }
 
-# state_cat FILE prints a file of the state itself, ipsec_cat FILE one of its ipsec directory
-# (reached through in_state_dir, because a symlink could stand in for the directory as well).
+# state_cat FILE prints a file of the state itself, ipsec_cat FILE one of the exchange directory.
+# That directory is root's (see ipsec_dir), so only the file in it can be a symlink the server
+# account made, and nofollow_cat does not follow one. A symlink in the place of the directory
+# itself could only be root's; it is not followed either.
 state_cat() { nofollow_cat "$STATE/$1"; }
-ipsec_cat() { in_state_dir ipsec nofollow_cat "$1"; }
+ipsec_cat() { [ ! -L "$IPSEC_DIR" ] && nofollow_cat "$IPSEC_DIR/$1"; }
 
 # The container runs as a dedicated unprivileged host account that owns only the state.
 ensure_account() {
@@ -187,12 +194,15 @@ prune_images() { # REPOSITORY IMAGE-TO-KEEP
         done
 }
 
+# start_container (re)creates the server. Besides the state it gets the exchange directory with
+# the IPsec component (made by ipsec_dir, which must have run: Docker would make a missing one
+# as root's, and the server could not write into it).
 start_container() {
     docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
     # shellcheck disable=SC2046
     docker run --detach --name "$CONTAINER" --restart unless-stopped \
         --log-opt max-size=10m --log-opt max-file=3 \
-        $(hardening) "$IMAGE" serve --state "$STATE" >/dev/null
+        $(hardening) --volume "$IPSEC_DIR:$IPSEC_DIR" "$IMAGE" serve --state "$STATE" --ipsec-dir "$IPSEC_DIR" >/dev/null
     tries=0
     while [ $tries -lt 20 ]; do
         running=$(docker inspect --format '{{.State.Running}} {{.RestartCount}}' "$CONTAINER" 2>/dev/null || true)
@@ -272,6 +282,7 @@ setup() {
     need_root setup
     need_docker
     ensure_account
+    ipsec_dir # before anything is stopped: a refusal leaves the server as it is
     load_image
     # Stop the running server before init. A stop lets it save its usage and history, and it
     # must not save its old state over what init writes next (it saves every 30 seconds).
@@ -287,10 +298,14 @@ setup() {
     tool check >/dev/null || setup_failed
     start_container
     prune_images ghostlink-server "$IMAGE"
-    # After an upgrade, the IPsec component (if enabled) moves to the new image too.
+    # After an upgrade, the IPsec component (if enabled) moves to the new image too, and, when it
+    # came from 0.9.1 or earlier, to the exchange directory outside the state: the server that just
+    # started writes its settings there, and the component, started below, reads them from there.
     if docker inspect "$IPSEC_CONTAINER" >/dev/null 2>&1; then
+        ipsec_await_settings
         ipsec_start
     fi
+    ipsec_retire_old_dir
     show_key
 }
 
@@ -333,48 +348,105 @@ ipsec_stop_container() {
     fi
 }
 
-# ipsec_dir makes $STATE/ipsec, the only directory the IPsec container gets, a directory of the
-# server account with mode 0770, or stops if something else is in its place (see in_state_dir).
+# ipsec_dir makes the exchange directory of the server and the IPsec component, or stops if
+# something else is in its place. It is root's, with the server account's group, mode 2770: the
+# account writes the settings into it and reads the component's report from it, the component
+# (root, in that group) the other way round, and the setgid bit keeps what the component writes in
+# the account's group. It stays in /var/lib, which only root can write, so the account cannot
+# rename, remove or replace it (it could for a directory in the state): the path that Docker
+# resolves for the mounts is the same directory at every start, also after a reboot, when Docker
+# looks it up again. Run it after ensure_account (it needs $gid), and again at each start: it puts
+# the owner and the mode back to what they should be.
 ipsec_dir() {
-    mkdir -m 0770 "$STATE/ipsec" 2>/dev/null || true
-    in_state_dir ipsec ipsec_dir_owner || ipsec_dir_refused
+    if [ -L "$IPSEC_DIR" ] || { [ -e "$IPSEC_DIR" ] && [ ! -d "$IPSEC_DIR" ]; }; then
+        ipsec_dir_refused
+    fi
+    [ -d "$IPSEC_DIR" ] || (umask 077 && mkdir "$IPSEC_DIR") || die "could not create $IPSEC_DIR"
+    fixed=0
+    ipsec_dir_fix || fixed=$?
+    case $fixed in
+        0) ;;
+        3) ipsec_dir_refused ;;
+        *) die "could not set the owner and the mode of $IPSEC_DIR" ;;
+    esac
 }
 
-ipsec_dir_owner() { chown "$uid:$gid" . && chmod 0770 .; }
+# ipsec_dir_fix checks, from inside the directory, that it is the directory at that path (not one
+# reached through a symlink, even though only root could have made one), and sets its owner and
+# mode on ".", which no swap after the check can redirect.
+ipsec_dir_fix() {
+    (
+        expected=$(cd -P "${IPSEC_DIR%/*}" && pwd -P)/${IPSEC_DIR##*/} &&
+            cd -P "$IPSEC_DIR" 2>/dev/null &&
+            [ "$(pwd -P)" = "$expected" ] || exit 3
+        chown "0:$gid" . && chmod 2770 . || exit 4
+    )
+}
 
 ipsec_dir_refused() {
-    die "$STATE/ipsec is not a plain directory (Ghostlink never makes it a symlink or a file); check it, move it away and run this again"
+    die "$IPSEC_DIR is not a plain directory (Ghostlink never makes it a symlink or a file); check it, move it away and run this again"
+}
+
+# ipsec_clear_status takes away the report of an earlier run, so that a start waits for its own.
+# rm unlinks a symlink the server account put there and never follows it.
+ipsec_clear_status() {
+    rm -f -- "$IPSEC_DIR/status.json" ||
+        die "could not remove $IPSEC_DIR/status.json (is something else in its place?); check it, move it away and run this again"
+}
+
+# ipsec_await_settings is for setup, after the server was recreated and before the component is:
+# when IKEv2 or IPsec is on, the server writes the component's settings at its start, to the
+# exchange directory, which is empty after an upgrade from 0.9.1 or earlier (those exchanged the
+# files in $STATE/ipsec). The component takes new settings within a second of their appearing, so
+# this only has them there when it starts; a server that is slow does not stop the upgrade.
+ipsec_await_settings() {
+    state_cat state.json | grep -E '"(ikev2|ipsec)_enabled": true' >/dev/null || return 0
+    tries=0
+    while [ $tries -lt 60 ]; do
+        [ -n "$(ipsec_cat desired.json | head -c 1)" ] && return 0
+        tries=$((tries + 1))
+        sleep 0.5
+    done
+    echo "ghostlink-server: the server has not written the IPsec settings to $IPSEC_DIR yet; the component takes them as soon as it does" >&2
+}
+
+# ipsec_retire_old_dir takes away $STATE/ipsec, where 0.9.1 and earlier exchanged these files and
+# nothing does now: its desired.json holds the keys and password hashes of clients, also of ones
+# removed since. The state is the server account's, so root removes names only: a symlink in the
+# directory's place is unlinked, never followed, and in the directory (checked from inside, see
+# in_state_dir) only the files Ghostlink wrote are unlinked. Anything else there stays, and so
+# does the directory.
+ipsec_retire_old_dir() {
+    old=$STATE/ipsec
+    if [ -L "$old" ]; then
+        rm -f -- "$old" || true
+        return 0
+    fi
+    [ -d "$old" ] || return 0
+    in_state_dir ipsec rm -f -- desired.json desired.json.pending status.json status.json.pending 2>/dev/null || true
+    rmdir "$old" 2>/dev/null || true
 }
 
 # ipsec_start (re)creates the component: root in the server account's group (to share only the
-# ipsec directory), no capabilities but the three IPsec needs, read-only, no privilege escalation.
-#
-# Docker mounts the directory by its path, which the server account could swap for a symlink in
-# the moment between the check and the mount, and a shell cannot hand Docker an open directory
-# instead (a restart policy would also look the path up again at each start). So the check comes
-# last, right before docker run, and each look at the component's status below checks the
-# directory again: a swap that stays ends the start and stops the component. What this does not
-# close is a swap that is put back at once; closing it needs the exchange directory outside the
-# server account's reach.
+# exchange directory), no capabilities but the three IPsec needs, read-only, no privilege
+# escalation. The directory is checked and fixed first (ipsec_dir) and is out of the server
+# account's reach, so nothing can redirect the path Docker mounts, now or when it restarts the
+# container.
 ipsec_start() {
     ipsec_dir
     docker load --input "$LIB/ipsec-image.tar.gz" >/dev/null || die "could not load the bundled IPsec image"
     ipsec_stop_container
-    in_state_dir ipsec rm -f status.json || ipsec_dir_refused
+    ipsec_clear_status
     docker run --detach --name "$IPSEC_CONTAINER" --restart unless-stopped \
         --log-opt max-size=10m --log-opt max-file=3 \
         --network host --user "0:$gid" --cap-drop ALL --cap-add NET_ADMIN --cap-add NET_RAW \
         --cap-add NET_BIND_SERVICE --security-opt no-new-privileges --read-only --tmpfs /run \
-        --volume "$STATE/ipsec:$STATE/ipsec" \
-        "$IPSEC_IMAGE" serve --dir "$STATE/ipsec" --iptables "$(ipsec_backend)" >/dev/null
+        --volume "$IPSEC_DIR:$IPSEC_DIR" \
+        "$IPSEC_IMAGE" serve --dir "$IPSEC_DIR" --iptables "$(ipsec_backend)" >/dev/null
     ipsec_created=1
     prune_images ghostlink-ipsec "$IPSEC_IMAGE"
     tries=0
     while [ $tries -lt 40 ]; do
-        if ! in_state_dir ipsec true; then
-            ipsec_stop_container
-            ipsec_dir_refused
-        fi
         ipsec_cat status.json | grep '"running": true' >/dev/null && return 0
         [ "$(docker inspect --format '{{.State.Running}}' "$IPSEC_CONTAINER" 2>/dev/null || true)" = true ] || break
         tries=$((tries + 1))
@@ -382,6 +454,18 @@ ipsec_start() {
     done
     docker logs --tail 20 "$IPSEC_CONTAINER" >&2 || true
     die "the IPsec component did not start; see: sudo ghostlink-server ipsec logs"
+}
+
+# ipsec_server_has_dir stops "ipsec enable" when the server container exists but was made by
+# 0.9.1 or earlier (or by a setup that did not finish): it has no exchange directory, writes the
+# component's settings to $STATE/ipsec and would never reach a component that reads this one.
+# Nothing has been changed on the host at that point. A server that does not exist is fine: setup
+# makes it with the directory.
+ipsec_server_has_dir() {
+    # A runtime that cannot answer is not taken for a server without the directory.
+    mounted=$(docker inspect --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null) || return 0
+    printf '%s\n' "$mounted" | grep -Fx "$IPSEC_DIR" >/dev/null ||
+        die "the server container was made by an older version and does not share $IPSEC_DIR with the IPsec component; run this first: sudo ghostlink-server setup"
 }
 
 # ipsec_forwarding_on turns IPv4 forwarding on, now and after a reboot (a sysctl drop-in), and
@@ -419,6 +503,7 @@ ipsec_command() {
             ensure_account
             ipsec_check_kernel
             ipsec_dir # a refusal leaves the host as it was
+            ipsec_server_has_dir
             ipsec_forwarding_on
             ipsec_start
             trap - EXIT INT TERM HUP # the component runs: what was changed stays
@@ -434,7 +519,7 @@ EOF
         disable)
             ipsec_stop_container
             rm -f "$SYSCTL_FILE"
-            in_state_dir ipsec rm -f status.json || true
+            rm -f -- "$IPSEC_DIR/status.json" 2>/dev/null || true
             echo "The IPsec component is stopped; its firewall rules and interface are removed."
             echo "IKEv2/IPsec keys stop working until you run: sudo ghostlink-server ipsec enable"
             ;;

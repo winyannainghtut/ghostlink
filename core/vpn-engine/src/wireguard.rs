@@ -241,7 +241,7 @@ fn endpoint(value: &str) -> Result<(String, u16)> {
 
 /// A configuration line as `parse` reads it: without its comment (`#` or `;` to the end of the
 /// line) and without the white space around it.
-fn significant(line: &str) -> &str {
+pub(crate) fn significant(line: &str) -> &str {
     line.split(['#', ';']).next().unwrap_or("").trim()
 }
 

@@ -34,7 +34,20 @@ jobs:
       - name: Install Rust toolchain
         run: |
           if ! command -v rustup >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            # rustup 1.29.3 from its archive, checked against a hard-coded SHA-256 (the same values
+            # as the .sha256 files next to the binaries and as rust-lang/docker-rust pins), instead
+            # of a script piped into a shell. To update: change the version and both hashes.
+            rustup_version=1.29.3
+            case "$(uname -m)" in
+              x86_64) rustup_target=x86_64-unknown-linux-gnu rustup_sha256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+              aarch64) rustup_target=aarch64-unknown-linux-gnu rustup_sha256=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+              *) echo "no pinned rustup-init for $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 15 -o "$RUNNER_TEMP/rustup-init" "https://static.rust-lang.org/rustup/archive/$rustup_version/$rustup_target/rustup-init"
+            echo "$rustup_sha256  $RUNNER_TEMP/rustup-init" | sha256sum -c -
+            chmod +x "$RUNNER_TEMP/rustup-init"
+            "$RUNNER_TEMP/rustup-init" -y --profile minimal --default-toolchain none
+            rm -f "$RUNNER_TEMP/rustup-init"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
@@ -160,17 +173,55 @@ jobs:
           ss -lun | grep ':443 ' > /dev/null
           sudo ghostlink-server keys ci --show | grep -E 'ss://[^@]+@127\.0\.0\.1:443/' > /dev/null
           sudo stat -c '%a %U' /var/lib/ghostlink-server | grep -qx '700 ghostlink-server'
-          # Root never follows a symlink in the state, which the container account controls:
-          # "ipsec enable" refuses one in place of the ipsec directory and changes nothing.
+          # The directory the server and the IPsec component exchange their files in is root's and in
+          # root's /var/lib, not in the state: the server account (which owns the state) cannot rename,
+          # remove or replace it, so no mount of it, which Docker resolves by path, also again after a
+          # reboot, can be sent elsewhere. It has the account's group and the setgid bit, so the
+          # account still writes its settings into it. One check per line: in "a && b" a failing a
+          # does not stop a script run with set -e.
+          test "$(stat -c '%U:%G %a' /var/lib/ghostlink-ipsec)" = 'root:ghostlink-server 2770'
+          docker inspect ghostlink-server --format '{{range .Mounts}}{{.Source}}>{{.Destination}}{{"\n"}}{{end}}' | tee mounts.txt
+          grep -qx '/var/lib/ghostlink-ipsec>/var/lib/ghostlink-ipsec' mounts.txt
+          docker inspect ghostlink-server --format '{{join .Args " "}}' | tee args.txt
+          grep -q -e '--ipsec-dir /var/lib/ghostlink-ipsec' args.txt
+          sudo -u ghostlink-server sh -c 'echo probe > /var/lib/ghostlink-ipsec/probe'
+          test "$(sudo stat -c %G /var/lib/ghostlink-ipsec/probe)" = ghostlink-server
+          sudo rm /var/lib/ghostlink-ipsec/probe
+          if sudo -u ghostlink-server mv /var/lib/ghostlink-ipsec /var/lib/ghostlink-ipsec.moved 2> denied.txt; then echo "the server account renamed the exchange directory" >&2; exit 1; fi
+          cat denied.txt
+          grep -q 'Permission denied' denied.txt
+          if sudo -u ghostlink-server rmdir /var/lib/ghostlink-ipsec 2> denied.txt; then echo "the server account removed the exchange directory" >&2; exit 1; fi
+          cat denied.txt
+          grep -q 'Permission denied' denied.txt
+          if sudo -u ghostlink-server ln -s /etc /var/lib/ghostlink-ipsec.link 2> denied.txt; then echo "the server account made a link in /var/lib" >&2; exit 1; fi
+          cat denied.txt
+          grep -q 'Permission denied' denied.txt
+          test -d /var/lib/ghostlink-ipsec
+          test ! -L /var/lib/ghostlink-ipsec
+          # A symlink the account plants where 0.9.1 and earlier exchanged these files, in the state's
+          # ipsec directory, no longer matters: nothing mounts or reads it, and setup unlinks it
+          # without following it.
           sudo mkdir -m 0755 /tmp/not-ipsec
-          sudo ln -sT /tmp/not-ipsec /var/lib/ghostlink-server/ipsec
+          sudo -u ghostlink-server ln -sT /tmp/not-ipsec /var/lib/ghostlink-server/ipsec
+          sudo ghostlink-server setup > /dev/null
+          sudo test ! -e /var/lib/ghostlink-server/ipsec
+          sudo test ! -L /var/lib/ghostlink-server/ipsec
+          test "$(stat -c '%U %a' /tmp/not-ipsec)" = 'root 755'
+          test -z "$(ls -A /tmp/not-ipsec)"
+          sudo rmdir /tmp/not-ipsec
+          # Root never follows a symlink where the directory belongs either (only root could put one
+          # there): "ipsec enable" refuses it and changes nothing.
+          sudo mv /var/lib/ghostlink-ipsec /var/lib/ghostlink-ipsec.kept
+          sudo mkdir -m 0755 /tmp/not-ipsec
+          sudo ln -sT /tmp/not-ipsec /var/lib/ghostlink-ipsec
           if sudo ghostlink-server ipsec enable 2> refused.txt; then echo "ipsec enable followed a symlink" >&2; exit 1; fi
           cat refused.txt
           grep -q 'not a plain directory' refused.txt
-          # One check per line: in "a && b" a failing a does not stop a script run with set -e.
           test "$(stat -c '%U %a' /tmp/not-ipsec)" = 'root 755'
+          test -z "$(ls -A /tmp/not-ipsec)"
           test ! -e /etc/sysctl.d/90-ghostlink-ipsec.conf
-          sudo rm /var/lib/ghostlink-server/ipsec
+          sudo rm /var/lib/ghostlink-ipsec
+          sudo mv /var/lib/ghostlink-ipsec.kept /var/lib/ghostlink-ipsec
           sudo rmdir /tmp/not-ipsec
           # An "ipsec enable" that fails after it turned forwarding on puts it back, and leaves no
           # sysctl file: the image's file is moved away, so that loading the component's image fails.
@@ -399,6 +450,7 @@ jobs:
           sudo apt-get purge -y ghostlink-server
           if docker ps -a --format '{{.Names}}' | grep -qx ghostlink-server; then echo "container left after purge" >&2; exit 1; fi
           test ! -e /var/lib/ghostlink-server
+          test ! -e /var/lib/ghostlink-ipsec
           if id ghostlink-server 2>/dev/null; then echo "the account is left after purge" >&2; exit 1; fi
       - name: Purge the server .deb while Docker is stopped (Docker is started to remove the containers)
         env:
@@ -416,6 +468,7 @@ jobs:
           docker info > /dev/null
           if docker ps -a --format '{{.Names}}' | grep -Eqx 'ghostlink-(server|ipsec)'; then echo "a container was left after the purge" >&2; exit 1; fi
           test ! -e /var/lib/ghostlink-server
+          test ! -e /var/lib/ghostlink-ipsec
           if id ghostlink-server 2>/dev/null; then echo "the account is left after purge" >&2; exit 1; fi
       - name: Smoke-test the migration from Outline (installer --migrate-outline, rollback)
         env:
@@ -504,6 +557,12 @@ jobs:
           grep -qx /usr/lib/ghostlink-server/image.tar.gz server-files.txt
           grep -qx /usr/lib/ghostlink-server/ipsec-image.tar.gz server-files.txt
           rpm -qp --scripts artifacts/linux-$ARCH/ghostlink-server-*.rpm | grep -q 'ghostlink-server setup'
+      # The three .rpm files installed with dnf in containers of Fedora, Rocky Linux 9 and Amazon
+      # Linux 2023 (images pinned by digest in the script), without systemd and without Docker.
+      - name: Install the .rpm packages with dnf (Fedora, Rocky Linux 9, Amazon Linux 2023)
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: bash tests/packages/rpm-install.sh "$ARCH"
       - name: IKEv2/IPsec interop (strongSwan client, all four sign-in methods)
         env:
           ARCH: ${{ inputs.arch }}

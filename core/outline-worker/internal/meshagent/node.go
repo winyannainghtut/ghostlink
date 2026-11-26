@@ -69,11 +69,15 @@ type Node struct {
 	ForwardingBefore string `json:"forwarding_before,omitempty"`
 }
 
+// ErrNotJoined is what LoadNode says when there is no identity in the state directory: this machine
+// never joined a mesh, or left it.
+var ErrNotJoined = errors.New("this machine is not in a mesh; join with: sudo ghostlink-mesh join (or the command from your Ghostlink server)")
+
 // LoadNode reads the node identity from dir.
 func LoadNode(dir string) (*Node, error) {
 	data, err := os.ReadFile(filepath.Join(dir, nodeFile))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, errors.New("this machine is not in a mesh; join with: sudo ghostlink-mesh join (or the command from your Ghostlink server)")
+		return nil, ErrNotJoined
 	}
 	if err != nil {
 		return nil, err

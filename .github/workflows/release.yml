@@ -57,6 +57,46 @@ jobs:
         run: |
           ./scripts/build-windows.ps1 -SkipCompile -Version '0.0.1-rc.1'
           Remove-Item -Path 'artifacts/windows-x64/*0.0.1-rc.1*' -Force
+      # What the compiled MSI says, read without installing it (tests/integration/test_windows_installer.py):
+      # a final release replacing its rc of the same version, the service restarting after a crash, the
+      # desktop app closed ahead of the old version's removal.
+      - name: The installer's tables
+        shell: pwsh
+        env:
+          GHOSTLINK_TEST_MSI: artifacts/windows-x64/Ghostlink-${{ steps.version.outputs.version }}-windows-x64.msi
+        run: |
+          python tests/integration/test_windows_installer.py -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      # A release candidate of this very version: Windows Installer takes the numeric a.b.c, so its MSI
+      # has the version of the release, and the release must replace it (install test, below). Built from
+      # the same binaries and kept out of the artifacts.
+      - name: A release candidate of this version, for the install test
+        shell: pwsh
+        run: |
+          $core = '${{ steps.version.outputs.version }}' -replace '-.*$', ''
+          ./scripts/build-windows.ps1 -SkipCompile -Version "$core-rc.99"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/msi-test" | Out-Null
+          Move-Item -LiteralPath "artifacts/windows-x64/Ghostlink-$core-rc.99-windows-x64.msi" -Destination "$env:RUNNER_TEMP/msi-test/same-version.msi"
+          Remove-Item -Path "artifacts/windows-x64/*$core-rc.99*" -Force
+      # The runner is an elevated throwaway VM, so the MSI is really installed (tests/packages/msi-install.ps1):
+      # the service runs as SYSTEM for the runner user (the first such run anywhere), the installed CLI gets
+      # in through the narrowed pipe rights, the published 0.9.1 is upgraded with a stand-in for the desktop
+      # app running, the rc above is replaced by the release, and each install is uninstalled again.
+      - name: Install, upgrade and uninstall the MSI (the service as SYSTEM)
+        shell: pwsh
+        run: |
+          ./tests/packages/msi-install.ps1 `
+            -Msi 'artifacts/windows-x64/Ghostlink-${{ steps.version.outputs.version }}-windows-x64.msi' `
+            -Version '${{ steps.version.outputs.version }}' `
+            -SameVersionMsi "$env:RUNNER_TEMP/msi-test/same-version.msi" `
+            -LogDirectory "$env:RUNNER_TEMP/msi-test/logs"
+      - name: The installer's logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msi-logs
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}/msi-test/logs/*.log
       - name: Worker corresponding source (GPL)
         shell: pwsh
         run: ./scripts/package-worker-source.ps1 -Version '${{ steps.version.outputs.version }}'

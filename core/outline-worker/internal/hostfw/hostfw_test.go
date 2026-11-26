@@ -74,7 +74,7 @@ func fakeFirewall() (*Firewall, *hostfwtest.Host) {
 func TestMissingFindsWhatAReloadTakesAway(t *testing.T) {
 	ctx := context.Background()
 	fw, host := fakeFirewall()
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 6 {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 6 {
 		t.Fatalf("an empty host is missing 3 jumps and 3 chains, Missing says %v", got)
 	}
 	if err := fw.Restore(ctx, testRender); err != nil {
@@ -83,13 +83,13 @@ func TestMissingFindsWhatAReloadTakesAway(t *testing.T) {
 	if err := fw.EnsureJumps(ctx, testJumps); err != nil {
 		t.Fatal(err)
 	}
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 0 || !fw.HasJumps(ctx, testJumps) {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 0 || !fw.HasJumps(ctx, testJumps) {
 		t.Fatalf("a restored firewall is missing %v", got)
 	}
 
 	// iptables -F: the rules of every chain go, the jumps among them; the chains stay, empty.
 	host.Flush()
-	got := fw.Missing(ctx, testJumps, testChains)
+	got := fw.Missing(ctx, testJumps, testChains, nil)
 	want := []string{"jump filter/FORWARD -> T-FWD", "jump filter/INPUT -> T-IN", "jump nat/POSTROUTING -> T-POST"}
 	if !slices.Equal(got, want) || fw.HasJumps(ctx, testJumps) {
 		t.Fatalf("after iptables -F: %v, want %v", got, want)
@@ -99,7 +99,7 @@ func TestMissingFindsWhatAReloadTakesAway(t *testing.T) {
 	if err := fw.EnsureJumps(ctx, testJumps); err != nil {
 		t.Fatal(err)
 	}
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 0 {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 0 {
 		t.Fatalf("with its jumps back the firewall looks whole: %v", got)
 	}
 	if len(host.Rules("filter", "T-IN")) != 0 {
@@ -112,7 +112,7 @@ func TestMissingFindsWhatAReloadTakesAway(t *testing.T) {
 	if err := fw.EnsureJumps(ctx, testJumps); err == nil {
 		t.Fatal("a jump to a chain that does not exist was inserted")
 	}
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 6 {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 6 {
 		t.Fatalf("after a full reload: %v", got)
 	}
 	if err := fw.Restore(ctx, testRender); err != nil {
@@ -121,13 +121,13 @@ func TestMissingFindsWhatAReloadTakesAway(t *testing.T) {
 	if err := fw.EnsureJumps(ctx, testJumps); err != nil {
 		t.Fatal(err)
 	}
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 0 || len(host.Rules("filter", "T-IN")) != 1 {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 0 || len(host.Rules("filter", "T-IN")) != 1 {
 		t.Fatalf("restored after a full reload: missing %v, rules %v", got, host.Rules("filter", "T-IN"))
 	}
 
 	// One jump gone, the rest in place.
 	host.Delete("nat", "POSTROUTING", "-j T-POST")
-	if got := fw.Missing(ctx, testJumps, testChains); !slices.Equal(got, []string{"jump nat/POSTROUTING -> T-POST"}) {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); !slices.Equal(got, []string{"jump nat/POSTROUTING -> T-POST"}) {
 		t.Fatalf("one jump gone: %v", got)
 	}
 }
@@ -143,7 +143,7 @@ func TestMissingChangesNothingAndAsksDockerOnlyWhenNeeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := len(host.Calls())
-	if got := fw.Missing(ctx, testJumps, testChains); len(got) != 0 {
+	if got := fw.Missing(ctx, testJumps, testChains, nil); len(got) != 0 {
 		t.Fatal(got)
 	}
 	calls := host.Calls()[before:]
@@ -157,18 +157,18 @@ func TestMissingChangesNothingAndAsksDockerOnlyWhenNeeded(t *testing.T) {
 	}
 	// A jump marked Docker is also kept in DOCKER-USER once Docker made it, so then the host is asked.
 	docker := append(slices.Clone(testJumps), Jump{Table: "filter", Chain: "FORWARD", Match: []string{"-i", "gltest0"}, Target: "T-FWD", Docker: true})
-	if got := fw.Missing(ctx, docker, testChains); !slices.Equal(got, []string{"jump filter/FORWARD -> T-FWD"}) || host.Count(" -S DOCKER-USER") != 1 {
+	if got := fw.Missing(ctx, docker, testChains, nil); !slices.Equal(got, []string{"jump filter/FORWARD -> T-FWD"}) || host.Count(" -S DOCKER-USER") != 1 {
 		t.Fatalf("without DOCKER-USER: %v, %d questions about it", got, host.Count(" -S DOCKER-USER"))
 	}
 	host.AddChain("filter", "DOCKER-USER")
-	got := fw.Missing(ctx, docker, testChains)
+	got := fw.Missing(ctx, docker, testChains, nil)
 	if !slices.Equal(got, []string{"jump filter/FORWARD -> T-FWD", "jump filter/DOCKER-USER -> T-FWD"}) {
 		t.Fatalf("with DOCKER-USER: %v", got)
 	}
 	if err := fw.EnsureJumps(ctx, docker); err != nil {
 		t.Fatal(err)
 	}
-	if got := fw.Missing(ctx, docker, testChains); len(got) != 0 {
+	if got := fw.Missing(ctx, docker, testChains, nil); len(got) != 0 {
 		t.Fatalf("after EnsureJumps: %v", got)
 	}
 }

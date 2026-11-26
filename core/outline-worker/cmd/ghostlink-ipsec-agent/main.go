@@ -26,7 +26,7 @@ const usage = `usage: ghostlink-ipsec-agent [serve] [flags] | version
   version    print the version
 
 flags:
-  --dir DIR          directory shared with the server (default /var/lib/ghostlink-server/ipsec)
+  --dir DIR          directory shared with the server (default /var/lib/ghostlink-ipsec)
   --run DIR          private runtime directory (default /run/ghostlink-ipsec)
   --iptables MODE    nft, legacy or auto: the iptables backend the host uses (default auto)
 `
@@ -47,7 +47,7 @@ func main() {
 	}
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	flags.Usage = func() { fmt.Fprint(os.Stderr, usage) }
-	dir := flags.String("dir", "/var/lib/ghostlink-server/ipsec", "")
+	dir := flags.String("dir", "/var/lib/ghostlink-ipsec", "")
 	runDir := flags.String("run", "/run/ghostlink-ipsec", "")
 	backend := flags.String("iptables", "auto", "")
 	_ = flags.Parse(args)

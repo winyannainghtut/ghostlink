@@ -6,6 +6,13 @@
 //! filters or DNS settings. On Windows the system removes the routes, DNS servers and filters of
 //! an interface with the interface; the check is a way to see that this happened, not a proof
 //! about every setting. When it cannot tell, it says so, and the caller keeps the block.
+//!
+//! On Linux it does not look at `ip rule` or nftables either, on purpose (decided in 0.9.2, with
+//! the evidence pinned by `worker_session`'s test `the_tunnel_inbound_leaves_nothing_that_outlives_its_interface_and_cuts_traffic`):
+//! the worker's TUN is not persistent, so its routes and addresses go with it; its configuration
+//! has no `auto_redirect`, so there are no nftables entries; and the `ip rule`s it leaves point at
+//! an empty table, which does not match, and are removed by the worker's own next start, which a
+//! check that held the block for them would keep from ever happening.
 
 use anyhow::{bail, Result};
 use std::{

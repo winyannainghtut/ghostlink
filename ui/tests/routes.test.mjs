@@ -44,6 +44,8 @@ test('the contract was read', () => {
 test('server, users and keys', () => {
   check('GET', '/server', undefined, { op: 'info' });
   check('PATCH', '/server', { protocols: { wireguard: { enabled: false } } }, { op: 'update', patch: { protocols: { wireguard: { enabled: false } } } });
+  // Replacing the management key: the service rotates it on the server and seals the new one here.
+  check('POST', '/server/rotate-key', undefined, { op: 'rotate_key' });
   check('GET', '/users', undefined, { op: 'users_list' });
   check('POST', '/users', { name: 'Maya', data_limit_bytes: 5e9 }, { op: 'user_create', change: { name: 'Maya', data_limit_bytes: 5e9 } });
   check('PATCH', '/users/12', { enabled: false }, { op: 'user_update', user: '12', change: { enabled: false } });

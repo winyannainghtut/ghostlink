@@ -142,6 +142,7 @@ When the mesh is on, the Mesh card shows a map of every node and every link: in 
   - its links with latency.
   - From there you can edit tags, share its subnets, make it a relay, and disable or remove it.
 - **Dragging** a node moves it; the position is remembered on that device. **Rearrange the map** forgets the positions.
+- **Zoom and pan (since 0.9.2):** the mouse wheel or a pinch zooms around the pointer, dragging the background pans, and the buttons at the top right zoom, show the zoom level and **Show the whole map**. With the map focused, `+` and `-` zoom, `0` fits and the arrow keys move it. Over the map the wheel always zooms, so scroll the page beside it. Subnet labels are placed so that they do not cover each other or a node.
 - **Waiting for approval** lists nodes that joined with an approval invite, with **Approve** and **Reject**.
 
 ## Access rules
@@ -224,7 +225,7 @@ On a node, `sudo ghostlink-mesh …`:
 | `join` | Join, with the invite in `GHOSTLINK_MESH_INVITE` or on standard input. The installer does this. |
 | `status [--json]` | This node and its peers: addresses, endpoint, handshake, latency and traffic. A node reached through the relay is listed as `(through the relay)`, and its address is among the relay peer's. |
 | `allow-forwarding` | Consent to relaying and subnet sharing. |
-| `leave` | Leave the mesh. The coordinator drops the node; the interface, firewall chains and `/etc/hosts` block are removed. IP forwarding is set back to what it was before the node first forwarded, unless Docker, libvirt or similar software on the machine may need it. |
+| `leave` | Leave the mesh. If the agent is running, `leave` asks it to stop first (it prints `stopping the running agent (process N)` and waits up to 30 s), so the two never work at the same time; the agent stops with status 0, so systemd does not start it again. The coordinator drops the node; the interface, firewall chains and `/etc/hosts` block are removed. IP forwarding is set back to what it was before the node first forwarded, unless Docker, libvirt or similar software on the machine may need it. |
 | `version` | Print the version. |
 
 The node's state is in `/var/lib/ghostlink-mesh`, readable only by root. Removing the package leaves the mesh, and purging it deletes the state.
@@ -253,6 +254,7 @@ See also the [security model](../security/model.md).
 - Kernel WireGuard is required (Linux 5.6 or newer, which covers all current server distributions). Container-based VPS types such as OpenVZ and LXC usually lack it; a userspace fallback is planned.
 - IPv4 inside the mesh. Peers can be up to 250 per node, and each node can offer up to 16 subnets.
 - No deliberate NAT hole punching: two nodes behind NAT connect directly only through 1:1 or port-preserving NAT, and otherwise use the relay.
+- The agent holds a lock on its state directory (`agent.lock`, which stays there, empty while no agent runs), so a second `ghostlink-mesh serve` on the same state is refused with the process ID of the first. An agent started by a version before 0.9.2 holds no lock: `leave` against it works as before (the two overlap harmlessly).
 - The coordinator keeps the paths in memory. After it restarts, pairs that need the relay can be cut off for up to about 90 seconds while it finds that out again.
 - The map shows the live state, with no mesh traffic history.
 

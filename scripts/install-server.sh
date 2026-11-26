@@ -186,7 +186,7 @@ main() {
 
     # --- Docker ---
     if [ "$(command -v docker 2>/dev/null)" = /snap/bin/docker ]; then
-        die "Docker from the Snap store cannot use /var/lib/ghostlink-server. Remove it (snap remove docker) and run this again; Docker is then installed as a system package"
+        die "Docker from the Snap store cannot use /var/lib/ghostlink-server or /var/lib/ghostlink-ipsec. Remove it (snap remove docker) and run this again; Docker is then installed as a system package"
     fi
     if ! command -v docker >/dev/null 2>&1; then
         [ "$docker_install" = 1 ] || die "Docker is not installed (and --no-docker was given)"

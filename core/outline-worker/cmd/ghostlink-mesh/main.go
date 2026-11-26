@@ -44,7 +44,8 @@ const usage = `usage: ghostlink-mesh <command> [flags]
   status    show this node, its peers (direct or through the relay) and latency [--json]
   allow-forwarding
             allow this node to relay or share subnets (then restart the service)
-  leave     leave the mesh and remove everything the agent set up
+  leave     leave the mesh and remove everything the agent set up (a running agent is stopped
+            first, and waited for)
   version   print the version
 
 Common flags: --state DIR (default /var/lib/ghostlink-mesh), --interface NAME (join only,
@@ -103,13 +104,16 @@ func main() {
 	}
 }
 
+func validBackend(backend string) bool {
+	return backend == "auto" || backend == "nft" || backend == "legacy"
+}
+
 func firewall(backend string) *hostfw.Firewall {
-	switch backend {
-	case "auto":
-		backend = hostfw.DetectHost(context.Background())
-	case "nft", "legacy":
-	default:
+	if !validBackend(backend) {
 		fail("--iptables must be auto, nft or legacy")
+	}
+	if backend == "auto" {
+		backend = hostfw.DetectHost(context.Background())
 	}
 	return &hostfw.Firewall{Backend: backend}
 }
@@ -240,17 +244,19 @@ func join(flags *flag.FlagSet, dir *string, args []string) {
 	}
 }
 
+// serve runs the agent until it is asked to stop. A SIGTERM (systemctl stop, or `ghostlink-mesh
+// leave`, which stops a running agent that way) or Ctrl-C ends it through its normal clean-up, and
+// the process then exits with status 0: systemd's Restart=on-failure starts only a process that
+// failed, so an agent stopped by `leave` is not started again. The signals are caught before
+// anything else, so one that comes while the agent is starting is not lost.
 func serve(dir, backend string) {
-	logger := log.New(os.Stderr, "ghostlink-mesh: ", 0)
-	node, err := meshagent.LoadNode(dir)
-	if err != nil {
-		fail("%v", err)
+	if !validBackend(backend) {
+		fail("--iptables must be auto, nft or legacy")
 	}
+	logger := log.New(os.Stderr, "ghostlink-mesh: ", 0)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	agent := &meshagent.Agent{Dir: dir, Node: node, Log: logger, FW: firewall(backend), Version: version.Ghostlink}
-	logger.Printf("starting %s (%s) for %s", node.Name, node.Address, node.URL)
-	if err := agent.Serve(ctx); err != nil {
+	if err := meshagent.Run(ctx, dir, func() *hostfw.Firewall { return firewall(backend) }, version.Ghostlink, logger); err != nil {
 		fail("%v", err)
 	}
 }

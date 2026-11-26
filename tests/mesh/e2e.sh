@@ -280,8 +280,19 @@ in_ns pub iptables-save | grep -q GHOSTLINK-MESH && fail "firewall chains left b
 grep -q "mesh" "/etc/netns/pub/hosts" && fail "/etc/hosts block left behind"
 
 step "Leaving while the agent runs stops the agent and leaves nothing behind"
-in_ns natb "$bin/ghostlink-mesh" leave --state "$work/natb"
-wait_for 30 "natb's agent exits once the node has left" bash -c "! kill -0 ${agent[natb]} 2>/dev/null"
+# Since 0.9.2 the running agent holds a lock on its state; leave asks it to stop (SIGTERM), waits
+# for it, and removes the node while it holds the lock. The agent stops by itself, with status 0
+# (so systemd's Restart=on-failure does not start it again), before leave returns.
+natb_agent=${agent[natb]}
+in_ns natb "$bin/ghostlink-mesh" leave --state "$work/natb" 2>&1 | tee "$work/natb-leave.log"
+grep -q "stopping the running agent (process $natb_agent)" "$work/natb-leave.log" || fail "leave did not stop the running agent"
+kill -0 "$natb_agent" 2>/dev/null && fail "natb's agent still runs after leave returned (leave waits for it)"
+agent_status=0
+wait "$natb_agent" || agent_status=$?
+[ "$agent_status" = 0 ] || fail "natb's agent ended with status $agent_status after leave: it must stop by itself with status 0, not be killed"
+grep -q "ghostlink-mesh: stopped" "$work/natb-restarted.log" || fail "natb's agent did not log a clean stop"
+if grep -q "this node left the mesh" "$work/natb-restarted.log"; then fail "natb's agent stopped because it found its identity gone, not because leave asked it to"; fi
+[ ! -s "$work/natb/agent.lock" ] || fail "a process ID is left in agent.lock after the agent stopped"
 in_ns natb ip link show glmesh0 >/dev/null 2>&1 && fail "glmesh0 left behind after leave"
 in_ns natb iptables-save | grep GHOSTLINK-MESH >/dev/null && fail "firewall chains left behind after leave"
 [ ! -e "$work/natb/node.json" ] || fail "node.json left behind after leave"

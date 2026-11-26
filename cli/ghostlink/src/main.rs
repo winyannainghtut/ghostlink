@@ -236,6 +236,13 @@ enum ServerCommand {
         #[arg(long)]
         server: String,
     },
+    /// Replace the server's management key. The old key stops working at once and this device
+    /// saves the new one; neither is ever printed. Other devices that have the old key must be
+    /// given the new one (`sudo ghostlink-server show-key`).
+    RotateKey {
+        #[arg(long)]
+        server: String,
+    },
     /// Live speed per user, online users and server health.
     Live {
         #[arg(long)]
@@ -1353,6 +1360,7 @@ async fn server_action(command: &ServerCommand, timeout: u64) -> Result<Action, 
         ServerCommand::Usage { server } => call(server, ServerOp::Metrics {}),
         ServerCommand::Live { server } => call(server, ServerOp::Live {}),
         ServerCommand::AsnUpdate { server } => call(server, ServerOp::AsnUpdate {}),
+        ServerCommand::RotateKey { server } => call(server, ServerOp::RotateKey {}),
         ServerCommand::Stats {
             server,
             user,

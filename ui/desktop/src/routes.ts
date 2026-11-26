@@ -8,6 +8,7 @@ const ID = '(\\d+)';
 const routes: Route[] = [
   { method: 'GET', pattern: /^\/server$/, op: () => ({ op: 'info' }) },
   { method: 'PATCH', pattern: /^\/server$/, op: (_m, body) => ({ op: 'update', patch: body }) },
+  { method: 'POST', pattern: /^\/server\/rotate-key$/, op: () => ({ op: 'rotate_key' }) },
   { method: 'GET', pattern: /^\/users$/, op: () => ({ op: 'users_list' }) },
   { method: 'POST', pattern: /^\/users$/, op: (_m, body) => ({ op: 'user_create', change: body }) },
   { method: 'PATCH', pattern: new RegExp(`^/users/${ID}$`), op: (m, body) => ({ op: 'user_update', user: m[1], change: body }) },

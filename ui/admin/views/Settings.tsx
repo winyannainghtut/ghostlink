@@ -1,15 +1,17 @@
-// Server settings: name, the address in new keys, the REALITY site, the default speed limit and
-// monitoring retention.
+// Server settings: name, the address in new keys, the REALITY site, the default speed limit,
+// monitoring retention, and replacing the management key.
+import { Copy, Eye, EyeOff } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Button, Check, Field, Inner, Note, Sheet, useUI } from '@shared/glass';
+import { Button, Check, Field, IconButton, Inner, Note, Sheet, useUI } from '@shared/glass';
 import { useBusy, usePoll } from '@shared/hooks';
 import { defaultSpeedChange, defaultSpeedText } from '../limits';
 import { lookupState } from '../provider';
+import { ROTATE_TITLE, rotateWarning, rotationResult } from '../rotateKey';
 import { useApi, useStore } from '../store';
 
 export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClose: () => void; footer?: ReactNode }) {
   const { server, reloadServer } = useStore();
-  const { api } = useApi();
+  const { api, desktop } = useApi();
   const { toast, confirm } = useUI();
   const [name, setName] = useState(server.name);
   const [hostname, setHostname] = useState(server.hostname);
@@ -21,6 +23,9 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
   const [historyMB, setHistoryMB] = useState(String(server.history_max_mb));
   const [speedDefault, setSpeedDefault] = useState(defaultSpeedText(server.default_speed_limit_bps));
   const [error, setError] = useState('');
+  // The new management key, for the dashboard to show once (the app never receives it). It lives
+  // only in this state: closing the sheet drops it.
+  const [newKey, setNewKey] = useState<string | null>(null);
   const speedField = useRef<HTMLInputElement>(null);
   // One save at a time (a double click would send it twice), and one provider download or key
   // replacement at a time.
@@ -122,6 +127,21 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
       }
     });
 
+  const rotateKey = () =>
+    work(async () => {
+      if (!(await confirm({ title: ROTATE_TITLE, text: rotateWarning(desktop ? 'app' : 'dashboard'), action: 'Replace the key', danger: true }))) return;
+      try {
+        const result = rotationResult(await api('POST', '/server/rotate-key'));
+        if (result.kind === 'shown') {
+          setNewKey(result.key);
+        } else {
+          toast(result.message, result.kind === 'saved' ? 'ok' : 'info');
+        }
+      } catch (e) {
+        toast((e as Error).message, 'bad');
+      }
+    });
+
   return (
     <Sheet
       open={open}
@@ -203,6 +223,15 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
             </Button>
           </Inner>
         )}
+        <Inner className="grid gap-2">
+          <h3 className="text-[14px]">Management key</h3>
+          <Note>
+            The key the Ghostlink app and the command line use to manage this server. Replace it if it may have leaked: the old one stops working at once, on every device and script that has it. Clients stay connected.
+          </Note>
+          <Button size="sm" variant="ghost" className="justify-self-start" disabled={working} onClick={rotateKey}>
+            Replace the management key
+          </Button>
+        </Inner>
         <Inner className="grid gap-1.5 text-[13px]">
           <h3 className="text-[14px]">This dashboard</h3>
           <p className="text-fg-2">
@@ -214,7 +243,47 @@ export function SettingsSheet({ open, onClose, footer }: { open: boolean; onClos
           </p>
         </Inner>
         {error && <Note tone="bad">{error}</Note>}
+        <NewKeySheet value={newKey} onClose={() => setNewKey(null)} />
       </div>
+    </Sheet>
+  );
+}
+
+// The new management key, shown once by the dashboard: masked, with a copy button. The key is
+// only in the state of the sheet that opened this one, and closing drops it.
+function NewKeySheet({ value, onClose }: { value: string | null; onClose: () => void }) {
+  const { copy } = useUI();
+  const [reveal, setReveal] = useState(false);
+  useEffect(() => setReveal(false), [value]);
+  return (
+    <Sheet
+      open={value !== null}
+      onClose={onClose}
+      title="The new management key"
+      subtitle="Shown once. This dashboard does not keep it."
+      footer={
+        <>
+          <Button icon={<Copy size={14} />} onClick={() => value && copy(value, 'Management key copied. Keep it private.', 'Could not copy the key. Show it, select it and copy it yourself.')}>
+            Copy key
+          </Button>
+          <Button variant="cta" onClick={onClose}>
+            Done
+          </Button>
+        </>
+      }
+    >
+      {value !== null && (
+        <div className="grid gap-3">
+          <div className="relative">
+            <input className="field mono pr-12" readOnly spellCheck={false} autoComplete="off" aria-label="New management key" type={reveal ? 'text' : 'password'} value={value} onFocus={e => e.currentTarget.select()} data-autofocus />
+            <IconButton label={reveal ? 'Hide the key' : 'Show the key'} className="absolute top-0.5 right-1" onClick={() => setReveal(!reveal)}>
+              {reveal ? <EyeOff size={16} /> : <Eye size={16} />}
+            </IconButton>
+          </div>
+          <Note tone="warn">{rotateWarning('shown')}</Note>
+          <Note>In the Ghostlink app, open Servers I run and use Update key on this server: it keeps its name. The old key is already refused.</Note>
+        </div>
+      )}
     </Sheet>
   );
 }

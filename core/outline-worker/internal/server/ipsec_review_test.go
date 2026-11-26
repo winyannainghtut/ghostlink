@@ -357,6 +357,33 @@ func TestIPsecSettingsAreWrittenOnlyWhenTheyChange(t *testing.T) {
 	}
 }
 
+// Two writes that read the same time (on Windows the clock moves in steps of about 15.6 ms, which
+// failed the test above once in CI) still get two generations: the agent applies a file only when
+// its generation differs from the one it applied, so it would ignore the second.
+func TestIPsecWritesAtTheSameTimeGetNewGenerations(t *testing.T) {
+	server := ipsecServer(t)
+	user := server.user(t, map[string]any{"name": "Phone"})
+	server.appleKey(t, user, map[string]string{"protocol": "ikev2"})
+	now := time.Now()
+	if err := server.service.WriteIPsecDesired(now); err != nil {
+		t.Fatal(err)
+	}
+	first := server.desired(t).Generation
+	if err := server.service.WriteIPsecDesired(now); err != nil {
+		t.Fatal(err)
+	}
+	if second := server.desired(t).Generation; second <= first {
+		t.Fatalf("a second write at the same time has generation %d, after %d", second, first)
+	}
+	// An earlier time (the clock set back) also gives a new, larger one.
+	if err := server.service.WriteIPsecDesired(now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if third := server.desired(t).Generation; third <= first+1 {
+		t.Fatalf("a write with the clock set back has generation %d, after %d", third, first+1)
+	}
+}
+
 // Changes and writes at the same time: the file must end up holding the newest state, and no
 // write may fail because another one is replacing the same files.
 func TestIPsecSettingsWritesAreSerialized(t *testing.T) {

@@ -485,12 +485,30 @@ func (a *Agent) writeStatus() {
 	_ = writeAtomic(filepath.Join(a.Dir, statusFile), data, 0o644)
 }
 
-// Leave removes this node from the mesh and from the host. The agent need not be stopped first: a
-// running agent sees that the identity is gone (before each sync and after it, whatever the
-// coordinator answered) and stops without setting anything up or saving anything again, taking
-// down what it holds itself. The two clean-ups may run at once; each is safe to repeat.
+// Leave removes this node from the mesh and from the host. A running agent is stopped first: it
+// is asked to stop with SIGTERM (when it holds the agent lock, see stopAgent), takes down what it
+// set up and ends with status 0, so systemd does not start it again; the identity is deleted only
+// after that, while Leave itself holds the lock, so no agent starts in between. When the agent
+// does not stop in time (or there is no lock to be had), Leave goes on without it, as it did
+// before the lock existed: a running agent sees that the identity is gone (before each sync and
+// after it, whatever the coordinator answered) and stops without setting anything up or saving
+// anything again. The two clean-ups may then run at once; each is safe to repeat.
 func Leave(dir string, fw *hostfw.Firewall) error {
+	return leave(dir, fw, osLocks, agentStopWait, log.New(os.Stderr, "ghostlink-mesh: ", 0))
+}
+
+func leave(dir string, fw *hostfw.Firewall, sys osLock, wait time.Duration, logger *log.Logger) error {
+	if _, err := LoadNode(dir); err != nil {
+		return err
+	}
+	lock := stopAgent(sys, dir, wait, logger.Printf)
+	defer lock.Release()
+	// Read again: the agent may have saved something (the forwarding setting from before) while it
+	// ended, or the coordinator may have dropped the node and the agent cleaned up by itself.
 	node, err := LoadNode(dir)
+	if errors.Is(err, ErrNotJoined) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -498,7 +516,7 @@ func Leave(dir string, fw *hostfw.Firewall) error {
 	if errors.Is(remoteErr, ErrRemoved) {
 		remoteErr = nil
 	}
-	a := &Agent{Dir: dir, Node: node, FW: fw, Log: log.New(os.Stderr, "ghostlink-mesh: ", 0)}
+	a := &Agent{Dir: dir, Node: node, FW: fw, Log: logger}
 	a.teardown()
 	a.restoreForwarding()
 	Forget(dir)

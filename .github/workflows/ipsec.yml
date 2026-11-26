@@ -1,12 +1,15 @@
 name: IPsec interop
-# Builds the server package with its IPsec component and runs tests/ipsec/interop.sh: a real
-# strongSwan client connects with each Apple profile's parameters (IKEv2 EAP, IKEv2 certificate,
-# IPsec certificate + XAuth, IPsec PSK + XAuth). Also builds the component's GPL source bundle.
+# Builds the server package with its IPsec component and runs tests/ipsec/interop.sh: it first
+# upgrades the published 0.9.1 package (IPsec on, a client connected) to this one
+# (tests/ipsec/upgrade.sh), then a real strongSwan client connects with each Apple profile's
+# parameters (IKEv2 EAP, IKEv2 certificate, IPsec certificate + XAuth, IPsec PSK + XAuth). Also
+# builds the component's GPL source bundle.
 on:
   push:
     paths:
       - 'core/outline-worker/**'
       - 'packages/linux/server/**'
+      - 'packages/linux/scripts/server-*.sh'
       - 'tests/ipsec/**'
       - 'scripts/build-linux-server.sh'
       - 'scripts/ipsec-source.sh'
@@ -79,6 +82,7 @@ jobs:
           sudo ghostlink-server ipsec disable
           sudo apt-get purge -y ghostlink-server >/dev/null
           test ! -e /var/lib/ghostlink-server
+          test ! -e /var/lib/ghostlink-ipsec
       - name: GPL source of the IPsec component
         env:
           VERSION: ${{ steps.build.outputs.version }}

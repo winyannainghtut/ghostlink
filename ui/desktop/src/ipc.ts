@@ -6,6 +6,16 @@ const invoke = (globalThis as unknown as { __TAURI__?: { core?: { invoke?: Invok
 
 export class ServiceUnavailable extends Error {}
 
+// An answer of the service that says no, with its code ("busy", "not_found", "invalid_request", ...).
+// (Written out, not as a parameter property: the tests run this file with Node's type stripping.)
+export class ServiceError extends Error {
+  code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 type Response<T> = { success: boolean; data: T; error?: { code: string; message: string } };
 
 // vpn_request answers every service error itself, so a rejected call means the shell refused the
@@ -24,7 +34,7 @@ export async function request<T>(action: Record<string, unknown>): Promise<T> {
   } catch (reason) {
     throw rejectionError(reason);
   }
-  if (!response.success) throw new Error(response.error?.message || 'The VPN service could not complete this request.');
+  if (!response.success) throw new ServiceError(response.error?.message || 'The VPN service could not complete this request.', response.error?.code ?? '');
   return response.data;
 }
 
