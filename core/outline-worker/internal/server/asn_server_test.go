@@ -425,9 +425,10 @@ func TestASNClosingTheServiceEndsTheDownloadAndStartsNoOther(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("closing the service waited for the download")
 	}
-	if got := source.abandoned.Load(); got != 1 {
-		t.Fatalf("%d held request(s) were given up, want 1", got)
-	}
+	// The source sees the request go away a moment after Close has ended it (the connection closes
+	// asynchronously), so it is waited for: checked at once, it failed once in CI (0 given up). A
+	// download that Close did not end is held for ever, and the wait times out.
+	waitFor(t, "the held request to be given up", func() bool { return source.abandoned.Load() == 1 })
 	if !server.service.RefreshASN(time.Now()) {
 		t.Fatal("the setting is on, so a refresh is accepted")
 	}
