@@ -18,6 +18,11 @@ The parts that 0.9.1 left undone, from the two reviews of 0.9.0 (`docs/developme
 - **Connecting with a dynamic `ssconf://` key no longer stalls the service.** The key used to be fetched (up to 15 s) while the service held its lock, so every other request, the app's polling included, waited. Now the service plans the connection, fetches the key without the lock and checks again before it starts: other requests are answered at once; another connect or switch meanwhile is `busy`; a disconnect gives the connection up (`cancelled`); a server removed or changed meanwhile is not started.
 - **Amnezia `vpn://` keys with an IPv6 endpoint without brackets import again** (0.9.1 refused them). The endpoint is bracketed when the key is read; everything else is checked as strictly as before, and a `.conf` file with such an endpoint is still refused.
 
+### Fixed: Linux packages
+
+- **The client `.rpm` works on Fedora 45.** It asked for `openssl-libs >= 3.0`, which Fedora 45's OpenSSL 4 satisfies, while `ghostlinkd` needs OpenSSL 3 (`libssl.so.3`) and did not start. It now asks for the two libraries themselves, which dnf finds in `openssl3-libs` on Fedora 45 and in `openssl-libs` on Rocky Linux 9 and Amazon Linux 2023. The new RPM container tests found it.
+- **Removing the server `.rpm` removes `/usr/lib/ghostlink-server`** (rpm left the empty directory behind).
+
 ### Added
 
 - **Replace a server's management key from the app:** **Server settings → Management key → Replace the management key**, or `ghostlink server rotate-key --server NAME`. The app's service saves the new key on this device, sealed like the old one, and never shows it; other devices need the new key (`sudo ghostlink-server show-key`). In the web dashboard the same button shows the new key once, to copy. A key in the server's answer for another host, port or certificate is refused. Agents and the MCP bridge cannot use it.

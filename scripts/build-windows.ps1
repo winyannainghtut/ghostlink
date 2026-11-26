@@ -73,10 +73,9 @@ Assert-Success 'Installer compilation'
 & (Join-Path $wixDirectory 'candle.exe') @candleArguments -out (Join-Path $objectDirectory 'licenses.wixobj') $harvest
 Assert-Success 'License fragment compilation'
 $installer = Join-Path $repository "artifacts\windows-x64\Ghostlink-$Version-windows-x64.msi"
-# ICE61 and ICE63 are warnings about two things that are meant (see the comments in Ghostlink.wxs: the
-# same-version upgrade and the close of the desktop app ahead of RemoveExistingProducts). Every other
-# ICE still runs; a new warning shows.
-& (Join-Path $wixDirectory 'light.exe') -nologo -ext WixUtilExtension -sice:ICE61 -sice:ICE63 -out $installer (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $objectDirectory 'licenses.wixobj')
+# ICE61 is a warning about something that is meant (see the comment in Ghostlink.wxs: the same-version
+# upgrade). Every other ICE still runs; a new warning shows.
+& (Join-Path $wixDirectory 'light.exe') -nologo -ext WixUtilExtension -sice:ICE61 -out $installer (Join-Path $objectDirectory 'Ghostlink.wixobj') (Join-Path $objectDirectory 'licenses.wixobj')
 Assert-Success 'Installer linking and validation'
 Compress-Archive -Path $stage -DestinationPath (Join-Path $repository "artifacts\windows-x64\Ghostlink-$Version-windows-x64-portable.zip") -Force
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Format-List

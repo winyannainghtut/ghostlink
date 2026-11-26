@@ -287,8 +287,9 @@ class WindowsInstallerSource(unittest.TestCase):
     def test_a_final_release_can_replace_its_rc_of_the_same_version(self):
         upgrade = self.product.find(WIX + "MajorUpgrade")
         self.assertEqual(upgrade.get("AllowSameVersionUpgrades"), "yes")
-        # Older versions are still replaced (before the new files go in), newer ones still refused.
-        self.assertEqual(upgrade.get("Schedule"), "afterInstallInitialize")
+        # Older versions are still replaced before the new files go in (the InstallExecute it follows
+        # comes right after InstallInitialize: see the closing of the app), newer ones still refused.
+        self.assertEqual(upgrade.get("Schedule"), "afterInstallExecute")
         self.assertIn("newer version", upgrade.get("DowngradeErrorMessage"))
 
     def test_the_service_starts_again_after_a_crash_but_not_endlessly(self):
@@ -314,14 +315,18 @@ class WindowsInstallerSource(unittest.TestCase):
         self.assertNotEqual(close.get("PromptToContinue"), "yes")
         self.assertEqual(close.get("RebootPrompt"), "no")
         placed = [action for action in self.product.iter(WIX + "Custom") if action.get("Action") == "WixCloseApplications"]
-        self.assertEqual([action.get("Before") for action in placed], ["RemoveExistingProducts"])
+        self.assertEqual([action.get("After") for action in placed], ["InstallInitialize"])
+        # Its deferred part is in the script, which has to run before RemoveExistingProducts (error 2613).
+        self.assertEqual([action.get("After") for action in self.product.iter(WIX + "InstallExecute")], ["WixCloseApplications"])
 
-    def test_the_build_gives_both_wix_tools_the_util_extension_and_silences_only_the_two_meant_warnings(self):
+    def test_the_build_gives_both_wix_tools_the_util_extension_and_silences_only_the_meant_warning(self):
         candle = re.search(r"\$candleArguments = @\((.*)\)", self.script).group(1)
         self.assertIn("'-ext', 'WixUtilExtension'", candle)
         light = re.search(r"^& \(Join-Path \$wixDirectory 'light\.exe'\) (.*)$", self.script, re.M).group(1)
         self.assertIn("-ext WixUtilExtension", light)
-        self.assertEqual(re.findall(r"-sice:(\w+)", light), ["ICE61", "ICE63"])
+        # ICE63 (an action between InstallInitialize and RemoveExistingProducts) is not silenced: the
+        # removal follows InstallExecute, where ICE63 accepts it.
+        self.assertEqual(re.findall(r"-sice:(\w+)", light), ["ICE61"])
         # The extension comes with the pinned WiX tools (a hash-checked archive): nothing else to fetch.
         self.assertIn("wix314-binaries.zip", (ROOT / "scripts/bootstrap-windows.ps1").read_text(encoding="utf-8"))
 
@@ -391,7 +396,7 @@ def build_installer(directory, version):
         os.rmdir(tree / ".tools/wix314")  # the junction only, never what it points to
     if result.returncode != 0:
         raise AssertionError(f"build-windows.ps1 failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
-    # A warning from candle or light (an ICE that is not one of the two meant ones) is a finding.
+    # A warning from candle or light (an ICE that is not the one meant) is a finding.
     warnings = [line for line in result.stdout.splitlines() if re.search(r"warning (CNDL|LGHT)\d+", line)]
     if warnings:
         raise AssertionError("the installer build warns:\n" + "\n".join(warnings))
@@ -455,8 +460,13 @@ class WindowsInstallerTables(unittest.TestCase):
 
     def test_the_desktop_app_is_closed_after_the_install_begins_and_before_anything_is_removed(self):
         self.assertEqual(self.close, [["ghostlink-desktop.exe", "1"]])
-        self.assertLess(self.order["InstallInitialize"], self.order["WixCloseApplications"])
-        self.assertLess(self.order["WixCloseApplications"], self.order["RemoveExistingProducts"])
+        # Between the start of the install script and the removal of the old product: the closing, whose
+        # deferred part goes into the script, and InstallExecute, which runs it. RemoveExistingProducts
+        # refuses to follow an operation left in the script (error 2613, every install of 0.9.2's first
+        # build), so nothing else may be in between.
+        start, removal = self.order["InstallInitialize"], self.order["RemoveExistingProducts"]
+        between = sorted((sequence, action) for action, sequence in self.order.items() if start < sequence < removal)
+        self.assertEqual([action for _, action in between], ["WixCloseApplications", "InstallExecute"])
         self.assertLess(self.order["RemoveExistingProducts"], self.order["StopServices"])
         self.assertLess(self.order["RemoveExistingProducts"], self.order["InstallFiles"])
 

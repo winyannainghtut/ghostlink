@@ -94,7 +94,9 @@ runs ghostlink --version
 runs ghostlinkd --version
 runs ghostlink-mcp --version
 runs /usr/lib/ghostlink/ghostlink-tunnel version
-transaction rpm -U --replacepkgs "$client"
+# --nosignature: the packages are not signed, and rpm 6 (Fedora 45) refuses an unsigned package
+# unless told (dnf installs one from a file, as the docs say to, after a warning).
+transaction rpm -U --replacepkgs --nosignature "$client"
 installed ghostlink
 runs ghostlink --version
 transaction dnf remove -y ghostlink
@@ -111,7 +113,7 @@ present /usr/bin/ghostlink-mesh
 present /usr/lib/systemd/system/ghostlink-mesh.service
 command -v iptables > /dev/null || fail "the mesh agent's iptables dependency did not bring an iptables command"
 runs ghostlink-mesh version
-transaction rpm -U --replacepkgs "$mesh"
+transaction rpm -U --replacepkgs --nosignature "$mesh"
 runs ghostlink-mesh version
 transaction dnf remove -y ghostlink-mesh
 not_installed ghostlink-mesh
@@ -144,7 +146,7 @@ grep -q 'ghostlink-server setup' /tmp/server-postin.txt || fail "the post-instal
 grep -q 'Docker is not installed' /tmp/server-postin.txt || fail "the post-install does not say that Docker is missing"
 usage=$(ghostlink-server help) || fail "ghostlink-server help does not run"
 case "$usage" in *'usage: sudo ghostlink-server'*) ;; *) fail "ghostlink-server help does not print its usage" ;; esac
-transaction rpm -U --replacepkgs "$server"
+transaction rpm -U --replacepkgs --nosignature "$server"
 runs ghostlink-server version
 transaction dnf remove -y ghostlink-server
 not_installed ghostlink-server

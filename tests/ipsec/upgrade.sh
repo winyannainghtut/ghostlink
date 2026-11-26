@@ -90,6 +90,14 @@ python3 "$here/client_config.py" "$work/legacy-client" legacy="$work/legacy.mobi
 chmod -R a+rX "$work/legacy-client"
 # The old component keeps the old copy of the settings, in the state, and reports from there.
 jq -e '.allowed | length == 1' "$state/ipsec/desired.json" >/dev/null
+# The server writes the settings once there is a key, and the component takes them up on its next
+# tick (a second) and then loads them into charon: a client that comes sooner is refused
+# (NO_PROPOSAL_CHOSEN, which failed this test once). Its report, every 5 s, says when it has them.
+for i in $(seq 1 30); do
+    [ "$(jq .generation "$state/ipsec/desired.json")" = "$(jq .applied_generation "$state/ipsec/status.json" 2>/dev/null || echo 0)" ] && break
+    sleep 1
+done
+test "$(jq .generation "$state/ipsec/desired.json")" = "$(jq .applied_generation "$state/ipsec/status.json")" || fail "the $previous component did not apply its settings"
 
 step "A client connects (network: the client at 10.99.0.2, the server at 10.99.0.1)"
 # The client runs the old release's own image (the new one is not loaded before the upgrade).
